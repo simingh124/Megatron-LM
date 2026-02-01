@@ -192,7 +192,9 @@ class Partition(object):
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
-        builders[key].finalize(output_idx_files[key])
+        # Finalize all builders (not just the last key from the loop)
+        for key in self.args.json_keys:
+            builders[key].finalize(output_idx_files[key])
 
 
 def get_args():
@@ -326,7 +328,8 @@ def main():
                     partitioned_input_files[index].write(line)
                     if args.keep_sequential_samples:
                         line_count += 1
-                        if line_count % partition_size == 0:
+                        # Clamp index to last partition to prevent overflow
+                        if line_count % partition_size == 0 and index < args.partitions - 1:
                             index += 1
                     else:
                         index = (index + 1)%args.partitions

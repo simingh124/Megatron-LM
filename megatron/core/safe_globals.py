@@ -9,7 +9,13 @@ from types import SimpleNamespace
 import torch
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
-from numpy.dtypes import UInt32DType
+try:
+    # NumPy 2.x
+    from numpy.dtypes import UInt32DType  # type: ignore
+except Exception:
+    # NumPy 1.x does not expose dtype classes under numpy.dtypes.
+    # For safe globals registration, using the base dtype type is sufficient.
+    UInt32DType = dtype  # type: ignore
 
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
