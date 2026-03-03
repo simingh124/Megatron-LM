@@ -141,6 +141,24 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
+    use_armt_tbptt = False
+    try:
+        from megatron.training import global_vars as training_global_vars
+    except ModuleNotFoundError:
+        training_global_vars = None
+    if training_global_vars is not None and training_global_vars._GLOBAL_ARGS is not None:
+        use_armt_tbptt = getattr(training_global_vars.get_args(), "use_armt_tbptt", False)
+
+    if use_armt_tbptt:
+        if pp_size != 1 or vp_size is not None:
+            raise ValueError(
+                "ARMT TBPTT schedule only supports PP=1 and no virtual pipeline "
+                f"(got PP={pp_size}, VP={vp_size})."
+            )
+        from .armt_schedules import armt_forward_backward_no_pipelining
+
+        return armt_forward_backward_no_pipelining
+
     if pp_size > 1:
         if vp_size is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving

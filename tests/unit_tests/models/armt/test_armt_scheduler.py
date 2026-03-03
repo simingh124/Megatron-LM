@@ -343,6 +343,35 @@ def test_scalar_metrics_are_token_weighted_across_chunks():
     assert abs(float(report["scalar_metric"].item()) - expected) < 1e-6
 
 
+def test_get_forward_backward_func_selects_armt_tbptt_schedule():
+    """验证开启 --use-armt-tbptt 后，训练 loop 会选用 ARMT TBPTT schedule。"""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from megatron.core.pipeline_parallel.armt_schedules import armt_forward_backward_no_pipelining
+    from megatron.core.pipeline_parallel.schedules import (
+        forward_backward_no_pipelining,
+        get_forward_backward_func,
+    )
+    from megatron.training import global_vars as training_global_vars
+
+    old_global_args = training_global_vars._GLOBAL_ARGS
+    try:
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_armt_tbptt=True)
+        func = get_forward_backward_func(pp_size=1, vp_size=None)
+        assert func is armt_forward_backward_no_pipelining
+
+        with pytest.raises(ValueError, match="ARMT TBPTT schedule only supports PP=1"):
+            _ = get_forward_backward_func(pp_size=2, vp_size=None)
+
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_armt_tbptt=False)
+        func = get_forward_backward_func(pp_size=1, vp_size=None)
+        assert func is forward_backward_no_pipelining
+    finally:
+        training_global_vars._GLOBAL_ARGS = old_global_args
+
+
 def test_no_loss_from_first_chunk_requires_loss_mask():
     """验证启用 --no-loss-from-first-chunk 时缺少 loss_mask 会显式报错。"""
     from unittest.mock import MagicMock, patch
