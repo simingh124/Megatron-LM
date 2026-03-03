@@ -1,7 +1,7 @@
 """ARMT TBPTT schedule for no-pipeline training."""
 
 import contextlib
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -60,6 +60,50 @@ def _get_num_tokens(chunk: Dict) -> float:
     if "tokens" in chunk and isinstance(chunk["tokens"], torch.Tensor):
         return float(chunk["tokens"].numel())
     return 0.0
+
+
+def _accumulate_chunk_reports(
+    accumulated: Optional[Dict[str, torch.Tensor]],
+    scalar_accumulators: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
+    chunk_report: Dict[str, torch.Tensor],
+    *,
+    chunk_tokens: float,
+) -> Dict[str, torch.Tensor]:
+    if accumulated is None:
+        accumulated = {}
+
+    for key, value in chunk_report.items():
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(
+                "ARMT TBPTT schedule expects loss_reduced dict values to be torch.Tensors "
+                f"(got key={key}, type={type(value)})."
+            )
+        if value.numel() == 2:
+            # New-style reporting: [loss_sum, num_tokens]
+            if key not in accumulated:
+                accumulated[key] = value.clone()
+            else:
+                accumulated[key] = accumulated[key] + value
+        elif value.numel() == 1:
+            # Legacy scalar metrics: token-weighted average over chunks.
+            if chunk_tokens <= 0.0:
+                continue
+            token_tensor = value.new_tensor(chunk_tokens)
+            if key not in scalar_accumulators:
+                scalar_accumulators[key] = (value.clone() * token_tensor, token_tensor)
+            else:
+                weighted_sum, token_sum = scalar_accumulators[key]
+                scalar_accumulators[key] = (
+                    weighted_sum + value * token_tensor,
+                    token_sum + token_tensor,
+                )
+        else:
+            raise ValueError(
+                "ARMT TBPTT schedule expects loss_reduced dict values to have shape (1,) or (2,) "
+                f"(got key={key}, shape={tuple(value.shape)})."
+            )
+
+    return accumulated
 
 
 def armt_forward_backward_no_pipelining(
@@ -157,17 +201,26 @@ def armt_forward_backward_no_pipelining(
         total_tokens_this_micro = sum(_get_num_tokens(c) for c in chunks)
         total_tokens_this_micro = max(total_tokens_this_micro, 1.0)
 
+        microbatch_loss_reduced: Optional[Dict[str, torch.Tensor]] = None
+        microbatch_scalar_accumulators: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        last_chunk_output_tensor: Optional[torch.Tensor] = None
+
         for chunk_idx, chunk in enumerate(chunks):
             chunk_tokens = _get_num_tokens(chunk)
-            loss_weight = (chunk_tokens / total_tokens_this_micro) * (1.0 / num_microbatches)
+            if config.calculate_per_token_loss:
+                loss_weight = 1.0
+            else:
+                loss_weight = (chunk_tokens / total_tokens_this_micro) * (1.0 / num_microbatches)
 
             chunk_iter = iter([chunk])
 
             def run_chunk():
+                nonlocal last_chunk_output_tensor
+                nonlocal microbatch_loss_reduced
                 output_tensor, loss_func = forward_step_func(chunk_iter, model)
                 if loss_func is None:
                     if chunk_idx == num_chunks - 1:
-                        losses_reduced.append(output_tensor.detach())
+                        last_chunk_output_tensor = output_tensor.detach()
                     return
 
                 outputs = loss_func(output_tensor)
@@ -182,11 +235,20 @@ def armt_forward_backward_no_pipelining(
                 scaled_loss = loss * loss_weight
 
                 # Optimization: if this chunk carries no loss (e.g. masked), skip backward_step.
-                if not forward_only and chunk_tokens > 0.0 and loss_weight > 0.0:
+                if not forward_only and chunk_tokens > 0.0:
                     backward_step(None, scaled_loss, None, model_type, config)
 
-                if chunk_idx == num_chunks - 1:
-                    losses_reduced.append(loss_reduced)
+                if not isinstance(loss_reduced, dict):
+                    raise ValueError(
+                        "ARMT TBPTT schedule expects loss_func to return a dict as loss_reduced "
+                        f"(got {type(loss_reduced)})."
+                    )
+                microbatch_loss_reduced = _accumulate_chunk_reports(
+                    microbatch_loss_reduced,
+                    microbatch_scalar_accumulators,
+                    loss_reduced,
+                    chunk_tokens=chunk_tokens,
+                )
 
             is_last_microbatch = microbatch_id == num_microbatches - 1
             is_last_chunk = chunk_idx == num_chunks - 1
@@ -198,6 +260,13 @@ def armt_forward_backward_no_pipelining(
                 run_chunk()
 
             total_num_tokens += int(chunk_tokens)
+
+        if microbatch_loss_reduced is not None:
+            for key, (weighted_sum, token_sum) in microbatch_scalar_accumulators.items():
+                microbatch_loss_reduced[key] = weighted_sum / torch.clamp(token_sum, min=1)
+            losses_reduced.append(microbatch_loss_reduced)
+        elif last_chunk_output_tensor is not None:
+            losses_reduced.append(last_chunk_output_tensor)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         config.finalize_model_grads_func(
