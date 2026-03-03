@@ -72,7 +72,11 @@ class AssociativeLayer(nn.Module):
         self.W_mk = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
         self.W_mv = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
 
-        nn.init.zeros_(self.W_mv.weight)
+        # NOTE: Do not init to exact zeros. `W_mv` participates only through the
+        # chunk-to-chunk memory state; if it's initialized to zeros, the memory update
+        # becomes identically zero -> retrieval is identically zero -> gradients to
+        # memory-write parameters are also identically zero.
+        nn.init.normal_(self.W_mv.weight, mean=0.0, std=1e-3)
 
         if gating:
             self.W_mb = nn.Linear(d_model, d_model, dtype=dtype)
@@ -215,6 +219,12 @@ class AssociativeLayer(nn.Module):
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
+        # TBPTT: keep cross-chunk credit assignment to memory-write parameters while
+        # preventing gradients from flowing into previous-chunk transformer activations.
+        # This also avoids requiring `retain_graph=True` across chunk-wise backward.
+        if self.tbptt_mode:
+            mem_tokens = mem_tokens.detach()
+
         k = self._to_heads(self.W_mk(mem_tokens))
         mk = self.phi(k)
         mk = F.normalize(mk, dim=-1, p=2.0)
@@ -250,9 +260,9 @@ class AssociativeLayer(nn.Module):
         if self.tbptt_mode:
             # Avoid in-place updates on buffers that were used earlier in the forward,
             # which can invalidate autograd saved tensors (version counter mismatch).
-            self.W_mem = (self.W_mem.detach() + associations).detach()
+            self.W_mem = self.W_mem.detach() + associations
             if self.use_denom:
-                self.z = (self.z.detach() + (new_info_coef * mk).sum(dim=-2)).detach()
+                self.z = self.z.detach() + (new_info_coef * mk).sum(dim=-2)
         else:
             self.W_mem = self.W_mem + associations
             if self.use_denom:
