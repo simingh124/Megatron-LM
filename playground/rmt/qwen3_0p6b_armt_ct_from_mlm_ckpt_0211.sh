@@ -1,0 +1,235 @@
+#!/bin/bash
+set -ex
+
+# Qwen3-0.6B ARMT continual training from torch_dist ckpt.
+#
+# Verification goal:
+# - Training can start from converted checkpoint.
+# - ARMT-specific params are newly created and kept random-initialized.
+# - Loss is not close to random guess (≈ ln(vocab)).
+#
+# Distributed settings are configurable via env vars:
+#   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
+#
+# Exit interval:
+#   Set EXIT_INTERVAL=1 to stop after 1 iter.
+
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+
+# ========== Distributed training setup ==========
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+NUM_NODES=${NUM_NODES:-1}
+MASTER_ADDR=${MASTER_ADDR:-localhost}
+MASTER_PORT=${MASTER_PORT:-6000}
+NODE_RANK=${NODE_RANK:-0}
+WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
+
+# ========== Fixed paths ==========
+ROOT="/mnt/step3-abla/siming"
+MEGATRON_ROOT="${ROOT}/code_repo/Megatron-LM"
+export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
+
+# Read from file name without extension
+EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
+
+TOKENIZER_DIR="${ROOT}/tokenizers/qwen3_tokenizer"
+
+# ========== Model / checkpoint selection ==========
+# Only two cases are required for validation: TP=1 and TP=2, both PP=1.
+TP_SIZE=${TP_SIZE:-1}
+PP_SIZE=1
+CP_SIZE=1
+
+if [[ "${TP_SIZE}" == "1" ]]; then
+  LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp1_pp1_torch_dist"
+elif [[ "${TP_SIZE}" == "2" ]]; then
+  LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp2_pp1_torch_dist"
+else
+  echo "ERROR: Unsupported TP_SIZE=${TP_SIZE}. Only 1 or 2 are supported by this validation script." >&2
+  exit 1
+fi
+
+CHECKPOINT_PATH="${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}_tp${TP_SIZE}"
+TENSORBOARD_LOGS_PATH="${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}_tp${TP_SIZE}"
+
+mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
+mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
+
+if ! command -v torchrun >/dev/null 2>&1; then
+  echo "ERROR: torchrun not found in PATH" >&2
+  exit 1
+fi
+if [[ ! -d "${TOKENIZER_DIR}" ]]; then
+  echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
+  exit 1
+fi
+if [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
+  echo "ERROR: ckpt root dir not found: ${LOAD_CHECKPOINT_PATH}" >&2
+  exit 1
+fi
+
+# ========== Data ==========
+# FineWeb-Edu merged-by-year, 2013 only (faster for smoke).
+DATASET_PATH="
+22715400849 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2013
+"
+
+# ========== Fixed model parameters ==========
+# Must match the checkpoint.
+NUM_LAYERS=28
+HIDDEN_SIZE=1024
+FFN_HIDDEN_SIZE=3072
+NUM_ATTN_HEADS=16
+NUM_QUERY_GROUPS=8
+KV_CHANNELS=128
+
+SEQ_LENGTH=1024
+MAX_POSITION_EMBEDDINGS=32768
+
+VOCAB_SIZE=151936
+MAKE_VOCAB_SIZE_DIVISIBLE_BY=128
+
+ROTARY_BASE=1000000
+ROTARY_PERCENT=1.0
+
+NORM_EPS=1e-6
+
+# ========== ARMT parameters ==========
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
+ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
+ARMT_N_HEADS=${ARMT_N_HEADS:-1}
+
+# ========== Fixed training parameters (smoke-friendly defaults) ==========
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-8}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-192}
+
+# Requested: 1B tokens schedule (still use EXIT_INTERVAL to keep smoke short).
+TRAIN_TOKENS=${TRAIN_TOKENS:-1000000000}
+LR_DECAY_TOKENS=${TRAIN_TOKENS}
+WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
+
+TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+
+LR=${LR:-5e-4}
+MIN_LR=${MIN_LR:-1e-5}
+
+DISTRIBUTED_ARGS=(
+  --nproc_per_node ${GPUS_PER_NODE}
+  --nnodes ${NUM_NODES}
+  --node_rank ${NODE_RANK}
+  --master_addr ${MASTER_ADDR}
+  --master_port ${MASTER_PORT}
+)
+
+MODEL_ARGS=(
+  --use-mcore-models
+  --tensor-model-parallel-size ${TP_SIZE}
+  --context-parallel-size ${CP_SIZE}
+  --pipeline-model-parallel-size ${PP_SIZE}
+  --num-layers ${NUM_LAYERS}
+  --hidden-size ${HIDDEN_SIZE}
+  --ffn-hidden-size ${FFN_HIDDEN_SIZE}
+  --num-attention-heads ${NUM_ATTN_HEADS}
+  --group-query-attention
+  --num-query-groups ${NUM_QUERY_GROUPS}
+  --kv-channels ${KV_CHANNELS}
+  --seq-length ${SEQ_LENGTH}
+  --max-position-embeddings ${MAX_POSITION_EMBEDDINGS}
+  --position-embedding-type rope
+  --use-rotary-position-embeddings
+  --rotary-base ${ROTARY_BASE}
+  --rotary-percent ${ROTARY_PERCENT}
+  --normalization RMSNorm
+  --norm-epsilon ${NORM_EPS}
+  --qk-layernorm
+  --swiglu
+  --disable-bias-linear
+  --attention-dropout 0.0
+  --hidden-dropout 0.0
+  --bf16
+  --vocab-size ${VOCAB_SIZE}
+  --make-vocab-size-divisible-by ${MAKE_VOCAB_SIZE_DIVISIBLE_BY}
+)
+
+ARMT_ARGS=(
+  --use-armt-tbptt
+  --num-mem-tokens ${NUM_MEM_TOKENS}
+  --armt-chunk-size ${ARMT_CHUNK_SIZE}
+  --armt-n-heads ${ARMT_N_HEADS}
+)
+
+TRAINING_ARGS=(
+  --micro-batch-size ${MICRO_BATCH_SIZE}
+  --global-batch-size ${GLOBAL_BATCH_SIZE}
+  --train-iters ${TRAIN_ITERS}
+  --lr-decay-iters ${LR_DECAY_ITERS}
+  --lr-warmup-iters ${LR_WARMUP_ITERS}
+  --lr ${LR}
+  --min-lr ${MIN_LR}
+  --lr-decay-style constant
+  --clip-grad 1.0
+  --weight-decay 0.1
+  --optimizer adam
+  --adam-beta1 0.9
+  --adam-beta2 0.95
+  --adam-eps 1e-8
+  --seed 42
+)
+
+DATA_ARGS=(
+  --data-path "${DATASET_PATH}"
+  --split "100,0,0"
+  --num-workers 8
+  --tokenizer-type HuggingFaceTokenizer
+  --tokenizer-model "${TOKENIZER_DIR}"
+)
+
+CKPT_AND_LOG_ARGS=(
+  --ckpt-format torch_dist
+  # Important: baseline ckpt doesn't have ARMT params; drop those "unexpected" keys.
+  --dist-ckpt-strictness log_unexpected
+  --load "${LOAD_CHECKPOINT_PATH}"
+  --save "${CHECKPOINT_PATH}"
+  --no-load-optim
+  --no-load-rng
+  --no-save-optim
+  --no-save-rng
+  --log-interval 1
+  --eval-interval 1000000000
+  --eval-iters 0
+  --save-interval 10000
+  --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
+  --distributed-timeout-minutes 60
+)
+
+EXTRA_ARGS=()
+if [[ -n "${EXIT_INTERVAL:-}" ]]; then
+  EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
+fi
+
+echo "ROOT=${ROOT}"
+echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
+echo "TP_SIZE=${TP_SIZE} PP_SIZE=${PP_SIZE} CP_SIZE=${CP_SIZE}"
+echo "LOAD_CHECKPOINT_PATH=${LOAD_CHECKPOINT_PATH}"
+echo "CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+echo "TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH}"
+echo "TOKENIZER_DIR=${TOKENIZER_DIR}"
+echo "WORLD_SIZE=${WORLD_SIZE} (GPUS_PER_NODE=${GPUS_PER_NODE}, NUM_NODES=${NUM_NODES})"
+echo "MASTER_ADDR=${MASTER_ADDR}"
+echo "MASTER_PORT=${MASTER_PORT}"
+echo "NODE_RANK=${NODE_RANK}"
+echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
+echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
+
+torchrun ${DISTRIBUTED_ARGS[@]} \
+  --module examples.armt.train \
+  ${ARMT_ARGS[@]} \
+  ${MODEL_ARGS[@]} \
+  ${TRAINING_ARGS[@]} \
+  ${DATA_ARGS[@]} \
+  ${CKPT_AND_LOG_ARGS[@]} \
+  ${EXTRA_ARGS[@]}
+

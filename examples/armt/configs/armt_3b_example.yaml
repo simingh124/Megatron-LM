@@ -1,0 +1,9 @@
+use_armt_tbptt: true
+num_mem_tokens: 16
+armt_chunk_size: 512
+tensor_model_parallel_size: 1
+pipeline_model_parallel_size: 1
+seq_length: 2048
+micro_batch_size: 1
+global_batch_size: 8
+position_embedding_type: rope
