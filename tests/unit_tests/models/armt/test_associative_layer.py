@@ -86,6 +86,35 @@ class TestAssociativeLayer:
         assert layer.W_mb.weight.grad is not None
         assert layer.W_mb.weight.grad.abs().sum().item() > 0.0
 
+    def test_associative_layer_tbptt_allows_multiple_chunk_backwards_without_retain_graph(
+        self, layer
+    ):
+        """验证 TBPTT 下可以连续进行多次 chunk-wise backward，不需要 retain_graph。"""
+        B, H = 2, 256
+        layer.reset_memory(B)
+
+        # Ensure memory updates are non-trivial (avoid near-zero retrieval).
+        layer.W_mv.weight.data.normal_()
+
+        # Chunk 1: simulate a token loss that does not depend on update_mem().
+        hidden_states = torch.randn(B, 32, H, requires_grad=True)
+        (hidden_states.float() ** 2).sum().backward()
+
+        # Chunk 1 update -> Chunk 2 loss backprops into memory-write weights.
+        mem_tokens = torch.randn(B, layer.num_mem_tokens, H, requires_grad=True)
+        layer.update_mem(mem_tokens, input_is_sbh=False)
+        hidden_states = torch.randn(B, 32, H, requires_grad=True)
+        layer.associate(hidden_states, input_is_sbh=False).float().sum().backward()
+
+        # Chunk 2 update -> Chunk 3 loss should be able to backward again without errors.
+        mem_tokens = torch.randn(B, layer.num_mem_tokens, H, requires_grad=True)
+        layer.update_mem(mem_tokens, input_is_sbh=False)
+        hidden_states = torch.randn(B, 32, H, requires_grad=True)
+        layer.associate(hidden_states, input_is_sbh=False).float().sum().backward()
+
+        assert layer.W_mk.weight.grad is not None
+        assert layer.W_mk.weight.grad.abs().sum().item() > 0.0
+
     def test_associative_layer_memory_flow(self, layer):
         """验证多次 update_mem 后 W_mem 会累积更新（不再保持初始全零）。"""
         B, S, H = 2, 128, 256

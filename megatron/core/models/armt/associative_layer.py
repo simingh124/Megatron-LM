@@ -232,9 +232,11 @@ class AssociativeLayer(nn.Module):
         new_mv = self._to_heads(self.W_mv(mem_tokens))
 
         if not self._first_chunk:
-            num = torch.einsum("bhsk,bhkd->bhsd", mk, self.W_mem)
+            prev_W_mem = self.W_mem.detach() if self.tbptt_mode else self.W_mem
+            num = torch.einsum("bhsk,bhkd->bhsd", mk, prev_W_mem)
             if self.use_denom:
-                denom = torch.einsum("bhk,bhsk->bhs", self.z, mk)[..., None] + 1e-5
+                prev_z = self.z.detach() if self.tbptt_mode else self.z
+                denom = torch.einsum("bhk,bhsk->bhs", prev_z, mk)[..., None] + 1e-5
                 prev_mv = num / denom
                 if self.correction:
                     mk_norm_sq = torch.linalg.norm(mk, dim=-1) ** 2
