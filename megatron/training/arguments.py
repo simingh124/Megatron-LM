@@ -291,7 +291,58 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
+
+def apply_test_train_run_overrides(args):
+    """Disable artifact-producing settings for smoke-test training runs."""
+    if not getattr(args, "test_train_run", False):
+        return False
+
+    assert getattr(args, "ckpt_convert_format", None) is None, (
+        "--test-train-run is incompatible with --ckpt-convert-format because checkpoint "
+        "conversion always writes a converted checkpoint."
+    )
+    assert not getattr(args, "moe_use_upcycling", False), (
+        "--test-train-run is incompatible with --moe-use-upcycling because upcycling always "
+        "writes a converted checkpoint."
+    )
+
+    overrides = {
+        "tensorboard_dir": None,
+        "save": None,
+        "save_interval": None,
+        "save_retain_interval": None,
+        "keep_last_n_checkpoints": None,
+        "save_wgrads_interval": None,
+        "save_dgrads_interval": None,
+        "async_save": False,
+        "use_persistent_ckpt_worker": False,
+        "non_persistent_ckpt_type": None,
+        "non_persistent_save_interval": None,
+        "non_persistent_global_ckpt_dir": None,
+        "non_persistent_local_ckpt_dir": None,
+        "replication": False,
+        "replication_jump": None,
+        "log_progress": False,
+        "config_logger_dir": "",
+        "wandb_project": None,
+        "wandb_exp_name": None,
+        "wandb_save_dir": None,
+        "wandb_entity": None,
+        "enable_one_logger": False,
+        "save_config_filepath": None,
+    }
+    for attr, value in overrides.items():
+        setattr(args, attr, value)
+
+    return True
+
+
 def validate_args(args, defaults={}):
+    if apply_test_train_run_overrides(args):
+        warn_rank_0(
+            "--test-train-run enabled: disabling TensorBoard, persistent/external logging, "
+            "checkpointing, and gradient artifact saves."
+        )
 
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
