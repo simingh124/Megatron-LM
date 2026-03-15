@@ -28,7 +28,11 @@ from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
-from megatron.training.arguments import parse_args, validate_args
+from megatron.training.arguments import (
+    apply_test_train_run_overrides,
+    parse_args,
+    validate_args,
+)
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
@@ -67,6 +71,8 @@ def initialize_megatron(
     else:
         args = parsed_args
 
+    apply_test_train_run_overrides(args)
+
     # Prep for checkpoint conversion.
     if args.ckpt_convert_format is not None:
         assert args.ckpt_convert_save is not None
@@ -82,14 +88,20 @@ def initialize_megatron(
         )
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
-
-    if args.async_save and args.use_persistent_ckpt_worker:
-        init_persistent_async_worker()
+        apply_test_train_run_overrides(args)
 
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
+        if apply_test_train_run_overrides(args):
+            warn_rank_0(
+                "--test-train-run enabled: disabling TensorBoard, persistent/external "
+                "logging, checkpointing, and gradient artifact saves."
+            )
     else:
         validate_args(args, args_defaults)
+
+    if args.async_save and args.use_persistent_ckpt_worker:
+        init_persistent_async_worker()
 
     # set global args, build tokenizer, and set adlr-autoresume,
     # tensorboard-writer, and timers.
