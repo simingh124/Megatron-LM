@@ -1,6 +1,12 @@
 import torch
+import pytest
 
 from megatron.core.pipeline_parallel.armt_schedules import chunk_data
+from megatron.core.models.armt.monitoring import (
+    build_mean_metric,
+    clear_armt_tensorboard_metrics,
+    consume_armt_tensorboard_metrics,
+)
 
 
 def test_chunk_data_shapes():
@@ -370,6 +376,192 @@ def test_get_forward_backward_func_selects_armt_tbptt_schedule():
         assert func is forward_backward_no_pipelining
     finally:
         training_global_vars._GLOBAL_ARGS = old_global_args
+
+
+def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
+    """验证 schedule 会发布 chunk loss 和 ARMT monitoring 指标。"""
+    from unittest.mock import MagicMock, patch
+
+    from megatron.core.pipeline_parallel.armt_schedules import armt_forward_backward_no_pipelining
+
+    clear_armt_tensorboard_metrics()
+    batch_size, seq_length = 1, 8
+    chunk_size = 4
+
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (batch_size, seq_length)),
+        "labels": torch.randint(0, 100, (batch_size, seq_length)),
+        "loss_mask": torch.ones(batch_size, seq_length),
+    }
+
+    forward_calls = {"n": 0}
+
+    def forward_step_func(data_it, model):
+        batch = next(data_it)
+        forward_calls["n"] += 1
+        output_tensor = torch.zeros([], requires_grad=True)
+
+        def _loss_func(_output_tensor):
+            num_tokens = batch["loss_mask"].float().sum().to(torch.int)
+            loss_scale = float(forward_calls["n"])
+            loss_sum = num_tokens.float() * loss_scale
+            loss_reduced = {
+                "lm loss": torch.cat([loss_sum.view(1), num_tokens.view(1)]),
+            }
+            return _output_tensor * 0.0 + loss_sum, num_tokens, loss_reduced
+
+        return output_tensor, _loss_func
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+
+    unwrapped_model = MagicMock()
+    unwrapped_model.consume_all_monitoring_primitives.return_value = {
+        "armt/read/retrieved_norm_mean": build_mean_metric(
+            torch.tensor(6.0),
+            torch.tensor(3.0),
+        ),
+    }
+
+    with (
+        patch("megatron.core.pipeline_parallel.armt_schedules.get_model_config", return_value=config),
+        patch("megatron.core.pipeline_parallel.armt_schedules.get_model_type", return_value=MagicMock()),
+        patch("megatron.core.pipeline_parallel.armt_schedules.unwrap_model", return_value=unwrapped_model),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_tensor_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_context_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_pipeline_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_position_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_data_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.training.utils.get_batch_on_this_tp_rank",
+            side_effect=lambda it: raw_batch,
+        ),
+        patch("megatron.core.pipeline_parallel.armt_schedules.backward_step"),
+    ):
+        losses = armt_forward_backward_no_pipelining(
+            forward_step_func=forward_step_func,
+            data_iterator=iter([raw_batch]),
+            model=MagicMock(),
+            num_microbatches=1,
+            chunk_size=chunk_size,
+            seq_length=seq_length,
+            micro_batch_size=batch_size,
+            forward_only=False,
+        )
+
+    assert len(losses) == 1
+    metrics = consume_armt_tensorboard_metrics()
+
+    assert float(metrics["train/chunk_00_loss"]) == pytest.approx(1.0)
+    assert float(metrics["train/chunk_01_loss"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+    unwrapped_model.reset_all_monitoring_stats.assert_called_once()
+    unwrapped_model.reset_all_memory.assert_called_once()
+
+
+def test_scheduler_forward_only_does_not_publish_monitoring_metrics():
+    """验证 forward_only 不会把监控指标发布到训练 TensorBoard tracker。"""
+    from unittest.mock import MagicMock, patch
+
+    from megatron.core.pipeline_parallel.armt_schedules import armt_forward_backward_no_pipelining
+
+    clear_armt_tensorboard_metrics()
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (1, 4)),
+        "labels": torch.randint(0, 100, (1, 4)),
+        "loss_mask": torch.ones(1, 4),
+    }
+
+    def forward_step_func(data_it, model):
+        batch = next(data_it)
+        output_tensor = torch.zeros([], requires_grad=True)
+
+        def _loss_func(_output_tensor):
+            num_tokens = batch["loss_mask"].float().sum().to(torch.int)
+            loss_reduced = {"lm loss": torch.cat([num_tokens.float().view(1), num_tokens.view(1)])}
+            return _output_tensor * 0.0, num_tokens, loss_reduced
+
+        return output_tensor, _loss_func
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+
+    unwrapped_model = MagicMock()
+    unwrapped_model.consume_all_monitoring_primitives.return_value = {
+        "armt/read/retrieved_norm_mean": build_mean_metric(
+            torch.tensor(4.0),
+            torch.tensor(2.0),
+        ),
+    }
+
+    with (
+        patch("megatron.core.pipeline_parallel.armt_schedules.get_model_config", return_value=config),
+        patch("megatron.core.pipeline_parallel.armt_schedules.get_model_type", return_value=MagicMock()),
+        patch("megatron.core.pipeline_parallel.armt_schedules.unwrap_model", return_value=unwrapped_model),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_tensor_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_context_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_pipeline_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_position_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.core.pipeline_parallel.armt_schedules.parallel_state.get_data_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.training.utils.get_batch_on_this_tp_rank",
+            side_effect=lambda it: raw_batch,
+        ),
+    ):
+        armt_forward_backward_no_pipelining(
+            forward_step_func=forward_step_func,
+            data_iterator=iter([raw_batch]),
+            model=MagicMock(),
+            num_microbatches=1,
+            chunk_size=4,
+            seq_length=4,
+            micro_batch_size=1,
+            forward_only=True,
+        )
+
+    assert consume_armt_tensorboard_metrics() == {}
 
 
 def test_no_loss_from_first_chunk_requires_loss_mask():

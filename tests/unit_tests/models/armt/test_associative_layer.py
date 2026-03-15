@@ -2,6 +2,7 @@ import torch
 import pytest
 
 from megatron.core.models.armt.associative_layer import DPFP, AssociativeLayer
+from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
 
 class TestDPFP:
@@ -129,3 +130,47 @@ class TestAssociativeLayer:
             layer.update_mem(hidden_states, input_is_sbh=False)
 
         assert not torch.allclose(layer.W_mem, initial_W_mem)
+
+    def test_associative_layer_monitoring_metrics(self, layer):
+        """验证 AssociativeLayer 会累计并导出 read/write/state 监控指标。"""
+        batch_size, hidden_size = 2, 256
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+
+        hidden_states = torch.randn(batch_size, 32, hidden_size)
+        layer.associate(hidden_states, input_is_sbh=False)
+        mem_tokens = torch.randn(batch_size, layer.num_mem_tokens, hidden_size)
+        layer.update_mem(mem_tokens, input_is_sbh=False)
+        layer.associate(torch.randn(batch_size, 32, hidden_size), input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert "armt/read/retrieved_norm_mean" in metrics
+        assert "armt/read/retrieved_to_hidden_ratio" in metrics
+        assert "armt/write/delta_mem_norm" in metrics
+        assert "armt/write/write_gate_mean" in metrics
+        assert "armt/state/W_mem_norm" in metrics
+        assert "armt/state/z_norm" in metrics
+        assert float(metrics["armt/write/delta_mem_norm"]) >= 0.0
+        assert float(metrics["armt/state/W_mem_norm"]) >= 0.0
+        assert layer.consume_monitoring_primitives() == {}
+
+    def test_associative_layer_monitoring_skips_z_norm_without_denom(self):
+        """验证 use_denom=False 时不会导出 z_norm。"""
+        layer = AssociativeLayer(
+            d_model=128,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            use_denom=False,
+            tbptt_mode=True,
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert "armt/state/z_norm" not in metrics

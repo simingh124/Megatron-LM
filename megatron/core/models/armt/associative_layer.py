@@ -1,12 +1,14 @@
 """Associative memory components for ARMT."""
 
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state, tensor_parallel
+
+from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
 
 
 class DPFP(nn.Module):
@@ -89,9 +91,71 @@ class AssociativeLayer(nn.Module):
 
         self._first_chunk = True
         self._pending_reset = True
+        self.reset_monitoring_stats()
 
     def set_tbptt_mode(self, enabled: bool):
         self.tbptt_mode = enabled
+
+    def reset_monitoring_stats(self):
+        self._monitoring_stats: Dict[str, torch.Tensor] = {}
+
+    def _accumulate_monitoring_stat(self, name: str, value: torch.Tensor):
+        value = value.detach()
+        if value.numel() != 1:
+            raise ValueError(
+                f"AssociativeLayer monitoring expects scalars, got {name}={tuple(value.shape)}"
+            )
+        value = value.reshape(()).to(dtype=torch.float32)
+        current = self._monitoring_stats.get(name)
+        if current is None:
+            self._monitoring_stats[name] = value
+        else:
+            self._monitoring_stats[name] = current + value
+
+    @staticmethod
+    def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
+        return torch.tensor(float(count), device=device, dtype=torch.float32)
+
+    def consume_monitoring_primitives(self):
+        stats = self._monitoring_stats
+        primitives = {}
+
+        if "retrieved_norm_count" in stats:
+            primitives["armt/read/retrieved_norm_mean"] = build_mean_metric(
+                stats["retrieved_norm_sum"],
+                stats["retrieved_norm_count"],
+            )
+            primitives["armt/read/retrieved_to_hidden_ratio"] = build_ratio_metric(
+                stats["retrieved_norm_sum"],
+                stats["hidden_norm_sum"],
+            )
+
+        if "delta_mem_elem_count" in stats:
+            primitives["armt/write/delta_mem_norm"] = build_rms_metric(
+                stats["delta_mem_sq_sum"],
+                stats["delta_mem_elem_count"],
+            )
+
+        if "write_gate_elem_count" in stats:
+            primitives["armt/write/write_gate_mean"] = build_mean_metric(
+                stats["write_gate_sum"],
+                stats["write_gate_elem_count"],
+            )
+
+        if "W_mem_elem_count" in stats:
+            primitives["armt/state/W_mem_norm"] = build_rms_metric(
+                stats["W_mem_sq_sum"],
+                stats["W_mem_elem_count"],
+            )
+
+        if self.use_denom and "z_elem_count" in stats:
+            primitives["armt/state/z_norm"] = build_rms_metric(
+                stats["z_sq_sum"],
+                stats["z_elem_count"],
+            )
+
+        self.reset_monitoring_stats()
+        return primitives
 
     def reset_memory(self, batch_size: Optional[int] = None, device: Optional[torch.device] = None):
         """Mark memory state for reset; optionally initialize immediately."""
@@ -206,6 +270,13 @@ class AssociativeLayer(nn.Module):
 
             result = self._from_heads(result)
 
+        hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+        retrieved_norms = torch.linalg.vector_norm(result.float(), dim=-1)
+        token_count = self._count_tensor(hidden_norms.numel(), hidden_states.device)
+        self._accumulate_monitoring_stat("hidden_norm_sum", hidden_norms.sum())
+        self._accumulate_monitoring_stat("retrieved_norm_sum", retrieved_norms.sum())
+        self._accumulate_monitoring_stat("retrieved_norm_count", token_count)
+
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)
 
@@ -259,6 +330,17 @@ class AssociativeLayer(nn.Module):
         else:
             associations = torch.einsum("bhsk,bhsd,bhsx->bhkd", mk, mv, mb)
 
+        self._accumulate_monitoring_stat("delta_mem_sq_sum", associations.float().square().sum())
+        self._accumulate_monitoring_stat(
+            "delta_mem_elem_count",
+            self._count_tensor(associations.numel(), associations.device),
+        )
+        self._accumulate_monitoring_stat("write_gate_sum", mb.float().sum())
+        self._accumulate_monitoring_stat(
+            "write_gate_elem_count",
+            self._count_tensor(mb.numel(), mb.device),
+        )
+
         if self.tbptt_mode:
             # Avoid in-place updates on buffers that were used earlier in the forward,
             # which can invalidate autograd saved tensors (version counter mismatch).
@@ -269,5 +351,17 @@ class AssociativeLayer(nn.Module):
             self.W_mem = self.W_mem + associations
             if self.use_denom:
                 self.z = self.z + (new_info_coef * mk).sum(dim=-2)
+
+        self._accumulate_monitoring_stat("W_mem_sq_sum", self.W_mem.float().square().sum())
+        self._accumulate_monitoring_stat(
+            "W_mem_elem_count",
+            self._count_tensor(self.W_mem.numel(), self.W_mem.device),
+        )
+        if self.use_denom:
+            self._accumulate_monitoring_stat("z_sq_sum", self.z.float().square().sum())
+            self._accumulate_monitoring_stat(
+                "z_elem_count",
+                self._count_tensor(self.z.numel(), self.z.device),
+            )
 
         self._first_chunk = False
