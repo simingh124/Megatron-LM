@@ -823,6 +823,19 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.seq_length, \
             f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
             f"or equal to seq_length ({args.seq_length})."
+    if args.baseline_virtual_chunk_size is not None:
+        assert args.baseline_virtual_chunk_size > 0, (
+            "baseline-virtual-chunk-size must be a positive integer."
+        )
+        assert args.context_parallel_size == 1, (
+            "baseline-virtual-chunk-size currently requires context-parallel-size == 1."
+        )
+        assert args.baseline_virtual_chunk_size <= args.seq_length, (
+            "baseline-virtual-chunk-size must be less than or equal to seq-length."
+        )
+        assert args.seq_length % args.baseline_virtual_chunk_size == 0, (
+            "baseline-virtual-chunk-size requires seq-length % baseline-virtual-chunk-size == 0."
+        )
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
