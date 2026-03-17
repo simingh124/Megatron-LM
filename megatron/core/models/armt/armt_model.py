@@ -10,6 +10,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 from .armt_layer import ARMTLayer
+from .monitoring import finalize_metric_primitives, merge_metric_primitives
 
 
 class ARMTModel(GPTModel):
@@ -43,6 +44,21 @@ class ARMTModel(GPTModel):
         for module in self.modules():
             if isinstance(module, ARMTLayer):
                 module.reset_memory()
+
+    def reset_all_monitoring_stats(self):
+        for module in self.modules():
+            if isinstance(module, ARMTLayer):
+                module.reset_monitoring_stats()
+
+    def consume_all_monitoring_primitives(self):
+        primitives = {}
+        for module in self.modules():
+            if isinstance(module, ARMTLayer):
+                merge_metric_primitives(primitives, module.consume_monitoring_primitives())
+        return primitives
+
+    def consume_all_monitoring_metrics(self):
+        return finalize_metric_primitives(self.consume_all_monitoring_primitives())
 
     def _concat_memory_embeddings(self, decoder_input: torch.Tensor) -> torch.Tensor:
         batch_size = decoder_input.shape[1]

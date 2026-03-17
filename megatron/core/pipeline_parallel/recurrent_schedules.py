@@ -6,10 +6,18 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.models.armt.monitoring import (
+    build_ratio_metric,
+    clear_armt_tensorboard_metrics,
+    merge_metric_primitives,
+    publish_armt_tensorboard_metrics,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config, get_model_type, unwrap_model
 
 from .schedules import backward_step
+
+_PRIMARY_LOSS_KEY = "lm loss"
 
 
 def _get_recurrent_chunk_size(args) -> Optional[int]:
@@ -111,6 +119,29 @@ def _accumulate_chunk_reports(
     return accumulated
 
 
+def _accumulate_chunk_loss_metrics(
+    per_chunk_loss_sums: Dict[int, torch.Tensor],
+    per_chunk_token_sums: Dict[int, torch.Tensor],
+    *,
+    chunk_idx: int,
+    chunk_report: Dict[str, torch.Tensor],
+) -> None:
+    loss_report = chunk_report.get(_PRIMARY_LOSS_KEY)
+    if not isinstance(loss_report, torch.Tensor) or loss_report.numel() != 2:
+        return
+
+    loss_report = loss_report.view(-1).detach().to(dtype=torch.float32)
+    current_loss_sum = per_chunk_loss_sums.get(chunk_idx)
+    current_token_sum = per_chunk_token_sums.get(chunk_idx)
+    if current_loss_sum is None:
+        per_chunk_loss_sums[chunk_idx] = loss_report[0]
+        per_chunk_token_sums[chunk_idx] = loss_report[1]
+        return
+
+    per_chunk_loss_sums[chunk_idx] = current_loss_sum + loss_report[0]
+    per_chunk_token_sums[chunk_idx] = current_token_sum + loss_report[1]
+
+
 def recurrent_forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -163,8 +194,14 @@ def recurrent_forward_backward_no_pipelining(
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
+    clear_armt_tensorboard_metrics()
     losses_reduced = []
     total_num_tokens = torch.zeros([], dtype=torch.int)
+    per_chunk_loss_sums: Dict[int, torch.Tensor] = {}
+    per_chunk_token_sums: Dict[int, torch.Tensor] = {}
+    unwrapped_model = unwrap_model(model)
+    if hasattr(unwrapped_model, "reset_all_monitoring_stats"):
+        unwrapped_model.reset_all_monitoring_stats()
 
     from megatron.training import global_vars as training_global_vars
 
@@ -194,7 +231,6 @@ def recurrent_forward_backward_no_pipelining(
                 )
             chunks[0]["loss_mask"] = torch.zeros_like(chunks[0]["loss_mask"])
 
-        unwrapped_model = unwrap_model(model)
         if hasattr(unwrapped_model, "reset_all_memory"):
             unwrapped_model.reset_all_memory()
 
@@ -242,6 +278,12 @@ def recurrent_forward_backward_no_pipelining(
                         "Recurrent TBPTT schedule expects loss_func to return a dict as "
                         f"loss_reduced (got {type(loss_reduced)})."
                     )
+                _accumulate_chunk_loss_metrics(
+                    per_chunk_loss_sums,
+                    per_chunk_token_sums,
+                    chunk_idx=chunk_idx,
+                    chunk_report=loss_reduced,
+                )
                 microbatch_loss_reduced = _accumulate_chunk_reports(
                     microbatch_loss_reduced,
                     microbatch_scalar_accumulators,
@@ -274,6 +316,24 @@ def recurrent_forward_backward_no_pipelining(
             pg_collection=pg_collection,
             force_all_reduce=force_all_reduce,
         )
+
+    monitoring_primitives = {}
+    if hasattr(unwrapped_model, "consume_all_monitoring_primitives"):
+        model_primitives = unwrapped_model.consume_all_monitoring_primitives()
+        if isinstance(model_primitives, dict):
+            merge_metric_primitives(
+                monitoring_primitives,
+                model_primitives,
+            )
+
+    if not forward_only:
+        for chunk_idx, loss_sum in per_chunk_loss_sums.items():
+            metric_name = f"train/chunk_{chunk_idx:02d}_loss"
+            monitoring_primitives[metric_name] = build_ratio_metric(
+                loss_sum,
+                per_chunk_token_sums[chunk_idx],
+            )
+        publish_armt_tensorboard_metrics(monitoring_primitives)
 
     return losses_reduced
 

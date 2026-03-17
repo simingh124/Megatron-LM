@@ -1,8 +1,10 @@
 import torch
+import pytest
 from unittest.mock import MagicMock, patch
 
 from megatron.core.models.armt.armt_model import ARMTModel
 from megatron.core.models.armt.armt_layer import ARMTLayer
+from megatron.core.models.armt.monitoring import build_mean_metric, build_ratio_metric
 
 
 def _minimal_gpt_init(self, config, transformer_layer_spec, vocab_size, max_sequence_length, **kwargs):
@@ -79,6 +81,72 @@ class TestARMTModel:
 
         model.reset_all_memory()
         layer.reset_memory.assert_called_once()
+
+    def test_armt_model_monitoring_helpers(self):
+        """验证模型级 monitoring reset/consume 会跨 ARMT 层聚合。"""
+        config = MagicMock()
+        config.hidden_size = 256
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+        layer_one.reset_monitoring_stats = MagicMock()
+        layer_two.reset_monitoring_stats = MagicMock()
+        layer_one.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(4.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_metric(
+                    torch.tensor(3.0),
+                    torch.tensor(6.0),
+                ),
+            }
+        )
+        layer_two.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(6.0),
+                    torch.tensor(3.0),
+                ),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_metric(
+                    torch.tensor(2.0),
+                    torch.tensor(4.0),
+                ),
+            }
+        )
+        model.add_module("armt_layer_one", layer_one)
+        model.add_module("armt_layer_two", layer_two)
+
+        model.reset_all_monitoring_stats()
+        layer_one.reset_monitoring_stats.assert_called_once()
+        layer_two.reset_monitoring_stats.assert_called_once()
+
+        metrics = model.consume_all_monitoring_metrics()
+
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.5)
 
     def test_armt_model_rope_extension(self):
         """验证 _preprocess 在拼接 memory tokens 后会重新生成/扩展 RoPE 到 S+M。"""

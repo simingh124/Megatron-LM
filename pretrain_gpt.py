@@ -26,6 +26,10 @@ from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.models.armt.monitoring import (
+    accumulate_armt_tensorboard_metrics,
+    build_ratio_metric,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_attr_wrapped_model, get_thd_batch_on_this_cp_rank, get_batch_on_this_hybrid_cp_rank, StragglerDetector
@@ -101,6 +105,45 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 SPIKY_LOSS_FACTOR = 10
 
 
+def _build_virtual_chunk_monitoring_primitives(
+    losses: torch.Tensor,
+    loss_mask: torch.Tensor,
+    virtual_chunk_size: int,
+):
+    """Build token-weighted virtual chunk loss monitoring primitives for TensorBoard."""
+    if loss_mask.dim() != 2:
+        raise ValueError(
+            "baseline-virtual-chunk-size expects loss_mask to be a 2D [batch, seq] tensor."
+        )
+    if losses.numel() != loss_mask.numel():
+        raise ValueError(
+            "baseline-virtual-chunk-size expects output_tensor and loss_mask to have matching "
+            f"numel, got {losses.numel()} and {loss_mask.numel()}."
+        )
+
+    losses = losses.reshape_as(loss_mask)
+    seq_length = loss_mask.shape[1]
+    if seq_length % virtual_chunk_size != 0:
+        raise ValueError(
+            "baseline-virtual-chunk-size expects the effective sequence length per rank to be "
+            "divisible by the virtual chunk size."
+        )
+
+    primitives = {}
+    for chunk_idx, chunk_start in enumerate(range(0, seq_length, virtual_chunk_size)):
+        chunk_end = chunk_start + virtual_chunk_size
+        chunk_losses = losses[:, chunk_start:chunk_end]
+        chunk_loss_mask = loss_mask[:, chunk_start:chunk_end]
+        chunk_loss_sum = torch.sum(chunk_losses * chunk_loss_mask)
+        chunk_num_tokens = chunk_loss_mask.sum().clone().detach().to(torch.int)
+        primitives[f"train/chunk_{chunk_idx:02d}_loss"] = build_ratio_metric(
+            chunk_loss_sum,
+            chunk_num_tokens,
+        )
+
+    return primitives
+
+
 def loss_func(
     loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
 ):
@@ -120,14 +163,32 @@ def loss_func(
     args = get_args()
 
     if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+        if args.baseline_virtual_chunk_size is not None:
+            raise NotImplementedError(
+                "baseline-virtual-chunk-size is not supported with modelopt-enabled training."
+            )
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
-        losses = output_tensor.view(-1).float()
-        loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses * loss_mask)
+        losses = output_tensor.float()
+        loss_mask = loss_mask.float()
+        if losses.numel() != loss_mask.numel():
+            raise ValueError(
+                "loss_func expects output_tensor and loss_mask to have matching numel, "
+                f"got {losses.numel()} and {loss_mask.numel()}."
+            )
+        losses = losses.reshape_as(loss_mask)
+        loss = torch.sum(losses.reshape(-1) * loss_mask.reshape(-1))
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+        if args.baseline_virtual_chunk_size is not None:
+            accumulate_armt_tensorboard_metrics(
+                _build_virtual_chunk_monitoring_primitives(
+                    losses,
+                    loss_mask,
+                    args.baseline_virtual_chunk_size,
+                )
+            )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()

@@ -15,12 +15,14 @@ set -ex
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
 #
 # Optional:
-#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable JIT fuser
+#   DISABLE_JIT_FUSER=1        add --disable-jit-fuser explicitly
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== For test ==========
-ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+# ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
+# DISABLE_JIT_FUSER=${DISABLE_JIT_FUSER:-${ENABLE_TEST_TRAIN_RUN}}
 
 # ========== Distributed training setup ==========
 GPUS_PER_NODE=${PROC_PER_NODE:-8}
@@ -32,14 +34,15 @@ WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
 # ========== Fixed paths ==========
 ROOT="/mnt/step3-abla/siming"
-MEGATRON_ROOT="${ROOT}/code_repo/Megatron-LM"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
 # Read from file name without extension
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
 
 PRETRAIN_SCRIPT_PATH="${MEGATRON_ROOT}/examples/armt/train.py"
-LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp2_pp1_torch_dist"
+LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp1_pp1_torch_dist"
 TOKENIZER_DIR="${ROOT}/tokenizers/qwen3_tokenizer"
 
 CHECKPOINT_PATH="${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}"
@@ -49,7 +52,7 @@ mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 # ========== Optional terminal+file logging ==========
-# Default off for smoke tests. Set ENABLE_TEE_LOG=1 to enable explicitly.
+# Default off for smoke tests. Set ENABLE_TEE_LOG=1 to enable.
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
 else
@@ -106,7 +109,7 @@ DATASET_PATH="
 
 # ========== Fixed model parameters ==========
 # Must match the checkpoint.
-TP_SIZE=2
+TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
 
@@ -117,7 +120,7 @@ NUM_ATTN_HEADS=16
 NUM_QUERY_GROUPS=8
 KV_CHANNELS=128
 
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=32768
 
 VOCAB_SIZE=151936
@@ -131,13 +134,13 @@ NORM_EPS=1e-6
 # ========== ARMT parameters ==========
 NUM_MEM_TOKENS=16
 ARMT_CHUNK_SIZE=512
-ARMT_N_HEADS=32
-ARMT_HEAD_SIZE=64
-ARMT_D_MEM=$(( ${ARMT_N_HEADS} * ${ARMT_HEAD_SIZE} ))
+ARMT_N_HEADS=16
 
 # ========== Fixed training parameters (smoke-friendly defaults) ==========
-MICRO_BATCH_SIZE=20
-GLOBAL_BATCH_SIZE=480
+# Keep tokens/update aligned with the baseline seq4096 script while remaining
+# divisible for the default 8-way data parallel launch.
+MICRO_BATCH_SIZE=15
+GLOBAL_BATCH_SIZE=120
 
 
 TRAIN_TOKENS=100000000000
@@ -150,6 +153,11 @@ LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 
 LR=5e-4
 MIN_LR=1e-5
+
+if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * WORLD_SIZE) != 0 )); then
+  echo "ERROR: global batch size ${GLOBAL_BATCH_SIZE} must be divisible by micro batch size ${MICRO_BATCH_SIZE} * world size ${WORLD_SIZE}" >&2
+  exit 1
+fi
 
 DISTRIBUTED_ARGS=(
   --nproc_per_node ${GPUS_PER_NODE}
@@ -194,7 +202,6 @@ ARMT_ARGS=(
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --armt-n-heads ${ARMT_N_HEADS}
-  --armt-d-mem ${ARMT_D_MEM}
 )
 
 TRAINING_ARGS=(
@@ -248,6 +255,9 @@ fi
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   EXTRA_ARGS+=(--test-train-run)
 fi
+if [[ "${DISABLE_JIT_FUSER}" == "1" ]]; then
+  EXTRA_ARGS+=(--disable-jit-fuser)
+fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
@@ -261,8 +271,9 @@ echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
-echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE} ARMT_D_MEM=${ARMT_D_MEM}"
+echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "DISABLE_JIT_FUSER=${DISABLE_JIT_FUSER}"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \

@@ -1,26 +1,29 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B ARMT continual training from torch_dist ckpt.
+# Qwen3-0.6B continual training (torch_dist ckpt), FineWeb-Edu 2025.
 #
-# Verification goal:
-# - Training can start from converted checkpoint.
-# - ARMT-specific params are newly created and kept random-initialized.
-# - Loss is not close to random guess (≈ ln(vocab)).
+# Based on:
+#   playground/rmt/qwen3_0p6b_baseline_0210.sh
 #
-# Distributed settings are configurable via env vars:
+# This variant changes:
+# - seq length: 4096
+# - baseline virtual chunk size: 512
+# - optional smoke-test mode via ENABLE_TEST_TRAIN_RUN=1 -> adds --test-train-run
+#
+# Only distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
 #
-# Exit interval:
-#   Set EXIT_INTERVAL=1 to stop after 1 iter.
-#
 # Optional:
-#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   EXIT_INTERVAL=1            stop after 1 iter
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run
 
+# Environment variables for performance tuning
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== For test ==========
-ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+# ENABLE_TEST_TRAIN_RUN=1
+
 
 # ========== Distributed training setup ==========
 GPUS_PER_NODE=${PROC_PER_NODE:-8}
@@ -30,31 +33,36 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-9899}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
+
 # ========== Fixed paths ==========
 ROOT="/mnt/step3-abla/siming"
-MEGATRON_ROOT="${ROOT}/code_repo/Megatron-LM"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEGATRON_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
+
+PRETRAIN_SCRIPT_PATH="${MEGATRON_ROOT}/pretrain_gpt.py"
+LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp1_pp1_torch_dist"
+TOKENIZER_DIR="${ROOT}/tokenizers/qwen3_tokenizer"
 
 # Read from file name without extension
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
 
-PRETRAIN_SCRIPT_PATH="${MEGATRON_ROOT}/examples/armt/train.py"
-LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp2_pp1_torch_dist"
-TOKENIZER_DIR="${ROOT}/tokenizers/qwen3_tokenizer"
-
 CHECKPOINT_PATH="${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}"
 TENSORBOARD_LOGS_PATH="${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}"
 LOG_DIR="${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"
+# DATA_CACHE_PATH="${ROOT}/outputs/data_cache/fineweb_edu_2025"
+
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 # ========== Optional terminal+file logging ==========
-# Default off for smoke tests. Set ENABLE_TEE_LOG=1 to enable explicitly.
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
 else
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
 fi
+
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
@@ -69,12 +77,16 @@ if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   echo "LOG_FILE=${LOG_FILE}"
 fi
 
-if ! command -v torchrun >/dev/null 2>&1; then
-  echo "ERROR: torchrun not found in PATH" >&2
+if [[ -n "${DATA_CACHE_PATH}" ]]; then
+  mkdir -p "${DATA_CACHE_PATH}"
+fi
+
+if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
+  echo "ERROR: pretrain_gpt.py not found: ${PRETRAIN_SCRIPT_PATH}" >&2
   exit 1
 fi
-if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
-  echo "ERROR: ARMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
+if ! command -v torchrun >/dev/null 2>&1; then
+  echo "ERROR: torchrun not found in PATH" >&2
   exit 1
 fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
@@ -87,7 +99,7 @@ if [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
 fi
 
 # ========== Data ==========
-# FineWeb-Edu merged-by-year, 2013-2025.
+# FineWeb-Edu merged-by-year, 2025 (token count: 104_357_702_010).
 DATASET_PATH="
 22715400849 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2013 \
 92435520518 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2014 \
@@ -105,8 +117,8 @@ DATASET_PATH="
 "
 
 # ========== Fixed model parameters ==========
-# Must match the checkpoint.
-TP_SIZE=2
+# From config.json + run_config.yaml (must match ckpt).
+TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
 
@@ -117,29 +129,28 @@ NUM_ATTN_HEADS=16
 NUM_QUERY_GROUPS=8
 KV_CHANNELS=128
 
-SEQ_LENGTH=1024
+SEQ_LENGTH=4096
 MAX_POSITION_EMBEDDINGS=32768
+BASELINE_VIRTUAL_CHUNK_SIZE=512
 
 VOCAB_SIZE=151936
 MAKE_VOCAB_SIZE_DIVISIBLE_BY=128
 
+# RoPE must match the checkpoint/hf config (Qwen3 uses rope_theta=1e6).
+# If rotary_base mismatches, checkpoint can still "load successfully" but the forward pass
+# position encoding is inconsistent and the loss will look close to random (≈ ln(vocab)).
 ROTARY_BASE=1000000
 ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
-# ========== ARMT parameters ==========
-NUM_MEM_TOKENS=16
-ARMT_CHUNK_SIZE=512
-ARMT_N_HEADS=32
-ARMT_HEAD_SIZE=64
-ARMT_D_MEM=$(( ${ARMT_N_HEADS} * ${ARMT_HEAD_SIZE} ))
+# ========== Fixed training parameters ==========
+# Derived from the seq1024 baseline by keeping tokens/update unchanged.
+MICRO_BATCH_SIZE=5
+GLOBAL_BATCH_SIZE=120
 
-# ========== Fixed training parameters (smoke-friendly defaults) ==========
-MICRO_BATCH_SIZE=20
-GLOBAL_BATCH_SIZE=480
-
-
+# Continual training schedule (token-based -> iters).
+# Note: This corresponds to training on all FineWeb-Edu 2025 tokens; adjust in-script if you want a shorter run.
 TRAIN_TOKENS=100000000000
 LR_DECAY_TOKENS=${TRAIN_TOKENS}
 WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
@@ -189,14 +200,6 @@ MODEL_ARGS=(
   --make-vocab-size-divisible-by ${MAKE_VOCAB_SIZE_DIVISIBLE_BY}
 )
 
-ARMT_ARGS=(
-  --use-armt-tbptt
-  --num-mem-tokens ${NUM_MEM_TOKENS}
-  --armt-chunk-size ${ARMT_CHUNK_SIZE}
-  --armt-n-heads ${ARMT_N_HEADS}
-  --armt-d-mem ${ARMT_D_MEM}
-)
-
 TRAINING_ARGS=(
   --micro-batch-size ${MICRO_BATCH_SIZE}
   --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -213,6 +216,7 @@ TRAINING_ARGS=(
   --adam-beta2 0.95
   --adam-eps 1e-8
   --seed 42
+  --baseline-virtual-chunk-size ${BASELINE_VIRTUAL_CHUNK_SIZE}
 )
 
 DATA_ARGS=(
@@ -222,21 +226,24 @@ DATA_ARGS=(
   --tokenizer-type HuggingFaceTokenizer
   --tokenizer-model "${TOKENIZER_DIR}"
 )
+if [[ -n "${DATA_CACHE_PATH}" ]]; then
+  DATA_ARGS+=(--data-cache-path "${DATA_CACHE_PATH}")
+fi
 
 CKPT_AND_LOG_ARGS=(
   --ckpt-format torch_dist
-  # Important: baseline ckpt doesn't have ARMT params; drop those "unexpected" keys.
+  # Fail-fast / visibility for distributed checkpoint key mismatches.
+  # Options: assume_ok_unexpected | log_unexpected | log_all | raise_unexpected | raise_all | return_unexpected | return_all | ignore_all
+  # Recommendation: start with log_all, switch to raise_all when debugging.
   --dist-ckpt-strictness log_all
   --load "${LOAD_CHECKPOINT_PATH}"
   --save "${CHECKPOINT_PATH}"
   --no-load-optim
   --no-load-rng
-  # --no-save-optim
-  # --no-save-rng
   --log-interval 1
   --eval-interval 1000000000
   --eval-iters 0
-  --save-interval 2000
+  --save-interval 5000
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
@@ -259,14 +266,13 @@ echo "WORLD_SIZE=${WORLD_SIZE} (GPUS_PER_NODE=${GPUS_PER_NODE}, NUM_NODES=${NUM_
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
-echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
-echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
-echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE} ARMT_D_MEM=${ARMT_D_MEM}"
+echo "SEQ_LENGTH=${SEQ_LENGTH}"
+echo "BASELINE_VIRTUAL_CHUNK_SIZE=${BASELINE_VIRTUAL_CHUNK_SIZE}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "TRAIN_ITERS=${TRAIN_ITERS} (TRAIN_TOKENS=${TRAIN_TOKENS})"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \
-  ${ARMT_ARGS[@]} \
   ${MODEL_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
   ${DATA_ARGS[@]} \

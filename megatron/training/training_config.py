@@ -249,6 +249,9 @@ class LoggerConfig:
     before one of the 'add' calls forces a flush to disk.
     """
 
+    baseline_virtual_chunk_size: int | None = None
+    """If set, log per-segment LM loss in standard GPT training for chunk-wise comparison."""
+
     log_timers_to_tensorboard: bool = False
     """If set, write timers to tensorboard."""
 

@@ -15,10 +15,15 @@ set -ex
 #
 # Exit interval:
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
+#
+# Optional:
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 
 # Environment variables for performance tuning
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
+# ========== For test ==========
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
 # ========== Distributed training setup ==========
 GPUS_PER_NODE=${PROC_PER_NODE:-8}
@@ -50,9 +55,14 @@ mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 # ========== Optional terminal+file logging ==========
-# Default on. Set ENABLE_TEE_LOG=0 to disable.
-ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+# Default off for smoke tests. Set ENABLE_TEE_LOG=1 to enable explicitly.
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+else
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
+  mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
   LOG_FILE="${LOG_DIR}/train_${LOG_TS}.log"
   if [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -242,6 +252,9 @@ EXTRA_ARGS=()
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  EXTRA_ARGS+=(--test-train-run)
+fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
@@ -254,6 +267,7 @@ echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_ITERS=${TRAIN_ITERS} (TRAIN_TOKENS=${TRAIN_TOKENS})"
+echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \

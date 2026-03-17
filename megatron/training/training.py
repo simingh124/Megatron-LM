@@ -143,6 +143,10 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.models.armt.monitoring import (
+    clear_armt_tensorboard_metrics,
+    consume_armt_tensorboard_metrics,
+)
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_global_symmetric_memory_buffer,
@@ -1866,6 +1870,7 @@ def training_log(
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    batch_size_tokens = batch_size * args.seq_length
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -1874,8 +1879,22 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
+    should_log_to_tensorboard = bool(args.tensorboard_dir) and (
+        iteration % args.tensorboard_log_interval == 0
+    )
+    if should_log_to_tensorboard:
+        armt_reduce_group = None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            armt_reduce_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        armt_tensorboard_metrics = consume_armt_tensorboard_metrics(
+            reduce_group=armt_reduce_group
+        )
+    else:
+        armt_tensorboard_metrics = {}
+        clear_armt_tensorboard_metrics()
+
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0):
+    if writer and should_log_to_tensorboard:
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         writer.add_scalar('learning-rate', learning_rate, iteration)
@@ -1888,6 +1907,10 @@ def training_log(
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
         writer.add_scalar('batch-size', batch_size, iteration)
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
+        writer.add_scalar('batch-size-tokens', batch_size_tokens, iteration)
+        writer.add_scalar(
+            'batch-size-tokens vs samples', batch_size_tokens, args.consumed_train_samples
+        )
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
         # Log bins for packed mode
@@ -1950,6 +1973,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+        for metric_name, metric_value in armt_tensorboard_metrics.items():
+            writer.add_scalar(metric_name, metric_value, iteration)
 
     # Log MoE metrics.
     if args.num_experts is not None:

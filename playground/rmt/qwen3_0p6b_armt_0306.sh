@@ -13,10 +13,17 @@ set -ex
 #
 # Exit interval:
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
+#
+# Optional:
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
-GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
+# ========== For test ==========
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+
+# ========== Distributed training setup ==========
+GPUS_PER_NODE=${PROC_PER_NODE:-8}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -40,10 +47,16 @@ TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"${ROOT}/exp_logs/tensorboard/rmt
 LOG_DIR=${LOG_DIR:-"${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"}
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
-mkdir -p "${LOG_DIR}"
 
-ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+# ========== Optional terminal+file logging ==========
+# Default off for smoke tests. Set ENABLE_TEE_LOG=1 to enable explicitly.
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+else
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
+  mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
   LOG_FILE="${LOG_DIR}/train_${LOG_TS}.log"
   if [[ "${NUM_NODES}" -gt 1 ]]; then
@@ -225,6 +238,9 @@ EXTRA_ARGS=()
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  EXTRA_ARGS+=(--test-train-run)
+fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
@@ -239,6 +255,7 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE}"
+echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \

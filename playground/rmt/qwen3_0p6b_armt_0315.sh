@@ -32,14 +32,15 @@ WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
 # ========== Fixed paths ==========
 ROOT="/mnt/step3-abla/siming"
-MEGATRON_ROOT="${ROOT}/code_repo/Megatron-LM"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
 # Read from file name without extension
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
 
 PRETRAIN_SCRIPT_PATH="${MEGATRON_ROOT}/examples/armt/train.py"
-LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp2_pp1_torch_dist"
+LOAD_CHECKPOINT_PATH="${ROOT}/ckpts/mlm/qwen3_0p6b_tp1_pp1_torch_dist"
 TOKENIZER_DIR="${ROOT}/tokenizers/qwen3_tokenizer"
 
 CHECKPOINT_PATH="${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}"
@@ -106,7 +107,7 @@ DATASET_PATH="
 
 # ========== Fixed model parameters ==========
 # Must match the checkpoint.
-TP_SIZE=2
+TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
 
@@ -131,12 +132,10 @@ NORM_EPS=1e-6
 # ========== ARMT parameters ==========
 NUM_MEM_TOKENS=16
 ARMT_CHUNK_SIZE=512
-ARMT_N_HEADS=32
-ARMT_HEAD_SIZE=64
-ARMT_D_MEM=$(( ${ARMT_N_HEADS} * ${ARMT_HEAD_SIZE} ))
+ARMT_N_HEADS=16
 
 # ========== Fixed training parameters (smoke-friendly defaults) ==========
-MICRO_BATCH_SIZE=20
+MICRO_BATCH_SIZE=30
 GLOBAL_BATCH_SIZE=480
 
 
@@ -194,7 +193,6 @@ ARMT_ARGS=(
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --armt-n-heads ${ARMT_N_HEADS}
-  --armt-d-mem ${ARMT_D_MEM}
 )
 
 TRAINING_ARGS=(
@@ -261,7 +259,7 @@ echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
-echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE} ARMT_D_MEM=${ARMT_D_MEM}"
+echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
