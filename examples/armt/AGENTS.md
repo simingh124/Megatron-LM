@@ -22,8 +22,8 @@
    - `get_armt_layer_spec(...)` 产出 ARMT layer spec
    - `ARMTModel(...)` 构建带 memory tokens 的 GPT 变体
 4. 调度（TBPTT）：
-   - 实现：`megatron/core/pipeline_parallel/armt_schedules.py:armt_forward_backward_no_pipelining`
-   - 需要作为训练 loop 的 `forward_backward_func` 运行（默认 `schedules.py` 不会自动选用）。
+   - 实现：`megatron/core/pipeline_parallel/recurrent_schedules.py:recurrent_forward_backward_no_pipelining`
+   - `schedules.py` 会在 `use_recurrent_tbptt` 打开时自动选用。
 
 ## Batch Contract (forward_step)
 - 关键字段：`tokens/labels/loss_mask/attention_mask/position_ids`

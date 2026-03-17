@@ -16,7 +16,7 @@
    - `--data-path/--split/...` -> `blend`/`blend_per_split`
 2. `BlendedMegatronDatasetBuilder(...).build()` -> `GPTDataset.__getitem__` 产 batch（CPU）
 3. `training/datasets.build_pretraining_data_loader()` 负责 sampler/DataLoader
-4. TBPTT：`armt_schedules.chunk_data()` 依据 `seq_length` 切 `tokens/labels/loss_mask/position_ids`，并对 `attention_mask[...,s:e,s:e]` 做方阵切片
+4. TBPTT：`recurrent_schedules.chunk_data()` 依据 `seq_length` 切 `tokens/labels/loss_mask/position_ids`，并对 `attention_mask[...,s:e,s:e]` 做方阵切片
 
 ## Dev Notes
 - `--create-attention-mask-in-dataloader` 决定是否返回 `attention_mask`；TBPTT 可无此字段（模型需能处理）。

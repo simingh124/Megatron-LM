@@ -277,13 +277,7 @@ def recurrent_forward_backward_no_pipelining(
 
     return losses_reduced
 
-
-# Compatibility export for existing ARMT callers.
-armt_forward_backward_no_pipelining = recurrent_forward_backward_no_pipelining
-
-
 __all__ = [
-    "armt_forward_backward_no_pipelining",
     "chunk_data",
     "recurrent_forward_backward_no_pipelining",
 ]

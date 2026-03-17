@@ -5,7 +5,7 @@
 - Training infrastructure and argument plumbing: `megatron/training/`; reference entrypoints at repo root (`pretrain_gpt.py`, `pretrain_t5.py`, `train_rl.py`).
 - ARMT focus paths:
   - `megatron/core/models/armt/`
-  - `megatron/core/pipeline_parallel/armt_schedules.py`
+  - `megatron/core/pipeline_parallel/recurrent_schedules.py`
   - `examples/armt/` (entrypoint, configs, conversion tool)
   - `tests/unit_tests/models/armt/` and `examples/armt/tests/`
 - Testing split: `tests/unit_tests/` (fast), `tests/functional_tests/test_cases/` (YAML-driven integration), `tests/test_utils/` (shared launch tooling).
@@ -27,7 +27,7 @@
 ## ARMT-Specific Guardrails
 - Validate constraints before large runs: PP must be `1`, CP must be `1`, FP8 unsupported, and position embedding must be `rope` or `yarn`.
 - With sequence parallel enabled, ensure `(armt_chunk_size + num_mem_tokens) % TP == 0`.
-- TBPTT chunking behavior is implemented in `megatron/core/pipeline_parallel/armt_schedules.py`; update tests when changing chunk semantics.
+- TBPTT chunking behavior is implemented in `megatron/core/pipeline_parallel/recurrent_schedules.py`; update tests when changing chunk semantics.
 
 ## Testing Guidelines
 - Test framework is `pytest` (`python_files = test_*.py`).

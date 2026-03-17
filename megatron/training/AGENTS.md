@@ -15,9 +15,9 @@
 1. `examples/armt/train.py` -> `pretrain(..., extra_args_provider=add_armt_args, model_provider=...)`
 2. `initialize_megatron()` -> `set_global_variables(args)`（会构建 legacy tokenizer 并设置 `args.padded_vocab_size`）
 3. `train_valid_test_datasets_provider()`（来自 `pretrain_gpt.py`）构建 datasets + dataloaders
-4. `train_step()` 调 `forward_backward_func(...)`；ARMT TBPTT 需要用 `armt_schedules.armt_forward_backward_no_pipelining`
+4. `train_step()` 调 `forward_backward_func(...)`；ARMT/RMT TBPTT 由 `recurrent_schedules.recurrent_forward_backward_no_pipelining` 执行
 
 ## Dev Notes
-- ARMT 接入点：`extra_args_provider`（新增 flags）+ `model_provider`（构建 `ARMTModel`）+ 自定义 schedule（TBPTT）。
+- ARMT 接入点：`extra_args_provider`（新增 flags）+ `model_provider`（构建 `ARMTModel`）+ recurrent TBPTT schedule。
 - `--ckpt-format torch_dist` 时 load/save 走 `core/dist_checkpointing`；baseline -> ARMT 新参数会触发 unexpected keys，需 `--dist-ckpt-strictness log_*`。
 - batch 的 `.cuda()`/TP broadcast 由 schedule/forward_step 协议决定；ARMT TBPTT schedule 内部调用 `get_batch_on_this_tp_rank()`。

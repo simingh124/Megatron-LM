@@ -20,7 +20,7 @@
 2. `examples/armt/train.py` 构建 `ARMTModel`（依赖 `core/models/*` + `core/transformer/*`）
 3. 训练 loop 调 `forward_backward_func`：
    - 默认来自 `pipeline_parallel/schedules.py`
-   - ARMT TBPTT 需显式选用 `pipeline_parallel/armt_schedules.py`
+   - ARMT/RMT TBPTT 由 `pipeline_parallel/recurrent_schedules.py` 提供 no-pipeline 实现
 4. `training/checkpointing.py` 在 `--ckpt-format torch_dist` 下走 `core/dist_checkpointing`
 
 ## Dev Notes

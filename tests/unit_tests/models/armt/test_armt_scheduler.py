@@ -287,14 +287,6 @@ def test_get_forward_backward_func_selects_recurrent_tbptt_schedule():
         training_global_vars._GLOBAL_ARGS = old_global_args
 
 
-def test_armt_schedule_compatibility_alias_points_to_recurrent_schedule():
-    from megatron.core.pipeline_parallel.armt_schedules import (
-        armt_forward_backward_no_pipelining,
-    )
-
-    assert armt_forward_backward_no_pipelining is recurrent_forward_backward_no_pipelining
-
-
 def test_no_loss_from_first_chunk_requires_loss_mask():
     raw_batch = {
         "tokens": torch.randint(0, 100, (1, 8)),
