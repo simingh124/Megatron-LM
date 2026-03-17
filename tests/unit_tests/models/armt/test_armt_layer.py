@@ -81,14 +81,16 @@ class TestARMTLayer:
 
     def test_armt_layer_token_monitoring_metrics(self, mock_config):
         """验证 token 监控指标按最终层输出计算。"""
-        num_mem_tokens = 2
-        hidden_states = torch.zeros(4, 1, 2)
+        num_mem_tokens = 4
+        hidden_states = torch.zeros(6, 1, 2)
         monitored_hidden = torch.tensor(
             [
                 [[3.0, 4.0]],
                 [[0.0, 5.0]],
                 [[1.0, 0.0]],
-                [[0.0, 2.0]],
+                [[1.0, 0.0]],
+                [[-1.0, 0.0]],
+                [[0.0, 1.0]],
             ]
         )
 
@@ -118,9 +120,14 @@ class TestARMTLayer:
         metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
 
         assert float(metrics["armt/token/context_token_norm_mean"]) == pytest.approx(5.0)
-        assert float(metrics["armt/token/mem_token_norm_mean"]) == pytest.approx(1.5)
-        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.3)
-        assert float(metrics["armt/token/mem_token_cosine_mean"]) == pytest.approx(0.0)
+        assert float(metrics["armt/token/mem_token_norm_mean"]) == pytest.approx(1.0)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.4)
+        assert float(metrics["armt/token/mem_token_cosine_mean"]) == pytest.approx(-1.0 / 6.0)
+        assert float(metrics["armt/token/mem_token_cosine_max_mean"]) == pytest.approx(1.0)
+        assert float(metrics["armt/token/mem_token_cosine_min_mean"]) == pytest.approx(-1.0)
+        assert float(metrics["armt/token/mem_token_cosine_gt_0p8_ratio_mean"]) == pytest.approx(
+            1.0 / 6.0
+        )
         mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
         assert torch.equal(mem_hidden, monitored_hidden[-num_mem_tokens:])
 
@@ -160,6 +167,9 @@ class TestARMTLayer:
         metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
 
         assert "armt/token/mem_token_cosine_mean" not in metrics
+        assert "armt/token/mem_token_cosine_max_mean" not in metrics
+        assert "armt/token/mem_token_cosine_min_mean" not in metrics
+        assert "armt/token/mem_token_cosine_gt_0p8_ratio_mean" not in metrics
 
     def test_armt_layer_sequence_parallel_monitoring_gathers_full_hidden_states(
         self, mock_config

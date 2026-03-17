@@ -11,6 +11,8 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from .associative_layer import AssociativeLayer
 from .monitoring import build_mean_metric, build_ratio_metric, merge_metric_primitives
 
+_MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
+
 
 class ARMTLayer(TransformerLayer):
     """TransformerLayer with associative memory retrieval and update."""
@@ -115,6 +117,12 @@ class ARMTLayer(TransformerLayer):
         )
         cosine = cosine.masked_select(off_diagonal_mask.unsqueeze(0)).view(mem_tokens.shape[0], -1)
         self._accumulate_monitoring_stat("mem_token_cosine_sum", cosine.mean(dim=-1).sum())
+        self._accumulate_monitoring_stat("mem_token_cosine_max_sum", cosine.max(dim=-1).values.sum())
+        self._accumulate_monitoring_stat("mem_token_cosine_min_sum", cosine.min(dim=-1).values.sum())
+        self._accumulate_monitoring_stat(
+            "mem_token_cosine_gt_0p8_ratio_sum",
+            (cosine > _MEM_TOKEN_COSINE_HIGH_THRESHOLD).float().mean(dim=-1).sum(),
+        )
         self._accumulate_monitoring_stat(
             "mem_token_cosine_count",
             self._count_tensor(mem_tokens.shape[0], cosine.device),
@@ -145,6 +153,18 @@ class ARMTLayer(TransformerLayer):
         if "mem_token_cosine_count" in stats:
             primitives["armt/token/mem_token_cosine_mean"] = build_mean_metric(
                 stats["mem_token_cosine_sum"],
+                stats["mem_token_cosine_count"],
+            )
+            primitives["armt/token/mem_token_cosine_max_mean"] = build_mean_metric(
+                stats["mem_token_cosine_max_sum"],
+                stats["mem_token_cosine_count"],
+            )
+            primitives["armt/token/mem_token_cosine_min_mean"] = build_mean_metric(
+                stats["mem_token_cosine_min_sum"],
+                stats["mem_token_cosine_count"],
+            )
+            primitives["armt/token/mem_token_cosine_gt_0p8_ratio_mean"] = build_mean_metric(
+                stats["mem_token_cosine_gt_0p8_ratio_sum"],
                 stats["mem_token_cosine_count"],
             )
 

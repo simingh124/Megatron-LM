@@ -83,6 +83,12 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
     tb_metric_names = [call.args[0] for call in writer.add_scalar.call_args_list]
     assert "armt/read/retrieved_norm_mean" in tb_metric_names
     assert "train/chunk_00_loss" in tb_metric_names
+    assert "batch-size-tokens" in tb_metric_names
+    assert "batch-size-tokens vs samples" in tb_metric_names
+
+    tb_metrics = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    assert tb_metrics["batch-size-tokens"] == (8, 1)
+    assert tb_metrics["batch-size-tokens vs samples"] == (8, 0)
 
     wandb_metric_names = []
     for call in wandb_writer.log.call_args_list:

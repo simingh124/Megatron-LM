@@ -1870,6 +1870,7 @@ def training_log(
 
     # Calculate batch size.
     batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    batch_size_tokens = batch_size * args.seq_length
 
     # Track app tag & app tag ID
     one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
@@ -1906,6 +1907,10 @@ def training_log(
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
         writer.add_scalar('batch-size', batch_size, iteration)
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
+        writer.add_scalar('batch-size-tokens', batch_size_tokens, iteration)
+        writer.add_scalar(
+            'batch-size-tokens vs samples', batch_size_tokens, args.consumed_train_samples
+        )
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
         # Log bins for packed mode
