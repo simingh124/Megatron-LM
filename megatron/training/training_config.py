@@ -52,6 +52,9 @@ class TrainingConfig:
     """Total number of samples to train over all training runs.
     Note that either train_iters or train_samples should be provided."""
 
+    test_train_run: bool = False
+    """If set, disable training artifact writes so scripts can be smoke-tested safely."""
+
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 

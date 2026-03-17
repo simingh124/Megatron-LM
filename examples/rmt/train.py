@@ -1,4 +1,4 @@
-"""ARMT training entrypoint (experimental)."""
+"""RMT training entrypoint (experimental)."""
 
 import os
 import sys
@@ -6,7 +6,6 @@ from functools import partial
 
 import torch
 
-# Add the parent directory to the path to import from megatron
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
@@ -16,35 +15,37 @@ from megatron.training import get_args, pretrain
 from megatron.training.arguments import core_transformer_config_from_args
 
 from pretrain_gpt import loss_func, train_valid_test_datasets_provider
-from megatron.core.models.armt.armt_model import ARMTModel
-from megatron.core.models.armt.armt_layer_specs import get_armt_layer_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.models.rmt.rmt_model import RMTModel
 
-from examples.armt.armt_args import add_armt_args, validate_armt_constraints
+from examples.rmt.rmt_args import add_rmt_args, validate_rmt_constraints
 
 
-def model_provider(
-    pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None, **kwargs
-):
-    args = get_args()
-    validate_armt_constraints(args)
-
-    # ARMT introduces new parameters (e.g., memory embeddings and associative layer weights)
-    # which do not exist in baseline GPT checkpoints. For `torch_dist` distributed checkpoints,
-    # the default strictness ("assume_ok_unexpected") may fail the load because those new keys
-    # are "unexpected" w.r.t. the checkpoint metadata. Switch to a logging strictness to
-    # automatically drop unexpected keys while still loading the rest of the model weights.
-    if (
-        getattr(args, "ckpt_format", None) == "torch_dist"
-        and getattr(args, "load", None)
-        and getattr(args, "dist_ckpt_strictness", None) == "assume_ok_unexpected"
-    ):
-        args.dist_ckpt_strictness = "log_unexpected"
-
-    if config is None:
-        config = core_transformer_config_from_args(args)
-
-    layer_spec = get_armt_layer_spec(
-        transformer_impl=args.transformer_impl,
+def _get_transformer_layer_spec(args):
+    if args.transformer_impl == "transformer_engine":
+        return get_gpt_layer_with_transformer_engine_spec(
+            num_experts=getattr(args, "num_experts", None),
+            moe_grouped_gemm=getattr(args, "moe_grouped_gemm", False),
+            qk_layernorm=getattr(args, "qk_layernorm", False),
+            multi_latent_attention=getattr(args, "multi_latent_attention", False),
+            fp8=getattr(args, "fp8", None),
+            moe_use_legacy_grouped_gemm=getattr(args, "moe_use_legacy_grouped_gemm", False),
+            qk_l2_norm=getattr(args, "qk_l2_norm", False),
+            use_kitchen=getattr(args, "use_kitchen", False),
+            use_kitchen_attention=getattr(args, "use_kitchen_attention", False),
+            kitchen_attention_backend=getattr(args, "kitchen_attention_backend", "sdpa"),
+        )
+    if args.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            qk_layernorm=getattr(args, "qk_layernorm", False),
+            multi_latent_attention=getattr(args, "multi_latent_attention", False),
+            qk_l2_norm=getattr(args, "qk_l2_norm", False),
+        )
+    return get_gpt_layer_local_spec(
         num_experts=getattr(args, "num_experts", None),
         moe_grouped_gemm=getattr(args, "moe_grouped_gemm", False),
         qk_layernorm=getattr(args, "qk_layernorm", False),
@@ -56,24 +57,35 @@ def model_provider(
         use_kitchen=getattr(args, "use_kitchen", False),
         use_kitchen_attention=getattr(args, "use_kitchen_attention", False),
         kitchen_attention_backend=getattr(args, "kitchen_attention_backend", "sdpa"),
-        num_mem_tokens=args.num_mem_tokens,
-        d_mem=args.armt_d_mem,
-        armt_n_heads=args.armt_n_heads,
-        nu=args.armt_nu,
-        use_denom=args.armt_use_denom,
-        gating=args.armt_gating,
-        correction=args.armt_correction,
-        tbptt_mode=args.recurrent_tbptt_mode,
     )
 
+
+def model_provider(
+    pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None, **kwargs
+):
+    args = get_args()
+    validate_rmt_constraints(args)
+
+    if (
+        getattr(args, "ckpt_format", None) == "torch_dist"
+        and getattr(args, "load", None)
+        and getattr(args, "dist_ckpt_strictness", None) == "assume_ok_unexpected"
+    ):
+        args.dist_ckpt_strictness = "log_all"
+
+    if config is None:
+        config = core_transformer_config_from_args(args)
+
+    layer_spec = _get_transformer_layer_spec(args)
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)
 
-    model = ARMTModel(
+    return RMTModel(
         config=config,
         transformer_layer_spec=layer_spec,
         vocab_size=args.padded_vocab_size,
         max_sequence_length=max_seq_length,
         num_mem_tokens=args.num_mem_tokens,
+        tbptt_mode=args.recurrent_tbptt_mode,
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),
@@ -88,8 +100,6 @@ def model_provider(
         vp_stage=vp_stage,
         pg_collection=pg_collection,
     )
-
-    return model
 
 
 def forward_step(data_iterator, model):
@@ -114,7 +124,7 @@ def forward_step(data_iterator, model):
 
 
 if __name__ == "__main__":
-    if os.environ.get("ARMT_DETECT_ANOMALY", "0") == "1":
+    if os.environ.get("RMT_DETECT_ANOMALY", "0") == "1":
         torch.autograd.set_detect_anomaly(True, check_nan=False)
 
     train_valid_test_datasets_provider.is_distributed = True
@@ -125,5 +135,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={"tokenizer_type": "GPT2BPETokenizer"},
-        extra_args_provider=add_armt_args,
+        extra_args_provider=add_rmt_args,
     )

@@ -2,9 +2,9 @@
 set -euo pipefail
 
 python examples/armt/train.py \
-  --use-armt-tbptt \
+  --use-recurrent-tbptt \
   --num-mem-tokens 16 \
-  --armt-chunk-size 512 \
+  --recurrent-chunk-size 512 \
   --tensor-model-parallel-size 1 \
   --pipeline-model-parallel-size 1 \
   --seq-length 2048 \
