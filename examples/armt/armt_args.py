@@ -1,21 +1,12 @@
 """ARMT argument definitions and constraint checks."""
 
+from examples.recurrent.recurrent_args import add_recurrent_args, validate_recurrent_constraints
+
 
 def add_armt_args(parser):
+    parser = add_recurrent_args(parser)
     group = parser.add_argument_group("ARMT", "ARMT specific arguments")
 
-    group.add_argument(
-        "--use-armt-tbptt",
-        action="store_true",
-        default=False,
-        help="Enable ARMT TBPTT schedule",
-    )
-    group.add_argument(
-        "--num-mem-tokens",
-        type=int,
-        default=16,
-        help="Number of memory tokens per layer",
-    )
     group.add_argument(
         "--armt-d-mem",
         dest="armt_d_mem",
@@ -35,7 +26,6 @@ def add_armt_args(parser):
         default=3,
         help="DPFP expansion factor (output dim = 2 * nu * d_mem)",
     )
-
     group.add_argument(
         "--armt-use-denom",
         action="store_true",
@@ -61,63 +51,13 @@ def add_armt_args(parser):
         help="Apply correction term in delta updates",
     )
 
-    group.add_argument(
-        "--armt-chunk-size",
-        type=int,
-        default=512,
-        help="Number of tokens per TBPTT chunk",
-    )
-    group.add_argument(
-        "--armt-tbptt-mode",
-        action="store_true",
-        default=True,
-        help="Enable TBPTT (detach gradients across chunks)",
-    )
-
-    group.add_argument(
-        "--no-loss-from-first-chunk",
-        action="store_true",
-        default=False,
-        help=(
-            "Do not compute LM loss (loss_mask=0) on the first TBPTT chunk. "
-            "Forward still runs so memory can be written."
-        ),
-    )
     return parser
 
 
 def validate_armt_constraints(args):
-    if args.pipeline_model_parallel_size != 1:
-        raise ValueError(
-            f"ARMT only supports PP=1. Got PP={args.pipeline_model_parallel_size}"
-        )
-    if args.context_parallel_size != 1:
-        raise ValueError(
-            f"ARMT only supports CP=1. Got CP={args.context_parallel_size}"
-        )
-
-    if getattr(args, "sequence_parallel", False):
-        tp = args.tensor_model_parallel_size
-        if tp <= 1:
-            raise ValueError("sequence_parallel=True requires TP>1")
-        if args.seq_length % args.armt_chunk_size != 0:
-            raise ValueError(
-                "V1 SP safety-mode requires seq_length % armt_chunk_size == 0 "
-                "(unless padding is implemented)"
-            )
-        if (args.armt_chunk_size + args.num_mem_tokens) % tp != 0:
-            raise ValueError(
-                "V1 SP safety-mode requires (armt_chunk_size + num_mem_tokens) % TP == 0"
-            )
-
-    if getattr(args, "position_embedding_type", None) not in ("rope", "yarn"):
-        raise ValueError(
-            f"ARMT only supports RoPE/Yarn position embedding. "
-            f"Got {args.position_embedding_type}"
-        )
-
-    # FP8 is not supported for ARMT v1. Note: Megatron's global default for
-    # `--fp8-recipe` is often non-None (e.g., "delayed") even when FP8 is disabled,
-    # so we must gate this constraint on FP8 actually being enabled.
-    if getattr(args, "fp8", None) or getattr(args, "fp8_format", None):
-        raise ValueError("ARMT v1 supports TE modules in bf16/fp16 only; FP8 is not supported.")
+    return validate_recurrent_constraints(
+        args,
+        model_name="ARMT",
+        sequence_parallel_extra_tokens=args.num_mem_tokens,
+        divisibility_expr="(recurrent_chunk_size + num_mem_tokens) % TP == 0",
+    )
