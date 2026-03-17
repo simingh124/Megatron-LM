@@ -1,11 +1,11 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B ARMT continual training from torch_dist ckpt.
+# Qwen3-0.6B RMT continual training from torch_dist ckpt.
 #
 # Verification goal:
-# - Training can start from converted checkpoint.
-# - ARMT-specific params are newly created and kept random-initialized.
+# - Training can start from baseline checkpoint.
+# - RMT-specific params are newly created and kept random-initialized.
 # - Loss is not close to random guess (≈ ln(vocab)).
 #
 # Distributed settings are configurable via env vars:
@@ -16,6 +16,10 @@ set -ex
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
+# ========== For test ==========
+# ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
+
+# ========== Distributed training setup ==========
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -23,15 +27,17 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-9899}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
+# ========== Fixed paths ==========
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 ROOT=${ROOT:-/mnt/step3-abla/siming}
 MEGATRON_ROOT=${MEGATRON_ROOT:-${REPO_ROOT}}
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
+# Read from file name without extension
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
 
-PRETRAIN_SCRIPT_PATH=${PRETRAIN_SCRIPT_PATH:-"${MEGATRON_ROOT}/examples/armt/train.py"}
+PRETRAIN_SCRIPT_PATH=${PRETRAIN_SCRIPT_PATH:-"${MEGATRON_ROOT}/examples/rmt/train.py"}
 LOAD_CHECKPOINT_PATH=${LOAD_CHECKPOINT_PATH:-"${ROOT}/ckpts/mlm/qwen3_0p6b_tp1_pp1_torch_dist"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"${ROOT}/tokenizers/qwen3_tokenizer"}
 
@@ -42,6 +48,8 @@ mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 mkdir -p "${LOG_DIR}"
 
+# ========== Optional terminal+file logging ==========
+# Default on. Set ENABLE_TEE_LOG=0 to disable.
 ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
@@ -61,7 +69,7 @@ if ! command -v torchrun >/dev/null 2>&1; then
   exit 1
 fi
 if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
-  echo "ERROR: ARMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
+  echo "ERROR: RMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
   exit 1
 fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
@@ -73,6 +81,8 @@ if [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
   exit 1
 fi
 
+# ========== Data ==========
+# FineWeb-Edu merged-by-year, 2013-2025.
 if [[ -z "${DATASET_PATH:-}" ]]; then
 DATASET_PATH="
 22715400849 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2013 \
@@ -91,6 +101,8 @@ DATASET_PATH="
 "
 fi
 
+# ========== Fixed model parameters ==========
+# Must match the checkpoint.
 TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
@@ -113,11 +125,12 @@ ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
+# ========== RMT parameters ==========
 NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
 RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE:-${ARMT_CHUNK_SIZE:-512}}
-ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-30}
+# ========== Fixed training parameters (smoke-friendly defaults) ==========
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-8}
 
@@ -176,10 +189,6 @@ RECURRENT_ARGS=(
   --recurrent-chunk-size ${RECURRENT_CHUNK_SIZE}
 )
 
-ARMT_ARGS=(
-  --armt-n-heads ${ARMT_N_HEADS}
-)
-
 TRAINING_ARGS=(
   --micro-batch-size ${MICRO_BATCH_SIZE}
   --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -208,11 +217,14 @@ DATA_ARGS=(
 
 CKPT_AND_LOG_ARGS=(
   --ckpt-format torch_dist
+  # Important: baseline ckpt doesn't have RMT params; drop those "unexpected" keys.
   --dist-ckpt-strictness log_all
   --load "${LOAD_CHECKPOINT_PATH}"
   --save "${CHECKPOINT_PATH}"
   --no-load-optim
   --no-load-rng
+  # --no-save-optim
+  # --no-save-rng
   --log-interval 1
   --eval-interval 1000000000
   --eval-iters 0
@@ -224,6 +236,9 @@ CKPT_AND_LOG_ARGS=(
 EXTRA_ARGS=()
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
+fi
+if [[ "${TEST_TRAIN_RUN:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--test-train-run)
 fi
 
 echo "ROOT=${ROOT}"
@@ -243,7 +258,6 @@ echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SI
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \
   ${RECURRENT_ARGS[@]} \
-  ${ARMT_ARGS[@]} \
   ${MODEL_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
   ${DATA_ARGS[@]} \
