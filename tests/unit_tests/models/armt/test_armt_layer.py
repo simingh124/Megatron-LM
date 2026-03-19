@@ -121,7 +121,7 @@ class TestARMTLayer:
 
         assert float(metrics["armt/token/context_token_norm_mean"]) == pytest.approx(5.0)
         assert float(metrics["armt/token/mem_token_norm_mean"]) == pytest.approx(1.0)
-        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.4)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.2)
         assert float(metrics["armt/token/mem_token_cosine_mean"]) == pytest.approx(-1.0 / 6.0)
         assert float(metrics["armt/token/mem_token_cosine_max_mean"]) == pytest.approx(1.0)
         assert float(metrics["armt/token/mem_token_cosine_min_mean"]) == pytest.approx(-1.0)

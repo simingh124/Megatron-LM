@@ -40,6 +40,29 @@ def build_ratio_metric(numerator: torch.Tensor, denominator: torch.Tensor) -> Me
     return MetricPrimitive("ratio", _to_scalar_tensor(numerator), _to_scalar_tensor(denominator))
 
 
+def build_ratio_of_means_metric(
+    numerator_sum: torch.Tensor,
+    numerator_count: torch.Tensor,
+    denominator_sum: torch.Tensor,
+    denominator_count: torch.Tensor,
+) -> MetricPrimitive:
+    return MetricPrimitive(
+        "ratio_of_means",
+        torch.stack(
+            (
+                _to_scalar_tensor(numerator_sum),
+                _to_scalar_tensor(numerator_count),
+            )
+        ),
+        torch.stack(
+            (
+                _to_scalar_tensor(denominator_sum),
+                _to_scalar_tensor(denominator_count),
+            )
+        ),
+    )
+
+
 def build_rms_metric(square_sum: torch.Tensor, count: torch.Tensor) -> MetricPrimitive:
     return MetricPrimitive("rms", _to_scalar_tensor(square_sum), _to_scalar_tensor(count))
 
@@ -74,6 +97,16 @@ def finalize_metric_primitive(primitive: MetricPrimitive) -> torch.Tensor:
         return numerator / torch.clamp(denominator, min=1.0)
     if primitive.kind == "ratio":
         return numerator / (denominator + _RATIO_EPSILON)
+    if primitive.kind == "ratio_of_means":
+        if numerator.numel() != 2 or denominator.numel() != 2:
+            raise ValueError(
+                "ratio_of_means expects [sum, count] tensors for numerator and denominator"
+            )
+        numerator_mean = numerator.reshape(-1)[0] / torch.clamp(numerator.reshape(-1)[1], min=1.0)
+        denominator_mean = denominator.reshape(-1)[0] / torch.clamp(
+            denominator.reshape(-1)[1], min=1.0
+        )
+        return numerator_mean / (denominator_mean + _RATIO_EPSILON)
     if primitive.kind == "rms":
         return torch.sqrt(numerator / torch.clamp(denominator, min=1.0))
 

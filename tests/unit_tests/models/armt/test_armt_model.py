@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 from megatron.core.models.armt.armt_model import ARMTModel
 from megatron.core.models.armt.armt_layer import ARMTLayer
-from megatron.core.models.armt.monitoring import build_mean_metric, build_ratio_metric
+from megatron.core.models.armt.monitoring import build_mean_metric, build_ratio_of_means_metric
 
 
 def _minimal_gpt_init(self, config, transformer_layer_spec, vocab_size, max_sequence_length, **kwargs):
@@ -118,9 +118,11 @@ class TestARMTModel:
                     torch.tensor(4.0),
                     torch.tensor(2.0),
                 ),
-                "armt/token/mem_ctx_norm_ratio": build_ratio_metric(
-                    torch.tensor(3.0),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
                     torch.tensor(6.0),
+                    torch.tensor(3.0),
+                    torch.tensor(18.0),
+                    torch.tensor(2.0),
                 ),
             }
         )
@@ -130,8 +132,10 @@ class TestARMTModel:
                     torch.tensor(6.0),
                     torch.tensor(3.0),
                 ),
-                "armt/token/mem_ctx_norm_ratio": build_ratio_metric(
-                    torch.tensor(2.0),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
+                    torch.tensor(9.0),
+                    torch.tensor(1.0),
+                    torch.tensor(8.0),
                     torch.tensor(4.0),
                 ),
             }
@@ -146,7 +150,7 @@ class TestARMTModel:
         metrics = model.consume_all_monitoring_metrics()
 
         assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
-        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.5)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(45.0 / 52.0)
 
     def test_armt_model_rope_extension(self):
         """验证 _preprocess 在拼接 memory tokens 后会重新生成/扩展 RoPE 到 S+M。"""

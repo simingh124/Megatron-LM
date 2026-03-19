@@ -6,6 +6,7 @@ import torch
 from megatron.core.models.armt.monitoring import (
     build_mean_metric,
     build_ratio_metric,
+    build_ratio_of_means_metric,
     publish_armt_tensorboard_metrics,
 )
 from megatron.training.training import training_log
@@ -21,6 +22,12 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
             ),
             "train/chunk_00_loss": build_ratio_metric(
                 torch.tensor(9.0),
+                torch.tensor(3.0),
+            ),
+            "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
+                torch.tensor(4.0),
+                torch.tensor(2.0),
+                torch.tensor(30.0),
                 torch.tensor(3.0),
             ),
         }
@@ -82,11 +89,13 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
 
     tb_metric_names = [call.args[0] for call in writer.add_scalar.call_args_list]
     assert "armt/read/retrieved_norm_mean" in tb_metric_names
+    assert "armt/token/mem_ctx_norm_ratio" in tb_metric_names
     assert "train/chunk_00_loss" in tb_metric_names
     assert "batch-size-tokens" in tb_metric_names
     assert "batch-size-tokens vs samples" in tb_metric_names
 
     tb_metrics = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    assert tb_metrics["armt/token/mem_ctx_norm_ratio"] == (0.2, 1)
     assert tb_metrics["batch-size-tokens"] == (8, 1)
     assert tb_metrics["batch-size-tokens vs samples"] == (8, 0)
 
@@ -94,4 +103,5 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
     for call in wandb_writer.log.call_args_list:
         wandb_metric_names.extend(call.args[0].keys())
     assert "armt/read/retrieved_norm_mean" not in wandb_metric_names
+    assert "armt/token/mem_ctx_norm_ratio" not in wandb_metric_names
     assert "train/chunk_00_loss" not in wandb_metric_names

@@ -9,7 +9,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 from .associative_layer import AssociativeLayer
-from .monitoring import build_mean_metric, build_ratio_metric, merge_metric_primitives
+from .monitoring import build_mean_metric, build_ratio_of_means_metric, merge_metric_primitives
 
 _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
 
@@ -145,9 +145,11 @@ class ARMTLayer(TransformerLayer):
             )
 
         if "mem_token_count" in stats and "context_token_count" in stats:
-            primitives["armt/token/mem_ctx_norm_ratio"] = build_ratio_metric(
+            primitives["armt/token/mem_ctx_norm_ratio"] = build_ratio_of_means_metric(
                 stats["mem_token_norm_sum"],
+                stats["mem_token_count"],
                 stats["context_token_norm_sum"],
+                stats["context_token_count"],
             )
 
         if "mem_token_cosine_count" in stats:
