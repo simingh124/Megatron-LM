@@ -253,6 +253,7 @@ class AssociativeLayer(nn.Module):
         self._maybe_initialize_memory(
             batch_size=hidden_states.shape[0], device=hidden_states.device
         )
+        should_track_read_metrics = not self._first_chunk
 
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)
@@ -270,12 +271,13 @@ class AssociativeLayer(nn.Module):
 
             result = self._from_heads(result)
 
-        hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
-        retrieved_norms = torch.linalg.vector_norm(result.float(), dim=-1)
-        token_count = self._count_tensor(hidden_norms.numel(), hidden_states.device)
-        self._accumulate_monitoring_stat("hidden_norm_sum", hidden_norms.sum())
-        self._accumulate_monitoring_stat("retrieved_norm_sum", retrieved_norms.sum())
-        self._accumulate_monitoring_stat("retrieved_norm_count", token_count)
+        if should_track_read_metrics:
+            hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+            retrieved_norms = torch.linalg.vector_norm(result.float(), dim=-1)
+            token_count = self._count_tensor(hidden_norms.numel(), hidden_states.device)
+            self._accumulate_monitoring_stat("hidden_norm_sum", hidden_norms.sum())
+            self._accumulate_monitoring_stat("retrieved_norm_sum", retrieved_norms.sum())
+            self._accumulate_monitoring_stat("retrieved_norm_count", token_count)
 
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)

@@ -59,6 +59,18 @@ class TestAssociativeLayer:
 
         assert torch.allclose(out, torch.zeros_like(out), atol=1e-6)
 
+    def test_associative_layer_first_chunk_does_not_emit_read_metrics(self, layer):
+        """验证首个 chunk 的 read 监控会被跳过，不污染 armt/read/* 指标。"""
+        batch_size, hidden_size = 2, 256
+        layer.reset_memory(batch_size)
+
+        layer.associate(torch.randn(batch_size, 32, hidden_size), input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert "armt/read/retrieved_norm_mean" not in metrics
+        assert "armt/read/retrieved_to_hidden_ratio" not in metrics
+
     def test_associative_layer_tbptt_detaches_inputs_but_trains_write_weights(self, layer):
         """验证 TBPTT 模式：
 
@@ -137,11 +149,11 @@ class TestAssociativeLayer:
         layer.reset_memory(batch_size)
         layer.W_mv.weight.data.normal_()
 
-        hidden_states = torch.randn(batch_size, 32, hidden_size)
-        layer.associate(hidden_states, input_is_sbh=False)
+        layer.associate(torch.randn(batch_size, 32, hidden_size), input_is_sbh=False)
         mem_tokens = torch.randn(batch_size, layer.num_mem_tokens, hidden_size)
         layer.update_mem(mem_tokens, input_is_sbh=False)
-        layer.associate(torch.randn(batch_size, 32, hidden_size), input_is_sbh=False)
+        second_hidden_states = torch.randn(batch_size, 32, hidden_size)
+        second_retrieved = layer.associate(second_hidden_states, input_is_sbh=False)
 
         metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
 
@@ -151,6 +163,19 @@ class TestAssociativeLayer:
         assert "armt/write/write_gate_mean" in metrics
         assert "armt/state/W_mem_norm" in metrics
         assert "armt/state/z_norm" in metrics
+        expected_retrieved_norm_mean = torch.linalg.vector_norm(
+            second_retrieved.float(), dim=-1
+        ).mean()
+        expected_retrieved_to_hidden_ratio = (
+            torch.linalg.vector_norm(second_retrieved.float(), dim=-1).sum()
+            / torch.linalg.vector_norm(second_hidden_states.float(), dim=-1).sum()
+        )
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(
+            float(expected_retrieved_norm_mean), rel=1e-5
+        )
+        assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(
+            float(expected_retrieved_to_hidden_ratio), rel=1e-4
+        )
         assert float(metrics["armt/write/delta_mem_norm"]) >= 0.0
         assert float(metrics["armt/state/W_mem_norm"]) >= 0.0
         assert layer.consume_monitoring_primitives() == {}
