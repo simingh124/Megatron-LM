@@ -33,6 +33,7 @@
 - Test framework is `pytest` (`python_files = test_*.py`).
 - Useful markers include `internal`, `flaky`, and `flaky_in_dev`.
 - Keep tests near the feature: ARMT logic in `tests/unit_tests/models/armt/`, runtime integration in `examples/armt/tests/`.
+- When launching training benchmarks or test runs with overridden `TRAIN_TOKENS`, set it high enough that the derived `lr_warmup_steps` stays strictly smaller than `lr_decay_steps`; avoid configurations where warmup is greater than or equal to decay.
 - For ARMT changes, minimum gate is:
   - unit tests covering model/layer/constraints touched;
   - one GPU forward/backward smoke test;

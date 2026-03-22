@@ -143,6 +143,36 @@ class TestAssociativeLayer:
 
         assert not torch.allclose(layer.W_mem, initial_W_mem)
 
+    def test_reset_memory_detaches_recurrent_state_between_microbatches(self):
+        """验证 reset_memory 会切断上一微批挂在 memory state 上的计算图。"""
+        layer = AssociativeLayer(
+            d_model=128,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=False,
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+
+        mem_tokens = torch.randn(
+            batch_size,
+            layer.num_mem_tokens,
+            layer.d_model,
+            requires_grad=True,
+        )
+        layer.update_mem(mem_tokens, input_is_sbh=False)
+
+        assert layer.W_mem.grad_fn is not None
+        if layer.use_denom:
+            assert layer.z.grad_fn is not None
+
+        layer.reset_memory()
+
+        assert layer.W_mem.grad_fn is None
+        if layer.use_denom:
+            assert layer.z.grad_fn is None
+
     def test_associative_layer_monitoring_metrics(self, layer):
         """验证 AssociativeLayer 会累计并导出 read/write/state 监控指标。"""
         batch_size, hidden_size = 2, 256
