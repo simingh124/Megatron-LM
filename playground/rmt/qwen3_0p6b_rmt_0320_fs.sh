@@ -44,7 +44,6 @@ TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"${ROOT}/exp_logs/tensorboard/rmt
 LOG_DIR=${LOG_DIR:-"${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"}
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
-mkdir -p "${LOG_DIR}"
 
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
@@ -52,6 +51,7 @@ else
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
 fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
+  mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
   LOG_FILE="${LOG_DIR}/train_${LOG_TS}.log"
   if [[ "${NUM_NODES}" -gt 1 ]]; then
