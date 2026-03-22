@@ -1,8 +1,9 @@
+import argparse
 from argparse import Namespace
 
 import pytest
 
-from examples.rmt.rmt_args import validate_rmt_constraints
+from examples.rmt.rmt_args import add_rmt_args, validate_rmt_constraints
 
 
 def _make_args(**overrides):
@@ -59,3 +60,11 @@ def test_valid_config_passes():
             sequence_parallel=True,
         )
     )
+
+
+def test_rmt_specific_flag_is_registered_on_rmt_args():
+    parser = argparse.ArgumentParser()
+    add_rmt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.rmt_no_read_memory_from_first_chunk is False

@@ -142,6 +142,19 @@ def _accumulate_chunk_loss_metrics(
     per_chunk_token_sums[chunk_idx] = current_token_sum + loss_report[1]
 
 
+def _set_recurrent_chunk_model_state(model, *, args, is_first_chunk: bool) -> None:
+    if hasattr(model, "set_current_chunk_is_first"):
+        model.set_current_chunk_is_first(is_first_chunk)
+
+    if hasattr(model, "set_skip_read_memory_for_current_chunk"):
+        skip_read_memory = bool(
+            args is not None
+            and is_first_chunk
+            and getattr(args, "rmt_no_read_memory_from_first_chunk", False)
+        )
+        model.set_skip_read_memory_for_current_chunk(skip_read_memory)
+
+
 def recurrent_forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -294,11 +307,23 @@ def recurrent_forward_backward_no_pipelining(
             is_last_microbatch = microbatch_id == num_microbatches - 1
             is_last_chunk = chunk_idx == num_chunks - 1
 
-            if not is_last_microbatch or not is_last_chunk:
-                with no_sync_func():
+            _set_recurrent_chunk_model_state(
+                unwrapped_model,
+                args=args,
+                is_first_chunk=chunk_idx == 0,
+            )
+            try:
+                if not is_last_microbatch or not is_last_chunk:
+                    with no_sync_func():
+                        run_chunk()
+                else:
                     run_chunk()
-            else:
-                run_chunk()
+            finally:
+                _set_recurrent_chunk_model_state(
+                    unwrapped_model,
+                    args=None,
+                    is_first_chunk=False,
+                )
 
             total_num_tokens += int(chunk_tokens)
 

@@ -2,7 +2,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -454,6 +454,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
+        layer_output_callback: Optional[Callable[[int, Tensor], None]] = None,
     ):
         """Forward method with activation checkpointing."""
 
@@ -497,6 +498,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                         )
+                    if (
+                        layer_output_callback is not None
+                        and (
+                            not tensor_parallel.random.is_checkpointing()
+                            or not torch.is_grad_enabled()
+                        )
+                    ):
+                        layer_output_callback(layer.layer_number, hidden_states)
                 return hidden_states, context
 
             return custom_forward
@@ -636,6 +645,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
+        layer_output_callback: Optional[Callable[[int, Tensor], None]] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -743,6 +753,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     packed_seq_params=packed_seq_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
+                    layer_output_callback=layer_output_callback,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
@@ -777,6 +788,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                         )
+                    if layer_output_callback is not None:
+                        layer_output_callback(layer.layer_number, hidden_states)
 
                     if (
                         torch.is_grad_enabled()

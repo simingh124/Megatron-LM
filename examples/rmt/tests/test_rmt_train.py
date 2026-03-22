@@ -75,7 +75,7 @@ def _build_model(tp_size: int, seq_len: int):
     )
 
 
-def _run_single_step(tp_size: int, seq_len: int):
+def _run_single_step(tp_size: int, seq_len: int, skip_read_memory_from_first_chunk: bool = False):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
 
@@ -89,6 +89,9 @@ def _run_single_step(tp_size: int, seq_len: int):
 
     model = _build_model(tp_size, seq_len).cuda()
     model.train()
+    if skip_read_memory_from_first_chunk:
+        model.set_current_chunk_is_first(True)
+        model.set_skip_read_memory_for_current_chunk(True)
 
     batch_size = 2
     tokens = torch.randint(0, 32000, (batch_size, seq_len), device="cuda")
@@ -126,6 +129,18 @@ class TestRMTTraining:
         _init_distributed(world_size=1)
         try:
             _run_single_step(tp_size=1, seq_len=64)
+        finally:
+            _finalize_distributed()
+
+    @requires_gpu
+    def test_rmt_single_step_without_read_memory_prefix(self):
+        _init_distributed(world_size=1)
+        try:
+            _run_single_step(
+                tp_size=1,
+                seq_len=64,
+                skip_read_memory_from_first_chunk=True,
+            )
         finally:
             _finalize_distributed()
 
