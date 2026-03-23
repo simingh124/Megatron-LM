@@ -21,6 +21,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 # ========== For test ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
+# ========== Distributed training settings ==========
+USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
+USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
+
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -133,6 +140,16 @@ TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${USE_DISTRIBUTED_OPTIMIZER}" != "1" ]]; then
+  echo "ERROR: OVERLAP_PARAM_GATHER=1 requires USE_DISTRIBUTED_OPTIMIZER=1" >&2
+  exit 1
+fi
+
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${OVERLAP_GRAD_REDUCE}" != "1" ]]; then
+  echo "ERROR: OVERLAP_PARAM_GATHER=1 requires OVERLAP_GRAD_REDUCE=1" >&2
+  exit 1
+fi
+
 LR=${LR:-5e-4}
 MIN_LR=${MIN_LR:-1e-5}
 
@@ -223,6 +240,21 @@ CKPT_AND_LOG_ARGS=(
 )
 
 EXTRA_ARGS=()
+if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
+  EXTRA_ARGS+=(--use-distributed-optimizer)
+fi
+if [[ "${OVERLAP_GRAD_REDUCE}" == "1" ]]; then
+  EXTRA_ARGS+=(--overlap-grad-reduce)
+fi
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" ]]; then
+  EXTRA_ARGS+=(--overlap-param-gather)
+fi
+if [[ "${USE_NCCL_UB}" == "1" ]]; then
+  EXTRA_ARGS+=(--use-nccl-ub)
+fi
+if [[ "${LOG_THROUGHPUT}" == "1" ]]; then
+  EXTRA_ARGS+=(--log-throughput)
+fi
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
@@ -244,6 +276,8 @@ echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE}"
 echo "RMT_NO_READ_MEMORY_FROM_FIRST_CHUNK=${RMT_NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
+echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"
 
 torchrun ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \

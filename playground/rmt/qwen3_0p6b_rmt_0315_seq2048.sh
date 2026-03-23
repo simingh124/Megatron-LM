@@ -17,7 +17,7 @@ set -ex
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== For test ==========
-# ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
 # ========== Distributed runtime toggles ==========
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
@@ -57,7 +57,11 @@ mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 # ========== Optional terminal+file logging ==========
 # Default on. Set ENABLE_TEE_LOG=0 to disable.
-ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+else
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
@@ -271,7 +275,7 @@ fi
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
-if [[ "${TEST_TRAIN_RUN:-0}" == "1" ]]; then
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   EXTRA_ARGS+=(--test-train-run)
 fi
 
@@ -289,6 +293,7 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE}"
+echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"

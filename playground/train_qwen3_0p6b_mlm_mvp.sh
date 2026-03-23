@@ -15,9 +15,15 @@ set -ex
 #
 # Exit interval:
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
+#
+# Optional:
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run
 
 # Environment variables for performance tuning
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+
+# ========== For test ==========
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
 # ========== Fixed paths ==========
 ROOT="/mnt/step3-abla/siming"
@@ -242,6 +248,9 @@ fi
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  EXTRA_ARGS+=(--test-train-run)
+fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
@@ -255,6 +264,7 @@ echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_ITERS=${TRAIN_ITERS} (TRAIN_TOKENS=${TRAIN_TOKENS})"
+echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
