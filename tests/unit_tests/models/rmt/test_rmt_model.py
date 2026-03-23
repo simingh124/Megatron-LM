@@ -89,6 +89,36 @@ class TestRMTModel:
         assert torch.equal(model.memory_state, hidden_states[-8:].detach())
         assert model.memory_state.requires_grad is False
 
+    def test_rmt_model_keeps_memory_graph_without_tbptt_until_reset(self):
+        config = MagicMock()
+        config.hidden_size = 128
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch("megatron.core.models.rmt.rmt_model.GPTModel.__init__", new=_minimal_gpt_init):
+            model = RMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=8,
+                tbptt_mode=False,
+            )
+
+        hidden_states = torch.randn(48, 2, 128, requires_grad=True)
+        model._update_memory_state_from_hidden_states(hidden_states)
+
+        assert model.memory_state.shape == (8, 2, 128)
+        assert torch.equal(model.memory_state, hidden_states[-8:])
+        assert model.memory_state.requires_grad is True
+        assert model.memory_state.grad_fn is not None
+
+        model.reset_all_memory()
+
+        assert model.memory_state is None
+
     def test_rmt_model_attention_mask_inserts_token_block(self):
         config = MagicMock()
         config.hidden_size = 128

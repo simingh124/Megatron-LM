@@ -24,6 +24,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 # ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
 # DISABLE_JIT_FUSER=${DISABLE_JIT_FUSER:-${ENABLE_TEST_TRAIN_RUN}}
 
+# ========== Distributed runtime toggles ==========
+USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
+USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
+
 # ========== Distributed training setup ==========
 GPUS_PER_NODE=${PROC_PER_NODE:-8}
 NUM_NODES=${NODE_COUNT:-1}
@@ -36,6 +43,7 @@ WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 ROOT="/mnt/step3-abla/siming"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+VENV_PYTHON=${VENV_PYTHON:-"${ROOT}/.venv/bin/python"}
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
 # Read from file name without extension
@@ -72,8 +80,8 @@ if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   echo "LOG_FILE=${LOG_FILE}"
 fi
 
-if ! command -v torchrun >/dev/null 2>&1; then
-  echo "ERROR: torchrun not found in PATH" >&2
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: venv python not found or not executable: ${VENV_PYTHON}" >&2
   exit 1
 fi
 if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
@@ -141,6 +149,7 @@ ARMT_N_HEADS=16
 # divisible for the default 8-way data parallel launch.
 MICRO_BATCH_SIZE=30
 GLOBAL_BATCH_SIZE=240
+NUM_WORKERS=${NUM_WORKERS:-32}
 
 
 TRAIN_TOKENS=100000000000
@@ -150,6 +159,16 @@ WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${USE_DISTRIBUTED_OPTIMIZER}" != "1" ]]; then
+  echo "ERROR: OVERLAP_PARAM_GATHER=1 requires USE_DISTRIBUTED_OPTIMIZER=1" >&2
+  exit 1
+fi
+
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${OVERLAP_GRAD_REDUCE}" != "1" ]]; then
+  echo "ERROR: OVERLAP_PARAM_GATHER=1 requires OVERLAP_GRAD_REDUCE=1" >&2
+  exit 1
+fi
 
 LR=5e-4
 MIN_LR=1e-5
@@ -225,7 +244,7 @@ TRAINING_ARGS=(
 DATA_ARGS=(
   --data-path "${DATASET_PATH}"
   --split "100,0,0"
-  --num-workers 8
+  --num-workers ${NUM_WORKERS}
   --tokenizer-type HuggingFaceTokenizer
   --tokenizer-model "${TOKENIZER_DIR}"
 )
@@ -249,6 +268,22 @@ CKPT_AND_LOG_ARGS=(
 )
 
 EXTRA_ARGS=()
+if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
+  EXTRA_ARGS+=(--use-distributed-optimizer)
+fi
+if [[ "${OVERLAP_GRAD_REDUCE}" == "1" ]]; then
+  EXTRA_ARGS+=(--overlap-grad-reduce)
+fi
+if [[ "${OVERLAP_PARAM_GATHER}" == "1" ]]; then
+  EXTRA_ARGS+=(--overlap-param-gather)
+fi
+if [[ "${USE_NCCL_UB}" == "1" ]]; then
+  EXTRA_ARGS+=(--use-nccl-ub)
+fi
+if [[ "${LOG_THROUGHPUT}" == "1" ]]; then
+  EXTRA_ARGS+=(--log-throughput)
+fi
+
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
@@ -261,6 +296,7 @@ fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
+echo "VENV_PYTHON=${VENV_PYTHON}"
 echo "LOAD_CHECKPOINT_PATH=${LOAD_CHECKPOINT_PATH}"
 echo "CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH}"
@@ -275,7 +311,11 @@ echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "DISABLE_JIT_FUSER=${DISABLE_JIT_FUSER}"
 
-torchrun ${DISTRIBUTED_ARGS[@]} \
+echo "NUM_WORKERS=${NUM_WORKERS}"
+echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
+echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"
+
+${VENV_PYTHON} -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \
   ${ARMT_ARGS[@]} \
   ${MODEL_ARGS[@]} \
