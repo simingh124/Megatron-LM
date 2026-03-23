@@ -159,6 +159,14 @@ class AssociativeLayer(nn.Module):
 
     def reset_memory(self, batch_size: Optional[int] = None, device: Optional[torch.device] = None):
         """Mark memory state for reset; optionally initialize immediately."""
+        # A reset starts a fresh sequence. If the previous microbatch left graph-bearing
+        # tensors in the recurrent state, detach them here so the next microbatch does
+        # not accidentally traverse a graph that has already been backpropagated.
+        if self.W_mem.numel() != 0:
+            self.W_mem = self.W_mem.detach()
+        if self.use_denom and self.z.numel() != 0:
+            self.z = self.z.detach()
+
         self._first_chunk = True
         self._pending_reset = True
 

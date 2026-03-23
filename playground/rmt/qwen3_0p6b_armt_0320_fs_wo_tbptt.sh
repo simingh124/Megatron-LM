@@ -1,14 +1,14 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B baseline training from scratch.
+# Qwen3-0.6B ARMT training from scratch.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_baseline_0210.sh
+# - playground/rmt/qwen3_0p6b_armt_0315.sh
 #
 # Difference from the reference:
 # - No --load / --no-load-optim / --no-load-rng.
-# - Backbone params are initialized from scratch.
+# - ARMT and backbone params are initialized from scratch.
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -22,20 +22,21 @@ set -ex
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== For test ==========
-# ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
-# ========== Distributed runtime toggles ==========
+# ========== Distributed training settings ==========
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
 USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+
 LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-9899}
+MASTER_PORT=${MASTER_PORT:-9898}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
 ROOT=${ROOT:-/mnt/step3-abla/siming}
@@ -44,22 +45,23 @@ MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 VENV_PYTHON=${VENV_PYTHON:-"${ROOT}/.venv/bin/python"}
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
-PRETRAIN_SCRIPT_PATH="${PRETRAIN_SCRIPT_PATH:-${MEGATRON_ROOT}/pretrain_gpt.py}"
-TOKENIZER_DIR="${TOKENIZER_DIR:-${ROOT}/tokenizers/qwen3_tokenizer}"
-
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
+
+PRETRAIN_SCRIPT_PATH="${PRETRAIN_SCRIPT_PATH:-${MEGATRON_ROOT}/examples/armt/train.py}"
+TOKENIZER_DIR="${TOKENIZER_DIR:-${ROOT}/tokenizers/qwen3_tokenizer}"
 
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}}"
 TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}}"
 LOG_DIR="${LOG_DIR:-${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}}"
-
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+  LOG_INTERVAL=${LOG_INTERVAL:-1}
 else
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+  LOG_INTERVAL=${LOG_INTERVAL:-1}
 fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
@@ -75,16 +77,12 @@ if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   echo "LOG_FILE=${LOG_FILE}"
 fi
 
-if [[ -n "${DATA_CACHE_PATH:-}" ]]; then
-  mkdir -p "${DATA_CACHE_PATH}"
-fi
-
-if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
-  echo "ERROR: pretrain_gpt.py not found: ${PRETRAIN_SCRIPT_PATH}" >&2
-  exit 1
-fi
 if [[ ! -x "${VENV_PYTHON}" ]]; then
   echo "ERROR: venv python not found or not executable: ${VENV_PYTHON}" >&2
+  exit 1
+fi
+if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
+  echo "ERROR: ARMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
   exit 1
 fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
@@ -121,7 +119,7 @@ NUM_ATTN_HEADS=16
 NUM_QUERY_GROUPS=8
 KV_CHANNELS=128
 
-SEQ_LENGTH=512
+SEQ_LENGTH=1024
 MAX_POSITION_EMBEDDINGS=32768
 
 VOCAB_SIZE=151936
@@ -132,8 +130,13 @@ ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-40}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-960}
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
+ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
+ARMT_N_HEADS=${ARMT_N_HEADS:-16}
+ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
+
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
 TRAIN_TOKENS=${TRAIN_TOKENS:-100000000000}
@@ -143,6 +146,11 @@ WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+
+if (( LR_WARMUP_ITERS >= LR_DECAY_ITERS )); then
+  echo "ERROR: invalid TRAIN_TOKENS/LR_DECAY_TOKENS override: lr_warmup_iters (${LR_WARMUP_ITERS}) must be smaller than lr_decay_iters (${LR_DECAY_ITERS})" >&2
+  exit 1
+fi
 
 if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${USE_DISTRIBUTED_OPTIMIZER}" != "1" ]]; then
   echo "ERROR: OVERLAP_PARAM_GATHER=1 requires USE_DISTRIBUTED_OPTIMIZER=1" >&2
@@ -195,6 +203,16 @@ MODEL_ARGS=(
   --make-vocab-size-divisible-by ${MAKE_VOCAB_SIZE_DIVISIBLE_BY}
 )
 
+ARMT_ARGS=(
+  --use-armt-tbptt
+  --num-mem-tokens ${NUM_MEM_TOKENS}
+  --armt-chunk-size ${ARMT_CHUNK_SIZE}
+  --armt-n-heads ${ARMT_N_HEADS}
+)
+if [[ "${ADD_NO_RECURRENT_TBPTT_MODE}" == "1" ]]; then
+  ARMT_ARGS+=(--no-recurrent-tbptt-mode)
+fi
+
 TRAINING_ARGS=(
   --micro-batch-size ${MICRO_BATCH_SIZE}
   --global-batch-size ${GLOBAL_BATCH_SIZE}
@@ -220,17 +238,14 @@ DATA_ARGS=(
   --tokenizer-type HuggingFaceTokenizer
   --tokenizer-model "${TOKENIZER_DIR}"
 )
-if [[ -n "${DATA_CACHE_PATH:-}" ]]; then
-  DATA_ARGS+=(--data-cache-path "${DATA_CACHE_PATH}")
-fi
 
 CKPT_AND_LOG_ARGS=(
   --ckpt-format torch_dist
   --save "${CHECKPOINT_PATH}"
-  --log-interval 1
+  --log-interval ${LOG_INTERVAL}
   --eval-interval 1000000000
   --eval-iters 0
-  --save-interval 5000
+  --save-interval 2000
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
@@ -251,7 +266,6 @@ fi
 if [[ "${LOG_THROUGHPUT}" == "1" ]]; then
   EXTRA_ARGS+=(--log-throughput)
 fi
-
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
@@ -269,15 +283,18 @@ echo "WORLD_SIZE=${WORLD_SIZE} (GPUS_PER_NODE=${GPUS_PER_NODE}, NUM_NODES=${NUM_
 echo "MASTER_ADDR=${MASTER_ADDR}"
 echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
-echo "TRAIN_ITERS=${TRAIN_ITERS} (TRAIN_TOKENS=${TRAIN_TOKENS})"
+echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
+echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
+echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
+echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
-
-echo "NUM_WORKERS=${NUM_WORKERS}"
+echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"
 
 ${VENV_PYTHON} -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \
+  ${ARMT_ARGS[@]} \
   ${MODEL_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
   ${DATA_ARGS[@]} \

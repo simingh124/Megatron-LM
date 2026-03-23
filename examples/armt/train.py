@@ -22,6 +22,22 @@ from megatron.core.models.armt.armt_layer_specs import get_armt_layer_spec
 from examples.armt.armt_args import add_armt_args, validate_armt_constraints
 
 
+def _disable_incompatible_fusions_for_no_tbptt(args, config=None):
+    """Disable fused kernels that are not safe with a cross-chunk retained graph."""
+    if getattr(args, "recurrent_tbptt_mode", True):
+        return config
+
+    args.bias_dropout_fusion = False
+    args.bias_swiglu_fusion = False
+    args.bias_gelu_fusion = False
+
+    if config is not None:
+        config.bias_dropout_fusion = False
+        config.bias_activation_fusion = False
+
+    return config
+
+
 def model_provider(
     pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None, **kwargs
 ):
@@ -40,8 +56,12 @@ def model_provider(
     ):
         args.dist_ckpt_strictness = "log_unexpected"
 
+    _disable_incompatible_fusions_for_no_tbptt(args, config)
+
     if config is None:
         config = core_transformer_config_from_args(args)
+    else:
+        _disable_incompatible_fusions_for_no_tbptt(args, config)
 
     layer_spec = get_armt_layer_spec(
         transformer_impl=args.transformer_impl,

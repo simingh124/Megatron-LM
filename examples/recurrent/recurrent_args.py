@@ -50,13 +50,19 @@ def add_recurrent_args(parser):
         dest="recurrent_tbptt_mode",
         action="store_true",
         default=RECURRENT_DEFAULTS["recurrent_tbptt_mode"],
-        help="Detach recurrent memory state between chunks.",
+        help=(
+            "Use truncated recurrent training: detach recurrent memory state between chunks "
+            "and run backward independently for each chunk."
+        ),
     )
     group.add_argument(
         "--no-recurrent-tbptt-mode",
         dest="recurrent_tbptt_mode",
         action="store_false",
-        help="Do not detach recurrent memory state between chunks.",
+        help=(
+            "Disable truncated recurrent training: keep recurrent memory state connected across "
+            "chunks and run a single backward after all chunks in the microbatch finish forward."
+        ),
     )
     group.add_argument(
         "--no-loss-from-first-chunk",

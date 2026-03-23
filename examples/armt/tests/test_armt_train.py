@@ -139,7 +139,9 @@ class TestARMTTraining:
     @requires_multi_gpu
     def test_armt_tp(self):
         """集成测试：TP=2 下完成一次真实 forward/backward，验证 TP 环境可跑通。"""
-        world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "2"))
+        world_size = dist.get_world_size() if dist.is_initialized() else int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < 2:
+            pytest.skip("TP=2 test requires launching pytest with WORLD_SIZE>=2, e.g. under torchrun.")
         _init_distributed(world_size=world_size)
         try:
             _run_single_step(tp_size=2, seq_len=64)

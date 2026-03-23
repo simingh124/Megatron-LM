@@ -150,10 +150,18 @@ def test_no_loss_from_first_chunk_masks_and_skips_backward():
     config.no_sync_func = None
     config.calculate_per_token_loss = False
     config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
+    config.grad_scale_func = None
+    config.timers = None
+    config.grad_scale_func = None
+    config.timers = None
 
     with _patched_schedule(raw_batch, config), patch(
         f"{SCHEDULE_MODULE}.backward_step"
-    ) as backward_step_mock:
+    ) as backward_step_mock, patch(
+        f"{SCHEDULE_MODULE}._backward_full_microbatch_loss"
+    ) as full_backward_mock:
         old_global_args = training_global_vars._GLOBAL_ARGS
         try:
             training_global_vars._GLOBAL_ARGS = SimpleNamespace(
@@ -174,7 +182,100 @@ def test_no_loss_from_first_chunk_masks_and_skips_backward():
 
     assert forward_calls["n"] == seq_length // chunk_size
     assert backward_step_mock.call_count == 1
+    assert full_backward_mock.call_count == 0
     assert len(losses) == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "recurrent_tbptt_mode",
+        "expected_backward_step_calls",
+        "expected_full_backward_calls",
+        "expected_backward_losses",
+    ),
+    [
+        (True, 2, 0, [0.5, 1.0]),
+        (False, 0, 1, [1.5]),
+    ],
+)
+def test_recurrent_tbptt_mode_controls_backward_granularity(
+    recurrent_tbptt_mode,
+    expected_backward_step_calls,
+    expected_full_backward_calls,
+    expected_backward_losses,
+):
+    batch_size, seq_length = 1, 8
+    chunk_size = 4
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (batch_size, seq_length)),
+        "labels": torch.randint(0, 100, (batch_size, seq_length)),
+        "loss_mask": torch.ones(batch_size, seq_length),
+    }
+
+    forward_calls = {"n": 0}
+
+    def forward_step_func(data_it, model):
+        del model
+        batch = next(data_it)
+        forward_calls["n"] += 1
+        output_tensor = torch.zeros([], requires_grad=True)
+
+        def _loss_func(_output_tensor):
+            num_tokens = batch["loss_mask"].float().sum().to(torch.int)
+            loss_scale = torch.tensor(float(forward_calls["n"]))
+            loss_reduced = {
+                "lm loss": torch.cat([(loss_scale * num_tokens.float()).view(1), num_tokens.view(1)])
+            }
+            return _output_tensor * 0.0 + loss_scale * num_tokens.float(), num_tokens, loss_reduced
+
+        return output_tensor, _loss_func
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
+    config.grad_scale_func = None
+    config.timers = None
+    config.grad_scale_func = None
+    config.timers = None
+
+    with _patched_schedule(raw_batch, config), patch(
+        f"{SCHEDULE_MODULE}.backward_step"
+    ) as backward_step_mock, patch(
+        f"{SCHEDULE_MODULE}._backward_full_microbatch_loss"
+    ) as full_backward_mock:
+        old_global_args = training_global_vars._GLOBAL_ARGS
+        try:
+            training_global_vars._GLOBAL_ARGS = SimpleNamespace(
+                recurrent_chunk_size=chunk_size,
+                recurrent_tbptt_mode=recurrent_tbptt_mode,
+            )
+            recurrent_forward_backward_no_pipelining(
+                forward_step_func=forward_step_func,
+                data_iterator=iter([raw_batch]),
+                model=MagicMock(),
+                num_microbatches=1,
+                seq_length=seq_length,
+                micro_batch_size=batch_size,
+                forward_only=False,
+            )
+        finally:
+            training_global_vars._GLOBAL_ARGS = old_global_args
+
+    assert forward_calls["n"] == seq_length // chunk_size
+    assert backward_step_mock.call_count == expected_backward_step_calls
+    assert full_backward_mock.call_count == expected_full_backward_calls
+    loss_calls = backward_step_mock.call_args_list or full_backward_mock.call_args_list
+    if backward_step_mock.call_args_list:
+        observed_losses = [call.args[1].detach().cpu() for call in loss_calls]
+    else:
+        observed_losses = [call.args[0].detach().cpu() for call in loss_calls]
+    assert torch.allclose(
+        torch.stack(observed_losses),
+        torch.tensor(expected_backward_losses, dtype=observed_losses[0].dtype),
+    )
 
 
 def test_loss_reduced_is_summed_across_chunks_new_style():
@@ -206,6 +307,10 @@ def test_loss_reduced_is_summed_across_chunks_new_style():
     config.no_sync_func = None
     config.calculate_per_token_loss = False
     config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
+    config.grad_scale_func = None
+    config.timers = None
 
     with _patched_schedule(raw_batch, config):
         losses = recurrent_forward_backward_no_pipelining(
@@ -253,6 +358,8 @@ def test_scalar_metrics_are_token_weighted_across_chunks():
     config.no_sync_func = None
     config.calculate_per_token_loss = False
     config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
 
     with _patched_schedule(raw_batch, config):
         losses = recurrent_forward_backward_no_pipelining(
@@ -326,6 +433,8 @@ def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
     config.no_sync_func = None
     config.calculate_per_token_loss = False
     config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
 
     unwrapped_model = MagicMock()
     unwrapped_model.consume_all_monitoring_primitives.return_value = {
@@ -414,6 +523,8 @@ def test_scheduler_forward_only_does_not_publish_monitoring_metrics():
     config.no_sync_func = None
     config.calculate_per_token_loss = False
     config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
 
     unwrapped_model = MagicMock()
     unwrapped_model.consume_all_monitoring_primitives.return_value = {

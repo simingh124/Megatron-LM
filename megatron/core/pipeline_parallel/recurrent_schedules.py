@@ -155,6 +155,21 @@ def _set_recurrent_chunk_model_state(model, *, args, is_first_chunk: bool) -> No
         model.set_skip_read_memory_for_current_chunk(skip_read_memory)
 
 
+def _backward_full_microbatch_loss(loss: torch.Tensor, config) -> None:
+    """Backward the accumulated recurrent loss once per microbatch in no-TBPTT mode."""
+    if config.timers is not None:
+        config.timers("backward-compute", log_level=2).start()
+
+    if config.grad_scale_func is not None:
+        loss = config.grad_scale_func(loss)
+
+    if loss.requires_grad:
+        torch.autograd.backward(loss)
+
+    if config.timers is not None:
+        config.timers("backward-compute").stop()
+
+
 def recurrent_forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -237,6 +252,13 @@ def recurrent_forward_backward_no_pipelining(
         num_chunks = len(chunks)
 
         args = training_global_vars.get_args() if training_global_vars._GLOBAL_ARGS is not None else None
+        recurrent_tbptt_mode = True
+        if args is not None:
+            recurrent_tbptt_mode = getattr(
+                args,
+                "recurrent_tbptt_mode",
+                getattr(args, "armt_tbptt_mode", True),
+            )
         if args is not None and getattr(args, "no_loss_from_first_chunk", False) and num_chunks > 0:
             if "loss_mask" not in chunks[0] or not isinstance(chunks[0]["loss_mask"], torch.Tensor):
                 raise ValueError(
@@ -252,9 +274,14 @@ def recurrent_forward_backward_no_pipelining(
 
         microbatch_loss_reduced: Optional[Dict[str, torch.Tensor]] = None
         microbatch_scalar_accumulators: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        microbatch_total_loss: Optional[torch.Tensor] = None
         last_chunk_output_tensor: Optional[torch.Tensor] = None
 
-        for chunk_idx, chunk in enumerate(chunks):
+        def run_chunk(chunk_idx: int, chunk: Dict) -> float:
+            nonlocal last_chunk_output_tensor
+            nonlocal microbatch_loss_reduced
+            nonlocal microbatch_total_loss
+
             chunk_tokens = _get_num_tokens(chunk)
             if config.calculate_per_token_loss:
                 loss_weight = 1.0
@@ -263,61 +290,59 @@ def recurrent_forward_backward_no_pipelining(
 
             chunk_iter = iter([chunk])
 
-            def run_chunk():
-                nonlocal last_chunk_output_tensor
-                nonlocal microbatch_loss_reduced
-                output_tensor, loss_func = forward_step_func(chunk_iter, model)
-                if loss_func is None:
-                    if chunk_idx == num_chunks - 1:
-                        last_chunk_output_tensor = output_tensor.detach()
-                    return
+            output_tensor, loss_func = forward_step_func(chunk_iter, model)
+            if loss_func is None:
+                if chunk_idx == num_chunks - 1:
+                    last_chunk_output_tensor = output_tensor.detach()
+                return chunk_tokens
 
-                outputs = loss_func(output_tensor)
-                if len(outputs) == 3:
-                    loss, num_tokens, loss_reduced = outputs
-                    if not config.calculate_per_token_loss:
-                        loss /= torch.clamp(num_tokens, min=1)
-                else:
-                    loss, loss_reduced = outputs
-                    loss *= pg_collection.cp.size()
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                loss, num_tokens, loss_reduced = outputs
+                if not config.calculate_per_token_loss:
+                    loss /= torch.clamp(num_tokens, min=1)
+            else:
+                loss, loss_reduced = outputs
+                loss *= pg_collection.cp.size()
 
-                scaled_loss = loss * loss_weight
+            scaled_loss = loss * loss_weight
 
-                if not forward_only and chunk_tokens > 0.0:
+            if not forward_only and chunk_tokens > 0.0:
+                if recurrent_tbptt_mode:
                     backward_step(None, scaled_loss, None, model_type, config)
+                elif microbatch_total_loss is None:
+                    microbatch_total_loss = scaled_loss
+                else:
+                    microbatch_total_loss = microbatch_total_loss + scaled_loss
 
-                if not isinstance(loss_reduced, dict):
-                    raise ValueError(
-                        "Recurrent TBPTT schedule expects loss_func to return a dict as "
-                        f"loss_reduced (got {type(loss_reduced)})."
-                    )
-                _accumulate_chunk_loss_metrics(
-                    per_chunk_loss_sums,
-                    per_chunk_token_sums,
-                    chunk_idx=chunk_idx,
-                    chunk_report=loss_reduced,
+            if not isinstance(loss_reduced, dict):
+                raise ValueError(
+                    "Recurrent TBPTT schedule expects loss_func to return a dict as "
+                    f"loss_reduced (got {type(loss_reduced)})."
                 )
-                microbatch_loss_reduced = _accumulate_chunk_reports(
-                    microbatch_loss_reduced,
-                    microbatch_scalar_accumulators,
-                    loss_reduced,
-                    chunk_tokens=chunk_tokens,
-                )
+            _accumulate_chunk_loss_metrics(
+                per_chunk_loss_sums,
+                per_chunk_token_sums,
+                chunk_idx=chunk_idx,
+                chunk_report=loss_reduced,
+            )
+            microbatch_loss_reduced = _accumulate_chunk_reports(
+                microbatch_loss_reduced,
+                microbatch_scalar_accumulators,
+                loss_reduced,
+                chunk_tokens=chunk_tokens,
+            )
 
-            is_last_microbatch = microbatch_id == num_microbatches - 1
-            is_last_chunk = chunk_idx == num_chunks - 1
+            return chunk_tokens
 
+        def run_chunk_with_model_state(chunk_idx: int, chunk: Dict) -> float:
             _set_recurrent_chunk_model_state(
                 unwrapped_model,
                 args=args,
                 is_first_chunk=chunk_idx == 0,
             )
             try:
-                if not is_last_microbatch or not is_last_chunk:
-                    with no_sync_func():
-                        run_chunk()
-                else:
-                    run_chunk()
+                return run_chunk(chunk_idx, chunk)
             finally:
                 _set_recurrent_chunk_model_state(
                     unwrapped_model,
@@ -325,7 +350,30 @@ def recurrent_forward_backward_no_pipelining(
                     is_first_chunk=False,
                 )
 
-            total_num_tokens += int(chunk_tokens)
+        is_last_microbatch = microbatch_id == num_microbatches - 1
+
+        if recurrent_tbptt_mode:
+            for chunk_idx, chunk in enumerate(chunks):
+                is_last_chunk = chunk_idx == num_chunks - 1
+                if not is_last_microbatch or not is_last_chunk:
+                    with no_sync_func():
+                        chunk_tokens = run_chunk_with_model_state(chunk_idx, chunk)
+                else:
+                    chunk_tokens = run_chunk_with_model_state(chunk_idx, chunk)
+
+                total_num_tokens += int(chunk_tokens)
+        else:
+            microbatch_context = (
+                no_sync_func() if not forward_only and not is_last_microbatch else contextlib.nullcontext()
+            )
+            with microbatch_context:
+                for chunk_idx, chunk in enumerate(chunks):
+                    chunk_tokens = run_chunk_with_model_state(chunk_idx, chunk)
+                    total_num_tokens += int(chunk_tokens)
+
+                if not forward_only and microbatch_total_loss is not None:
+                    _backward_full_microbatch_loss(microbatch_total_loss, config)
+                    microbatch_total_loss = None
 
         if microbatch_loss_reduced is not None:
             for key, (weighted_sum, token_sum) in microbatch_scalar_accumulators.items():
