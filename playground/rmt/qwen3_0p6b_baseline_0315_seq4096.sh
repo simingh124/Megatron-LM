@@ -21,11 +21,20 @@ set -ex
 # Environment variables for performance tuning
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
-# ========== For test ==========
-# ENABLE_TEST_TRAIN_RUN=1
+# ========== Communication / runtime control ==========
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
+USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
 
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+else
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+fi
 
-# ========== Distributed training setup ==========
 GPUS_PER_NODE=${PROC_PER_NODE:-8}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -33,8 +42,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-9899}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
-
-# ========== Fixed paths ==========
+# ========== Paths (files and data) ==========
 ROOT="/mnt/step3-abla/siming"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGATRON_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -56,22 +64,7 @@ LOG_DIR="${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
-# ========== Optional terminal+file logging ==========
-ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
-
-# ========== Distributed runtime toggles ==========
-USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
-OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
-OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
-USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
-LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
-
-if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
-  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
-else
-  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
-fi
-
+# Optional terminal+file logging.
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
@@ -107,7 +100,6 @@ if [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
   exit 1
 fi
 
-# ========== Data ==========
 # FineWeb-Edu merged-by-year, 2025 (token count: 104_357_702_010).
 DATASET_PATH="
 22715400849 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2013 \
@@ -125,8 +117,8 @@ DATASET_PATH="
 104357702010 ${ROOT}/pt_data/fineweb_edu_by_year_merged/2025
 "
 
-# ========== Fixed model parameters ==========
 # From config.json + run_config.yaml (must match ckpt).
+# ========== Model structure parameters ==========
 TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
@@ -153,8 +145,8 @@ ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
-# ========== Fixed training parameters ==========
 # Derived from the seq1024 baseline by keeping tokens/update unchanged.
+# ========== Training parameters ==========
 MICRO_BATCH_SIZE=5
 GLOBAL_BATCH_SIZE=120
 NUM_WORKERS=${NUM_WORKERS:-32}
@@ -163,6 +155,9 @@ NUM_WORKERS=${NUM_WORKERS:-32}
 # Note: This corresponds to training on all FineWeb-Edu 2025 tokens; adjust in-script if you want a shorter run.
 TRAIN_TOKENS=100000000000
 LR_DECAY_TOKENS=${TRAIN_TOKENS}
+LR=5e-4
+MIN_LR=1e-5
+
 WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
@@ -178,9 +173,6 @@ if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${OVERLAP_GRAD_REDUCE}" != "1" ]]; th
   echo "ERROR: OVERLAP_PARAM_GATHER=1 requires OVERLAP_GRAD_REDUCE=1" >&2
   exit 1
 fi
-
-LR=5e-4
-MIN_LR=1e-5
 
 DISTRIBUTED_ARGS=(
   --nproc_per_node ${GPUS_PER_NODE}

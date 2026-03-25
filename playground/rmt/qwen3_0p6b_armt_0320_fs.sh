@@ -21,10 +21,9 @@ set -ex
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
-# ========== For test ==========
+# ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 
-# ========== Distributed runtime toggles ==========
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
@@ -38,6 +37,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-9899}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
+# ========== Paths (files and data) ==========
 ROOT=${ROOT:-/mnt/step3-abla/siming}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
@@ -105,6 +105,7 @@ DATASET_PATH="
 "
 fi
 
+# ========== Model structure parameters ==========
 TP_SIZE=1
 PP_SIZE=1
 CP_SIZE=1
@@ -127,16 +128,22 @@ ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
+# ========== ARMT mechanism parameters ==========
 NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
 ARMT_N_HEADS=${ARMT_N_HEADS:-16}
+NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
 
+# ========== Training parameters ==========
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-30}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
 TRAIN_TOKENS=${TRAIN_TOKENS:-100000000000}
 LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-${TRAIN_TOKENS}}
+LR=${LR:-5e-4}
+MIN_LR=${MIN_LR:-1e-5}
+
 WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
@@ -152,9 +159,6 @@ if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${OVERLAP_GRAD_REDUCE}" != "1" ]]; th
   echo "ERROR: OVERLAP_PARAM_GATHER=1 requires OVERLAP_GRAD_REDUCE=1" >&2
   exit 1
 fi
-
-LR=${LR:-5e-4}
-MIN_LR=${MIN_LR:-1e-5}
 
 DISTRIBUTED_ARGS=(
   --nproc_per_node ${GPUS_PER_NODE}
@@ -200,6 +204,11 @@ ARMT_ARGS=(
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --armt-n-heads ${ARMT_N_HEADS}
 )
+if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
+  ARMT_ARGS+=(--no-read-memory-from-first-chunk)
+else
+  ARMT_ARGS+=(--read-memory-from-first-chunk)
+fi
 
 TRAINING_ARGS=(
   --micro-batch-size ${MICRO_BATCH_SIZE}
@@ -275,6 +284,7 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
+echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 
 echo "NUM_WORKERS=${NUM_WORKERS}"

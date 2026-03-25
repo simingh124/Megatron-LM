@@ -1,22 +1,23 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B RMT training from scratch without TBPTT truncation.
+# Qwen3-0.6B ARMT training from scratch with denominator normalization disabled by default.
 #
-# Reference launchers:
-# - playground/rmt/qwen3_0p6b_rmt_0320_fs.sh
-# - playground/rmt/qwen3_0p6b_armt_0320_fs_wo_tbptt.sh
+# Reference launcher:
+# - playground/rmt/qwen3_0p6b_armt_0324_fs_wo_tbptt.sh
 #
 # Difference from the reference:
-# - No --load / --no-load-optim / --no-load-rng.
-# - RMT and backbone params are initialized from scratch.
-# - Add --no-recurrent-tbptt-mode so recurrent memory state stays connected across chunks.
+# - Default to --no-armt-use-denom.
+# - Set ARMT_USE_DENOM=1 to switch to --armt-use-denom.
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
 #
 # Exit interval:
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
+#
+# Optional:
+#   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
@@ -27,38 +28,40 @@ USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer sta
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
 USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+
 LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-9899}
+MASTER_PORT=${MASTER_PORT:-9898}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
 # ========== Paths (files and data) ==========
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 ROOT=${ROOT:-/mnt/step3-abla/siming}
-MEGATRON_ROOT=${MEGATRON_ROOT:-${REPO_ROOT}}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 VENV_PYTHON=${VENV_PYTHON:-"${ROOT}/.venv/bin/python"}
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
 
 EXP_NAME=$(basename "${BASH_SOURCE[0]}" ".sh")
 
-PRETRAIN_SCRIPT_PATH=${PRETRAIN_SCRIPT_PATH:-"${MEGATRON_ROOT}/examples/rmt/train.py"}
-TOKENIZER_DIR=${TOKENIZER_DIR:-"${ROOT}/tokenizers/qwen3_tokenizer"}
+PRETRAIN_SCRIPT_PATH="${PRETRAIN_SCRIPT_PATH:-${MEGATRON_ROOT}/examples/armt/train.py}"
+TOKENIZER_DIR="${TOKENIZER_DIR:-${ROOT}/tokenizers/qwen3_tokenizer}"
 
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}"}
-TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}"}
-LOG_DIR=${LOG_DIR:-"${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"}
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}}"
+TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}}"
+LOG_DIR="${LOG_DIR:-${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}}"
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+  LOG_INTERVAL=${LOG_INTERVAL:-1}
 else
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+  LOG_INTERVAL=${LOG_INTERVAL:-1}
 fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
@@ -79,7 +82,7 @@ if [[ ! -x "${VENV_PYTHON}" ]]; then
   exit 1
 fi
 if [[ ! -f "${PRETRAIN_SCRIPT_PATH}" ]]; then
-  echo "ERROR: RMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
+  echo "ERROR: ARMT train entrypoint not found: ${PRETRAIN_SCRIPT_PATH}" >&2
   exit 1
 fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
@@ -128,14 +131,16 @@ ROTARY_PERCENT=1.0
 
 NORM_EPS=1e-6
 
-# ========== RMT mechanism parameters ==========
+# ========== ARMT mechanism parameters ==========
 NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
-RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE:-${ARMT_CHUNK_SIZE:-512}}
+ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
+ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
-NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-0}
+NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
+ARMT_USE_DENOM=${ARMT_USE_DENOM:-0}
 
 # ========== Training parameters ==========
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-30}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
@@ -149,6 +154,11 @@ WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+
+if (( LR_WARMUP_ITERS >= LR_DECAY_ITERS )); then
+  echo "ERROR: invalid TRAIN_TOKENS/LR_DECAY_TOKENS override: lr_warmup_iters (${LR_WARMUP_ITERS}) must be smaller than lr_decay_iters (${LR_DECAY_ITERS})" >&2
+  exit 1
+fi
 
 if [[ "${OVERLAP_PARAM_GATHER}" == "1" && "${USE_DISTRIBUTED_OPTIMIZER}" != "1" ]]; then
   echo "ERROR: OVERLAP_PARAM_GATHER=1 requires USE_DISTRIBUTED_OPTIMIZER=1" >&2
@@ -198,18 +208,24 @@ MODEL_ARGS=(
   --make-vocab-size-divisible-by ${MAKE_VOCAB_SIZE_DIVISIBLE_BY}
 )
 
-RECURRENT_ARGS=(
-  --use-recurrent-tbptt
+ARMT_ARGS=(
+  --use-armt-tbptt
   --num-mem-tokens ${NUM_MEM_TOKENS}
-  --recurrent-chunk-size ${RECURRENT_CHUNK_SIZE}
+  --armt-chunk-size ${ARMT_CHUNK_SIZE}
+  --armt-n-heads ${ARMT_N_HEADS}
 )
 if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
-  RECURRENT_ARGS+=(--no-read-memory-from-first-chunk)
+  ARMT_ARGS+=(--no-read-memory-from-first-chunk)
 else
-  RECURRENT_ARGS+=(--read-memory-from-first-chunk)
+  ARMT_ARGS+=(--read-memory-from-first-chunk)
 fi
 if [[ "${ADD_NO_RECURRENT_TBPTT_MODE}" == "1" ]]; then
-  RECURRENT_ARGS+=(--no-recurrent-tbptt-mode)
+  ARMT_ARGS+=(--no-recurrent-tbptt-mode)
+fi
+if [[ "${ARMT_USE_DENOM}" == "1" ]]; then
+  ARMT_ARGS+=(--armt-use-denom)
+else
+  ARMT_ARGS+=(--no-armt-use-denom)
 fi
 
 TRAINING_ARGS=(
@@ -241,7 +257,7 @@ DATA_ARGS=(
 CKPT_AND_LOG_ARGS=(
   --ckpt-format torch_dist
   --save "${CHECKPOINT_PATH}"
-  --log-interval 1
+  --log-interval ${LOG_INTERVAL}
   --eval-interval 1000000000
   --eval-iters 0
   --save-interval 2000
@@ -265,7 +281,6 @@ fi
 if [[ "${LOG_THROUGHPUT}" == "1" ]]; then
   EXTRA_ARGS+=(--log-throughput)
 fi
-
 if [[ -n "${EXIT_INTERVAL:-}" ]]; then
   EXTRA_ARGS+=(--exit-interval "${EXIT_INTERVAL}")
 fi
@@ -285,18 +300,18 @@ echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
-echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} RECURRENT_CHUNK_SIZE=${RECURRENT_CHUNK_SIZE}"
+echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
+echo "ARMT_USE_DENOM=${ARMT_USE_DENOM}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
-
-echo "NUM_WORKERS=${NUM_WORKERS}"
+echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"
 
 ${VENV_PYTHON} -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
   "${PRETRAIN_SCRIPT_PATH}" \
-  ${RECURRENT_ARGS[@]} \
+  ${ARMT_ARGS[@]} \
   ${MODEL_ARGS[@]} \
   ${TRAINING_ARGS[@]} \
   ${DATA_ARGS[@]} \

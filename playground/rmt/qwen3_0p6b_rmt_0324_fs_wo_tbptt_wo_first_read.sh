@@ -22,13 +22,11 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
-
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
 OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
 USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
 LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
-
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
 NODE_RANK=${NODE_RANK:-0}
@@ -36,10 +34,16 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-9899}
 WORLD_SIZE=$((${GPUS_PER_NODE} * ${NUM_NODES}))
 
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
+else
+  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
+fi
+
 # ========== Paths (files and data) ==========
+ROOT=${ROOT:-/mnt/step3-abla/siming}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ROOT=${ROOT:-/mnt/step3-abla/siming}
 MEGATRON_ROOT=${MEGATRON_ROOT:-${REPO_ROOT}}
 VENV_PYTHON=${VENV_PYTHON:-"${ROOT}/.venv/bin/python"}
 export PYTHONPATH="${MEGATRON_ROOT}:${PYTHONPATH}"
@@ -52,14 +56,28 @@ TOKENIZER_DIR=${TOKENIZER_DIR:-"${ROOT}/tokenizers/qwen3_tokenizer"}
 CHECKPOINT_PATH=${CHECKPOINT_PATH:-"${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}"}
 TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH:-"${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}"}
 LOG_DIR=${LOG_DIR:-"${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}"}
+
+if [[ -z "${DATASET_PATH:-}" ]]; then
+DATASET_PATH="
+2917318656 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2013 \
+12269142016 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2014 \
+14899052544 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2015 \
+14319288320 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2016 \
+20508835840 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2017 \
+16312246272 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2018 \
+15216353280 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2019 \
+11591385088 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2020 \
+13373333504 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2021 \
+9962110976 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2022 \
+9400868864 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2023 \
+8781021184 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2024 \
+4888559616 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2025
+"
+fi
+
 mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
 mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
 
-if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
-  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
-else
-  ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-1}
-fi
 if [[ "${ENABLE_TEE_LOG}" == "1" ]]; then
   mkdir -p "${LOG_DIR}"
   LOG_TS="$(date +%Y%m%d_%H%M%S)"
@@ -85,24 +103,6 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
-fi
-
-if [[ -z "${DATASET_PATH:-}" ]]; then
-DATASET_PATH="
-2917318656 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2013 \
-12269142016 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2014 \
-14899052544 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2015 \
-14319288320 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2016 \
-20508835840 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2017 \
-16312246272 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2018 \
-15216353280 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2019 \
-11591385088 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2020 \
-13373333504 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2021 \
-9962110976 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2022 \
-9400868864 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2023 \
-8781021184 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2024 \
-4888559616 ${ROOT}/pt_data/fineweb_edu_by_year_seq8192_merged/2025
-"
 fi
 
 # ========== Model structure parameters ==========
@@ -145,7 +145,6 @@ LR=${LR:-5e-4}
 MIN_LR=${MIN_LR:-1e-5}
 
 WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
-
 TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
