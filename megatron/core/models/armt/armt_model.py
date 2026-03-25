@@ -34,27 +34,43 @@ class ARMTModel(GPTModel):
         )
 
         self.num_mem_tokens = num_mem_tokens
+        self._skip_read_memory_for_current_chunk = False
+        self._current_chunk_is_first = False
 
         init_std = getattr(config, "init_method_std", 0.02)
         self.memory_embeddings = nn.Parameter(
             torch.randn(num_mem_tokens, config.hidden_size) * init_std
         )
 
-    def reset_all_memory(self):
+    def _armt_layers(self):
         for module in self.modules():
             if isinstance(module, ARMTLayer):
-                module.reset_memory()
+                yield module
+
+    def set_skip_read_memory_for_current_chunk(self, enabled: bool):
+        self._skip_read_memory_for_current_chunk = bool(enabled)
+        for module in self._armt_layers():
+            module.set_skip_read_memory_for_current_chunk(enabled)
+
+    def set_current_chunk_is_first(self, enabled: bool):
+        self._current_chunk_is_first = bool(enabled)
+        for module in self._armt_layers():
+            module.set_current_chunk_is_first(enabled)
+
+    def reset_all_memory(self):
+        self._skip_read_memory_for_current_chunk = False
+        self._current_chunk_is_first = False
+        for module in self._armt_layers():
+            module.reset_memory()
 
     def reset_all_monitoring_stats(self):
-        for module in self.modules():
-            if isinstance(module, ARMTLayer):
-                module.reset_monitoring_stats()
+        for module in self._armt_layers():
+            module.reset_monitoring_stats()
 
     def consume_all_monitoring_primitives(self):
         primitives = {}
-        for module in self.modules():
-            if isinstance(module, ARMTLayer):
-                merge_metric_primitives(primitives, module.consume_monitoring_primitives())
+        for module in self._armt_layers():
+            merge_metric_primitives(primitives, module.consume_monitoring_primitives())
         return primitives
 
     def consume_all_monitoring_metrics(self):

@@ -15,6 +15,7 @@ RECURRENT_DEFAULTS = {
     "recurrent_chunk_size": 512,
     "recurrent_tbptt_mode": True,
     "num_mem_tokens": 16,
+    "no_read_memory_from_first_chunk": False,
     "no_loss_from_first_chunk": False,
 }
 
@@ -63,6 +64,22 @@ def add_recurrent_args(parser):
             "Disable truncated recurrent training: keep recurrent memory state connected across "
             "chunks and run a single backward after all chunks in the microbatch finish forward."
         ),
+    )
+    group.add_argument(
+        "--no-read-memory-from-first-chunk",
+        dest="no_read_memory_from_first_chunk",
+        action="store_true",
+        default=RECURRENT_DEFAULTS["no_read_memory_from_first_chunk"],
+        help=(
+            "Do not read recurrent memory on the first chunk. "
+            "RMT skips prepending read-memory tokens; ARMT skips calling associate()."
+        ),
+    )
+    group.add_argument(
+        "--read-memory-from-first-chunk",
+        dest="no_read_memory_from_first_chunk",
+        action="store_false",
+        help="Explicitly read recurrent memory on the first chunk.",
     )
     group.add_argument(
         "--no-loss-from-first-chunk",

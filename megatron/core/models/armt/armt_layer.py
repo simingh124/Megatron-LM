@@ -48,7 +48,15 @@ class ARMTLayer(TransformerLayer):
             dtype=getattr(config, "params_dtype", torch.bfloat16),
             tbptt_mode=tbptt_mode,
         )
+        self._skip_read_memory_for_current_chunk = False
+        self._current_chunk_is_first = False
         self.reset_monitoring_stats()
+
+    def set_skip_read_memory_for_current_chunk(self, enabled: bool):
+        self._skip_read_memory_for_current_chunk = bool(enabled)
+
+    def set_current_chunk_is_first(self, enabled: bool):
+        self._current_chunk_is_first = bool(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats = {}
@@ -184,8 +192,9 @@ class ARMTLayer(TransformerLayer):
         input_is_sbh = True
 
         # Step 1: Associate (Memory Retrieval)
-        retrieved = self.associative_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
-        hidden_states = hidden_states + retrieved
+        if not self._skip_read_memory_for_current_chunk:
+            retrieved = self.associative_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
+            hidden_states = hidden_states + retrieved
 
         # Step 2 & 3: Attention + MLP
         hidden_states, context = super().forward(
@@ -222,4 +231,6 @@ class ARMTLayer(TransformerLayer):
         return hidden_states, context
 
     def reset_memory(self):
+        self._skip_read_memory_for_current_chunk = False
+        self._current_chunk_is_first = False
         self.associative_layer.reset_memory()

@@ -67,4 +67,12 @@ def test_rmt_specific_flag_is_registered_on_rmt_args():
     add_rmt_args(parser)
     args = parser.parse_args([])
 
-    assert args.rmt_no_read_memory_from_first_chunk is False
+    assert args.no_read_memory_from_first_chunk is False
+
+
+def test_rmt_shared_read_flag_can_be_explicitly_enabled():
+    parser = argparse.ArgumentParser()
+    add_rmt_args(parser)
+    args = parser.parse_args(["--read-memory-from-first-chunk"])
+
+    assert args.no_read_memory_from_first_chunk is False

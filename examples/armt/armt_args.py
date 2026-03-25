@@ -1,10 +1,13 @@
 """ARMT argument definitions and constraint checks."""
 
+import argparse
+
 from examples.recurrent.recurrent_args import add_recurrent_args, validate_recurrent_constraints
 
 
 def add_armt_args(parser):
     parser = add_recurrent_args(parser)
+    parser.set_defaults(no_read_memory_from_first_chunk=True)
     group = parser.add_argument_group("ARMT", "ARMT specific arguments")
 
     group.add_argument(
@@ -28,7 +31,7 @@ def add_armt_args(parser):
     )
     group.add_argument(
         "--armt-use-denom",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Use denominator normalization in retrieval",
     )
@@ -36,7 +39,7 @@ def add_armt_args(parser):
         "--armt-no-denom",
         action="store_false",
         dest="armt_use_denom",
-        help="Disable denominator normalization",
+        help=argparse.SUPPRESS,
     )
     group.add_argument(
         "--armt-gating",
@@ -46,7 +49,7 @@ def add_armt_args(parser):
     )
     group.add_argument(
         "--armt-correction",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply correction term in delta updates",
     )
@@ -55,6 +58,8 @@ def add_armt_args(parser):
 
 
 def validate_armt_constraints(args):
+    if not hasattr(args, "no_read_memory_from_first_chunk"):
+        args.no_read_memory_from_first_chunk = True
     return validate_recurrent_constraints(
         args,
         model_name="ARMT",

@@ -110,7 +110,7 @@ def test_scheduler_sets_skip_read_memory_only_on_first_chunk():
         try:
             training_global_vars._GLOBAL_ARGS = SimpleNamespace(
                 recurrent_chunk_size=4,
-                rmt_no_read_memory_from_first_chunk=True,
+                no_read_memory_from_first_chunk=True,
                 no_loss_from_first_chunk=False,
             )
             recurrent_forward_backward_no_pipelining(
@@ -171,7 +171,7 @@ def test_scheduler_skip_read_memory_does_not_conflict_with_first_chunk_loss_mask
         try:
             training_global_vars._GLOBAL_ARGS = SimpleNamespace(
                 recurrent_chunk_size=4,
-                rmt_no_read_memory_from_first_chunk=True,
+                no_read_memory_from_first_chunk=True,
                 no_loss_from_first_chunk=True,
             )
             recurrent_forward_backward_no_pipelining(
@@ -229,7 +229,7 @@ def test_scheduler_publishes_rmt_mem_token_cosine_metrics():
         try:
             training_global_vars._GLOBAL_ARGS = SimpleNamespace(
                 recurrent_chunk_size=4,
-                rmt_no_read_memory_from_first_chunk=False,
+                no_read_memory_from_first_chunk=False,
                 no_loss_from_first_chunk=False,
             )
             recurrent_forward_backward_no_pipelining(

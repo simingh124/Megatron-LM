@@ -82,6 +82,51 @@ class TestARMTModel:
         model.reset_all_memory()
         layer.reset_memory.assert_called_once()
 
+    def test_armt_model_propagates_chunk_state_to_layers(self):
+        config = MagicMock()
+        config.hidden_size = 256
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        layer.associative_layer = MagicMock()
+        model.add_module("armt_layer", layer)
+
+        model.set_current_chunk_is_first(True)
+        model.set_skip_read_memory_for_current_chunk(True)
+
+        assert model._current_chunk_is_first is True
+        assert model._skip_read_memory_for_current_chunk is True
+        assert layer._current_chunk_is_first is True
+        assert layer._skip_read_memory_for_current_chunk is True
+
+        model.reset_all_memory()
+
+        assert model._current_chunk_is_first is False
+        assert model._skip_read_memory_for_current_chunk is False
+        assert layer._current_chunk_is_first is False
+        assert layer._skip_read_memory_for_current_chunk is False
+        layer.associative_layer.reset_memory.assert_called_once()
+
     def test_armt_model_monitoring_helpers(self):
         """验证模型级 monitoring reset/consume 会跨 ARMT 层聚合。"""
         config = MagicMock()

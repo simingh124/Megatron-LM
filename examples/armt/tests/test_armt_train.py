@@ -79,7 +79,12 @@ def _build_model(tp_size: int, seq_len: int):
     return model
 
 
-def _run_single_step(tp_size: int, seq_len: int):
+def _run_single_step(
+    tp_size: int,
+    seq_len: int,
+    *,
+    skip_read_memory_from_first_chunk: bool = True,
+):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
 
@@ -93,6 +98,8 @@ def _run_single_step(tp_size: int, seq_len: int):
 
     model = _build_model(tp_size, seq_len).cuda()
     model.train()
+    model.set_current_chunk_is_first(True)
+    model.set_skip_read_memory_for_current_chunk(skip_read_memory_from_first_chunk)
 
     batch_size = 2
     tokens = torch.randint(0, 32000, (batch_size, seq_len), device="cuda")
@@ -132,7 +139,15 @@ class TestARMTTraining:
         """集成测试：单卡（TP=1）下完成一次真实 forward/backward，loss 为有限值。"""
         _init_distributed(world_size=1)
         try:
-            _run_single_step(tp_size=1, seq_len=64)
+            _run_single_step(tp_size=1, seq_len=64, skip_read_memory_from_first_chunk=True)
+        finally:
+            _finalize_distributed()
+
+    @requires_gpu
+    def test_armt_single_step_with_first_chunk_read(self):
+        _init_distributed(world_size=1)
+        try:
+            _run_single_step(tp_size=1, seq_len=64, skip_read_memory_from_first_chunk=False)
         finally:
             _finalize_distributed()
 
@@ -144,6 +159,6 @@ class TestARMTTraining:
             pytest.skip("TP=2 test requires launching pytest with WORLD_SIZE>=2, e.g. under torchrun.")
         _init_distributed(world_size=world_size)
         try:
-            _run_single_step(tp_size=2, seq_len=64)
+            _run_single_step(tp_size=2, seq_len=64, skip_read_memory_from_first_chunk=True)
         finally:
             _finalize_distributed()

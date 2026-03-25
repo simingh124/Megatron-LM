@@ -150,7 +150,7 @@ def _set_recurrent_chunk_model_state(model, *, args, is_first_chunk: bool) -> No
         skip_read_memory = bool(
             args is not None
             and is_first_chunk
-            and getattr(args, "rmt_no_read_memory_from_first_chunk", False)
+            and getattr(args, "no_read_memory_from_first_chunk", False)
         )
         model.set_skip_read_memory_for_current_chunk(skip_read_memory)
 

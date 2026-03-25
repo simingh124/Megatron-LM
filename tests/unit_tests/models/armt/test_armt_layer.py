@@ -79,6 +79,52 @@ class TestARMTLayer:
         mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
         assert mem_hidden.shape == (num_mem_tokens, B, H)
 
+    def test_armt_layer_skip_read_memory_skips_associate_but_still_updates_memory(
+        self, mock_config
+    ):
+        S, B, H = 128 + 16, 2, 256
+        num_mem_tokens = 16
+        hidden_states = torch.randn(S, B, H)
+        retrieved = torch.full_like(hidden_states, 3.0)
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=num_mem_tokens,
+            )
+            layer.associative_layer = _DummyAssociativeLayer(retrieved)
+
+        forwarded_inputs = []
+
+        def _forward_side_effect(hidden_states_arg, attention_mask=None, **kwargs):
+            del attention_mask, kwargs
+            forwarded_inputs.append(hidden_states_arg.clone())
+            return hidden_states_arg, None
+
+        layer.set_current_chunk_is_first(True)
+        layer.set_skip_read_memory_for_current_chunk(True)
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.forward",
+            side_effect=_forward_side_effect,
+        ):
+            out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        layer.associative_layer.associate.assert_not_called()
+        layer.associative_layer.update_mem.assert_called_once()
+        assert torch.equal(forwarded_inputs[0], hidden_states)
+        assert torch.equal(out, hidden_states)
+
     def test_armt_layer_token_monitoring_metrics(self, mock_config):
         """验证 token 监控指标按最终层输出计算。"""
         num_mem_tokens = 4

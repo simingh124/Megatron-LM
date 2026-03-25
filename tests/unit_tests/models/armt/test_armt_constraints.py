@@ -1,8 +1,9 @@
+import argparse
 from argparse import Namespace
 
 import pytest
 
-from examples.armt.armt_args import validate_armt_constraints
+from examples.armt.armt_args import add_armt_args, validate_armt_constraints
 from examples.recurrent.recurrent_args import normalize_recurrent_args
 
 
@@ -94,3 +95,66 @@ def test_legacy_yaml_like_namespace_passes_validation():
     )
     validate_armt_constraints(args)
     assert args.recurrent_chunk_size == 512
+
+
+def test_armt_defaults_skip_read_memory_on_first_chunk():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.no_read_memory_from_first_chunk is True
+
+
+def test_armt_shared_read_flag_can_enable_first_chunk_read():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--read-memory-from-first-chunk"])
+
+    assert args.no_read_memory_from_first_chunk is False
+
+
+def test_armt_use_denom_defaults_to_true():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_use_denom is True
+
+
+def test_armt_use_denom_can_be_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--no-armt-use-denom"])
+
+    assert args.armt_use_denom is False
+
+
+def test_armt_no_denom_legacy_alias_still_works():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-no-denom"])
+
+    assert args.armt_use_denom is False
+
+
+def test_armt_correction_defaults_to_true():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_correction is True
+
+
+def test_armt_correction_can_be_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--no-armt-correction"])
+
+    assert args.armt_correction is False
+
+
+def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
+    args = _make_args()
+    validate_armt_constraints(args)
+
+    assert args.no_read_memory_from_first_chunk is True

@@ -5,16 +5,7 @@ from examples.recurrent.recurrent_args import add_recurrent_args, validate_recur
 
 def add_rmt_args(parser):
     parser = add_recurrent_args(parser)
-    group = parser.add_argument_group("RMT", "RMT specific arguments")
-    group.add_argument(
-        "--rmt-no-read-memory-from-first-chunk",
-        action="store_true",
-        default=False,
-        help=(
-            "Do not prepend read memory tokens on the first recurrent TBPTT chunk. "
-            "The first chunk still appends write memory tokens so later chunks can read them."
-        ),
-    )
+    parser.set_defaults(no_read_memory_from_first_chunk=False)
     return parser
 
 
