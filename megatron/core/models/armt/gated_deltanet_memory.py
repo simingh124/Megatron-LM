@@ -205,14 +205,17 @@ class GatedDeltaNetMemory(nn.Module):
         needs_rebuild = (
             self.recurrent_state.numel() == 0
             or self.recurrent_state.shape != expected_state_shape
-            or self.recurrent_state.device != device
-            or self.recurrent_state.dtype != dtype
         )
 
         if needs_rebuild:
             self.recurrent_state = torch.zeros(expected_state_shape, device=device, dtype=dtype)
             self._pending_reset = False
             return
+
+        if self.recurrent_state.device != device:
+            # The gated delta rule may return a higher-precision recurrent state.
+            # Preserve the accumulated memory when only the placement changes.
+            self.recurrent_state = self.recurrent_state.to(device=device)
 
         if self._pending_reset:
             self.recurrent_state = self.recurrent_state.detach().zero_()

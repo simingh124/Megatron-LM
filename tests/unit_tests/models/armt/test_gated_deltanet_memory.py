@@ -7,6 +7,8 @@ from megatron.training import global_vars as training_global_vars
 from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
 
 def _build_layer(**overrides):
     kwargs = dict(
@@ -122,6 +124,38 @@ def test_gdn_memory_monitoring_metrics_present():
     assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(
         float(expected_retrieved_norm_mean), rel=1e-5
     )
+
+
+@requires_cuda
+def test_gdn_memory_bf16_read_preserves_state_and_emits_nonzero_read_metrics():
+    layer = _build_layer(dtype=torch.bfloat16, tbptt_mode=False).cuda()
+    batch_size = 2
+    device = torch.device("cuda")
+    layer.reset_memory(batch_size=batch_size, device=device)
+
+    layer.update_mem(
+        torch.randn(
+            batch_size,
+            layer.num_mem_tokens,
+            layer.d_model,
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+        input_is_sbh=False,
+    )
+    state_norm_before_read = layer.recurrent_state.float().norm()
+    assert float(state_norm_before_read) > 0.0
+
+    retrieved = layer.associate(
+        torch.randn(batch_size, 6, layer.d_model, device=device, dtype=torch.bfloat16),
+        input_is_sbh=False,
+    )
+    metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+    assert float(layer.recurrent_state.float().norm()) > 0.0
+    assert float(torch.linalg.vector_norm(retrieved.float(), dim=-1).mean()) > 0.0
+    assert float(metrics["armt/read/retrieved_norm_mean"]) > 0.0
+    assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) > 0.0
 
 
 def test_gdn_memory_requires_fla_when_requested():
