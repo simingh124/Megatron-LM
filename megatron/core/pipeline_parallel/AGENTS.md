@@ -4,7 +4,7 @@
 - 在不启用 pipeline parallel（PP=1）的前提下，为 ARMT/RMT 提供共享 TBPTT 的 forward/backward 调度实现。
 
 ## Directory Structure (Recurrent-related)
-- `schedules.py`: 默认 forward/backward schedules；当 `use_recurrent_tbptt` 打开时自动切到 recurrent TBPTT。
+- `schedules.py`: 默认 forward/backward schedules；当 `use_recurrent_model_schedule` 打开时自动切到 recurrent TBPTT。
 - `recurrent_schedules.py`:
   - `chunk_data(...)`: 按 `recurrent_chunk_size` 切分 batch（含 `attention_mask` 的方阵切片）
   - `recurrent_forward_backward_no_pipelining(...)`: TBPTT 调度主函数

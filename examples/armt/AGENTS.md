@@ -14,7 +14,7 @@
 - `README.md`: v1 约束与用法。
 
 ## Key Data Flow (Launcher -> Train -> Core)
-1. 启动：`torchrun ... examples/armt/train.py --use-armt-tbptt ...`
+1. 启动：`torchrun ... examples/armt/train.py --use-recurrent-model-schedule ...`
 2. 参数：
    - `pretrain(..., extra_args_provider=add_armt_args)` 将 ARMT 参数注入全局 args。
    - `model_provider()` 里 `validate_armt_constraints(args)` 做硬约束检查。
@@ -23,7 +23,7 @@
    - `ARMTModel(...)` 构建带 memory tokens 的 GPT 变体
 4. 调度（TBPTT）：
    - 实现：`megatron/core/pipeline_parallel/recurrent_schedules.py:recurrent_forward_backward_no_pipelining`
-   - `schedules.py` 会在 `use_recurrent_tbptt` 打开时自动选用。
+   - `schedules.py` 会在 `use_recurrent_model_schedule` 打开时自动选用。
 
 ## Batch Contract (forward_step)
 - 关键字段：`tokens/labels/loss_mask/attention_mask/position_ids`
