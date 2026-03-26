@@ -84,6 +84,14 @@ def model_provider(
         gating=args.armt_gating,
         correction=args.armt_correction,
         tbptt_mode=args.recurrent_tbptt_mode,
+        recurrent_memory_backend=args.recurrent_memory_backend,
+        recurrent_gdn_use_fla_kernel=args.recurrent_gdn_use_fla_kernel,
+        recurrent_gdn_use_causal_conv1d=args.recurrent_gdn_use_causal_conv1d,
+        recurrent_gdn_conv_kernel_size=args.recurrent_gdn_conv_kernel_size,
+        recurrent_gdn_key_head_dim=args.recurrent_gdn_key_head_dim,
+        recurrent_gdn_value_head_dim=args.recurrent_gdn_value_head_dim,
+        recurrent_gdn_num_key_heads=args.recurrent_gdn_num_key_heads,
+        recurrent_gdn_num_value_heads=args.recurrent_gdn_num_value_heads,
     )
 
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)

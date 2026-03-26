@@ -1,5 +1,6 @@
 import argparse
 from argparse import Namespace
+from unittest.mock import patch
 
 import pytest
 
@@ -177,3 +178,57 @@ def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
     validate_armt_constraints(args)
 
     assert args.no_read_memory_from_first_chunk is True
+
+
+def test_gdn_requires_explicit_hyperparameters():
+    args = _make_args(
+        recurrent_memory_backend="gated_deltanet",
+    )
+    with pytest.raises(ValueError, match="explicit recurrent GDN hyperparameters"):
+        validate_armt_constraints(args)
+
+
+def test_gdn_head_counts_must_match_tp_and_ratio():
+    args = _make_args(
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_key_head_dim=64,
+        recurrent_gdn_value_head_dim=64,
+        recurrent_gdn_num_key_heads=3,
+        recurrent_gdn_num_value_heads=5,
+        tensor_model_parallel_size=2,
+    )
+    with pytest.raises(ValueError, match="multiple"):
+        validate_armt_constraints(args)
+
+
+def test_gdn_use_fla_requires_installed_package():
+    args = _make_args(
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_key_head_dim=64,
+        recurrent_gdn_value_head_dim=64,
+        recurrent_gdn_num_key_heads=2,
+        recurrent_gdn_num_value_heads=2,
+        recurrent_gdn_use_fla_kernel=True,
+        recurrent_gdn_use_causal_conv1d=False,
+    )
+    with patch("examples.recurrent.recurrent_args.find_spec", side_effect=lambda name: None):
+        with pytest.raises(ImportError, match="flash-linear-attention"):
+            validate_armt_constraints(args)
+
+
+def test_gdn_use_causal_conv1d_requires_installed_package():
+    args = _make_args(
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_key_head_dim=64,
+        recurrent_gdn_value_head_dim=64,
+        recurrent_gdn_num_key_heads=2,
+        recurrent_gdn_num_value_heads=2,
+        recurrent_gdn_use_fla_kernel=False,
+        recurrent_gdn_use_causal_conv1d=True,
+    )
+    with patch(
+        "examples.recurrent.recurrent_args.find_spec",
+        side_effect=lambda name: None if name == "causal_conv1d" else object(),
+    ):
+        with pytest.raises(ImportError, match="causal_conv1d"):
+            validate_armt_constraints(args)

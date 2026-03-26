@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from megatron.core.models.armt.armt_layer import ARMTLayer
+from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
 
@@ -279,3 +280,30 @@ class TestARMTLayer:
 
         mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
         assert torch.equal(mem_hidden, full_hidden[-2:])
+
+    def test_armt_layer_can_build_gated_deltanet_backend(self, mock_config):
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_memory_backend="gated_deltanet",
+                recurrent_gdn_use_fla_kernel=False,
+                recurrent_gdn_use_causal_conv1d=False,
+                recurrent_gdn_conv_kernel_size=2,
+                recurrent_gdn_key_head_dim=16,
+                recurrent_gdn_value_head_dim=16,
+                recurrent_gdn_num_key_heads=4,
+                recurrent_gdn_num_value_heads=4,
+            )
+
+        assert layer.associative_layer is None
+        assert isinstance(layer.recurrent_memory_layer, GatedDeltaNetMemory)

@@ -1,5 +1,6 @@
 import os
 import random
+from importlib.util import find_spec
 
 import torch
 import torch.distributed as dist
@@ -21,6 +22,9 @@ requires_multi_gpu = pytest.mark.skipif(
     reason="Need at least 2 GPUs",
 )
 
+HAS_FLA = find_spec("fla") is not None
+HAS_CAUSAL_CONV1D = find_spec("causal_conv1d") is not None
+
 
 def _init_distributed(world_size: int):
     if dist.is_initialized():
@@ -40,7 +44,14 @@ def _init_distributed(world_size: int):
     dist.init_process_group(backend="nccl", init_method="env://")
 
 
-def _build_model(tp_size: int, seq_len: int):
+def _build_model(
+    tp_size: int,
+    seq_len: int,
+    *,
+    recurrent_memory_backend: str = "associative",
+    recurrent_gdn_use_fla_kernel: bool = True,
+    recurrent_gdn_use_causal_conv1d: bool = True,
+):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=64,
@@ -64,6 +75,14 @@ def _build_model(tp_size: int, seq_len: int):
         gating=False,
         correction=True,
         tbptt_mode=True,
+        recurrent_memory_backend=recurrent_memory_backend,
+        recurrent_gdn_use_fla_kernel=recurrent_gdn_use_fla_kernel,
+        recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+        recurrent_gdn_conv_kernel_size=2,
+        recurrent_gdn_key_head_dim=16,
+        recurrent_gdn_value_head_dim=16,
+        recurrent_gdn_num_key_heads=4,
+        recurrent_gdn_num_value_heads=4,
     )
 
     model = ARMTModel(
@@ -84,6 +103,9 @@ def _run_single_step(
     seq_len: int,
     *,
     skip_read_memory_from_first_chunk: bool = True,
+    recurrent_memory_backend: str = "associative",
+    recurrent_gdn_use_fla_kernel: bool = True,
+    recurrent_gdn_use_causal_conv1d: bool = True,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
@@ -96,7 +118,13 @@ def _run_single_step(
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
 
-    model = _build_model(tp_size, seq_len).cuda()
+    model = _build_model(
+        tp_size,
+        seq_len,
+        recurrent_memory_backend=recurrent_memory_backend,
+        recurrent_gdn_use_fla_kernel=recurrent_gdn_use_fla_kernel,
+        recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+    ).cuda()
     model.train()
     model.set_current_chunk_is_first(True)
     model.set_skip_read_memory_for_current_chunk(skip_read_memory_from_first_chunk)
@@ -135,11 +163,45 @@ def _finalize_distributed():
 
 class TestARMTTraining:
     @requires_gpu
-    def test_armt_single_step(self):
+    @pytest.mark.parametrize(
+        ("recurrent_memory_backend", "recurrent_gdn_use_fla_kernel", "recurrent_gdn_use_causal_conv1d"),
+        [
+            ("associative", True, True),
+            pytest.param(
+                "gated_deltanet",
+                True,
+                True,
+                marks=pytest.mark.skipif(
+                    not (HAS_FLA and HAS_CAUSAL_CONV1D),
+                    reason="Need FLA and causal_conv1d for fused GDN path",
+                ),
+            ),
+            ("gated_deltanet", False, False),
+            pytest.param(
+                "gated_deltanet",
+                True,
+                False,
+                marks=pytest.mark.skipif(not HAS_FLA, reason="Need FLA for fused GDN path"),
+            ),
+        ],
+    )
+    def test_armt_single_step(
+        self,
+        recurrent_memory_backend,
+        recurrent_gdn_use_fla_kernel,
+        recurrent_gdn_use_causal_conv1d,
+    ):
         """集成测试：单卡（TP=1）下完成一次真实 forward/backward，loss 为有限值。"""
         _init_distributed(world_size=1)
         try:
-            _run_single_step(tp_size=1, seq_len=64, skip_read_memory_from_first_chunk=True)
+            _run_single_step(
+                tp_size=1,
+                seq_len=64,
+                skip_read_memory_from_first_chunk=True,
+                recurrent_memory_backend=recurrent_memory_backend,
+                recurrent_gdn_use_fla_kernel=recurrent_gdn_use_fla_kernel,
+                recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+            )
         finally:
             _finalize_distributed()
 

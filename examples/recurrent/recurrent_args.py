@@ -1,6 +1,7 @@
 """Shared recurrent training arguments and validation helpers."""
 
 from argparse import Namespace
+from importlib.util import find_spec
 from typing import Any
 
 
@@ -16,6 +17,14 @@ RECURRENT_DEFAULTS = {
     "num_mem_tokens": 16,
     "no_read_memory_from_first_chunk": False,
     "no_loss_from_first_chunk": False,
+    "recurrent_memory_backend": "associative",
+    "recurrent_gdn_use_fla_kernel": True,
+    "recurrent_gdn_use_causal_conv1d": True,
+    "recurrent_gdn_conv_kernel_size": 4,
+    "recurrent_gdn_key_head_dim": None,
+    "recurrent_gdn_value_head_dim": None,
+    "recurrent_gdn_num_key_heads": None,
+    "recurrent_gdn_num_value_heads": None,
 }
 
 
@@ -87,6 +96,68 @@ def add_recurrent_args(parser):
             "Do not compute LM loss (loss_mask=0) on the first TBPTT chunk. "
             "Forward still runs so memory can be written."
         ),
+    )
+    group.add_argument(
+        "--recurrent-memory-backend",
+        choices=["associative", "gated_deltanet"],
+        default=RECURRENT_DEFAULTS["recurrent_memory_backend"],
+        help="Recurrent memory backend used inside ARMT layers.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-use-fla-kernel",
+        dest="recurrent_gdn_use_fla_kernel",
+        action="store_true",
+        default=RECURRENT_DEFAULTS["recurrent_gdn_use_fla_kernel"],
+        help="Use FLA gated delta kernel for recurrent GDN memory backend.",
+    )
+    group.add_argument(
+        "--no-recurrent-gdn-use-fla-kernel",
+        dest="recurrent_gdn_use_fla_kernel",
+        action="store_false",
+        help="Disable FLA gated delta kernel and use torch fallback.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-use-causal-conv1d",
+        dest="recurrent_gdn_use_causal_conv1d",
+        action="store_true",
+        default=RECURRENT_DEFAULTS["recurrent_gdn_use_causal_conv1d"],
+        help="Use causal_conv1d kernel for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--no-recurrent-gdn-use-causal-conv1d",
+        dest="recurrent_gdn_use_causal_conv1d",
+        action="store_false",
+        help="Disable causal_conv1d kernel and use nn.Conv1d fallback.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-conv-kernel-size",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_gdn_conv_kernel_size"],
+        help="Depth-wise convolution kernel size for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-key-head-dim",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_gdn_key_head_dim"],
+        help="Key head dimension for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-value-head-dim",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_gdn_value_head_dim"],
+        help="Value head dimension for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-num-key-heads",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_gdn_num_key_heads"],
+        help="Number of key heads for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-num-value-heads",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_gdn_num_value_heads"],
+        help="Number of value heads for recurrent GDN backend.",
     )
     return parser
 
@@ -164,5 +235,50 @@ def validate_recurrent_constraints(
         raise ValueError(
             f"{model_name} supports TE modules in bf16/fp16 only; FP8 is not supported."
         )
+
+    if args.recurrent_memory_backend == "gated_deltanet":
+        required_fields = (
+            "recurrent_gdn_key_head_dim",
+            "recurrent_gdn_value_head_dim",
+            "recurrent_gdn_num_key_heads",
+            "recurrent_gdn_num_value_heads",
+        )
+        missing = [field for field in required_fields if getattr(args, field, None) is None]
+        if missing:
+            raise ValueError(
+                "gated_deltanet backend requires explicit recurrent GDN hyperparameters: "
+                + ", ".join(missing)
+            )
+
+        if args.recurrent_gdn_conv_kernel_size <= 0:
+            raise ValueError("recurrent_gdn_conv_kernel_size must be > 0")
+        if args.recurrent_gdn_key_head_dim <= 0:
+            raise ValueError("recurrent_gdn_key_head_dim must be > 0")
+        if args.recurrent_gdn_value_head_dim <= 0:
+            raise ValueError("recurrent_gdn_value_head_dim must be > 0")
+        if args.recurrent_gdn_num_key_heads <= 0:
+            raise ValueError("recurrent_gdn_num_key_heads must be > 0")
+        if args.recurrent_gdn_num_value_heads <= 0:
+            raise ValueError("recurrent_gdn_num_value_heads must be > 0")
+        if args.recurrent_gdn_num_value_heads % args.recurrent_gdn_num_key_heads != 0:
+            raise ValueError(
+                "recurrent_gdn_num_value_heads must be a multiple of recurrent_gdn_num_key_heads"
+            )
+
+        tp = args.tensor_model_parallel_size
+        if args.recurrent_gdn_num_key_heads % tp != 0:
+            raise ValueError("recurrent_gdn_num_key_heads must be a multiple of TP")
+        if args.recurrent_gdn_num_value_heads % tp != 0:
+            raise ValueError("recurrent_gdn_num_value_heads must be a multiple of TP")
+
+        if args.recurrent_gdn_use_fla_kernel and find_spec("fla") is None:
+            raise ImportError(
+                "recurrent_gdn_use_fla_kernel=True requires flash-linear-attention to be "
+                "installed."
+            )
+        if args.recurrent_gdn_use_causal_conv1d and find_spec("causal_conv1d") is None:
+            raise ImportError(
+                "recurrent_gdn_use_causal_conv1d=True requires causal_conv1d to be installed."
+            )
 
     return args

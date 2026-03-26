@@ -34,6 +34,14 @@ def get_armt_layer_spec(
     gating: bool = False,
     correction: bool = True,
     tbptt_mode: bool = True,
+    recurrent_memory_backend: str = "associative",
+    recurrent_gdn_use_fla_kernel: bool = True,
+    recurrent_gdn_use_causal_conv1d: bool = True,
+    recurrent_gdn_conv_kernel_size: int = 4,
+    recurrent_gdn_key_head_dim: Optional[int] = None,
+    recurrent_gdn_value_head_dim: Optional[int] = None,
+    recurrent_gdn_num_key_heads: Optional[int] = None,
+    recurrent_gdn_num_value_heads: Optional[int] = None,
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
         base_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -78,5 +86,13 @@ def get_armt_layer_spec(
             "gating": gating,
             "correction": correction,
             "tbptt_mode": tbptt_mode,
+            "recurrent_memory_backend": recurrent_memory_backend,
+            "recurrent_gdn_use_fla_kernel": recurrent_gdn_use_fla_kernel,
+            "recurrent_gdn_use_causal_conv1d": recurrent_gdn_use_causal_conv1d,
+            "recurrent_gdn_conv_kernel_size": recurrent_gdn_conv_kernel_size,
+            "recurrent_gdn_key_head_dim": recurrent_gdn_key_head_dim,
+            "recurrent_gdn_value_head_dim": recurrent_gdn_value_head_dim,
+            "recurrent_gdn_num_key_heads": recurrent_gdn_num_key_heads,
+            "recurrent_gdn_num_value_heads": recurrent_gdn_num_value_heads,
         },
     )

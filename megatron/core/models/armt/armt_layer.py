@@ -1,4 +1,4 @@
-"""ARMT transformer layer with associative memory."""
+"""ARMT transformer layer with pluggable recurrent memory backends."""
 
 from typing import Optional
 
@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-from .associative_layer import AssociativeLayer
 from .monitoring import build_mean_metric, build_ratio_of_means_metric, merge_metric_primitives
+from .recurrent_memory import build_recurrent_memory_backend
 
 _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
 
@@ -30,27 +30,63 @@ class ARMTLayer(TransformerLayer):
         gating: bool = False,
         correction: bool = True,
         tbptt_mode: bool = True,
+        recurrent_memory_backend: str = "associative",
+        recurrent_gdn_use_fla_kernel: bool = True,
+        recurrent_gdn_use_causal_conv1d: bool = True,
+        recurrent_gdn_conv_kernel_size: int = 4,
+        recurrent_gdn_key_head_dim: Optional[int] = None,
+        recurrent_gdn_value_head_dim: Optional[int] = None,
+        recurrent_gdn_num_key_heads: Optional[int] = None,
+        recurrent_gdn_num_value_heads: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
 
         self.num_mem_tokens = num_mem_tokens
+        self.recurrent_memory_backend = recurrent_memory_backend
+        self.associative_layer = None
+        self.recurrent_memory_layer = None
 
-        self.associative_layer = AssociativeLayer(
-            d_model=config.hidden_size,
-            num_mem_tokens=num_mem_tokens,
-            d_mem=d_mem or config.hidden_size,
-            n_heads=armt_n_heads,
-            use_denom=use_denom,
-            gating=gating,
-            correction=correction,
-            nu=nu,
-            dtype=getattr(config, "params_dtype", torch.bfloat16),
-            tbptt_mode=tbptt_mode,
-        )
+        common_kwargs = {
+            "d_model": config.hidden_size,
+            "num_mem_tokens": num_mem_tokens,
+            "dtype": getattr(config, "params_dtype", torch.bfloat16),
+            "tbptt_mode": tbptt_mode,
+        }
+
+        if recurrent_memory_backend == "associative":
+            self.associative_layer = build_recurrent_memory_backend(
+                recurrent_memory_backend,
+                d_mem=d_mem or config.hidden_size,
+                n_heads=armt_n_heads,
+                use_denom=use_denom,
+                gating=gating,
+                correction=correction,
+                nu=nu,
+                **common_kwargs,
+            )
+        else:
+            self.recurrent_memory_layer = build_recurrent_memory_backend(
+                recurrent_memory_backend,
+                conv_kernel_size=recurrent_gdn_conv_kernel_size,
+                key_head_dim=recurrent_gdn_key_head_dim,
+                value_head_dim=recurrent_gdn_value_head_dim,
+                num_key_heads=recurrent_gdn_num_key_heads,
+                num_value_heads=recurrent_gdn_num_value_heads,
+                use_fla_kernel=recurrent_gdn_use_fla_kernel,
+                use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+                **common_kwargs,
+            )
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
         self.reset_monitoring_stats()
+
+    def _get_memory_layer(self):
+        if self.recurrent_memory_layer is not None:
+            return self.recurrent_memory_layer
+        if self.associative_layer is not None:
+            return self.associative_layer
+        raise RuntimeError("ARMTLayer has no recurrent memory layer configured.")
 
     def set_skip_read_memory_for_current_chunk(self, enabled: bool):
         self._skip_read_memory_for_current_chunk = bool(enabled)
@@ -60,7 +96,7 @@ class ARMTLayer(TransformerLayer):
 
     def reset_monitoring_stats(self):
         self._monitoring_stats = {}
-        self.associative_layer.reset_monitoring_stats()
+        self._get_memory_layer().reset_monitoring_stats()
 
     def _accumulate_monitoring_stat(self, name: str, value: torch.Tensor):
         value = value.detach()
@@ -179,7 +215,7 @@ class ARMTLayer(TransformerLayer):
             )
 
         self._monitoring_stats = {}
-        merge_metric_primitives(primitives, self.associative_layer.consume_monitoring_primitives())
+        merge_metric_primitives(primitives, self._get_memory_layer().consume_monitoring_primitives())
         return primitives
 
     def forward(
@@ -190,10 +226,11 @@ class ARMTLayer(TransformerLayer):
     ):
         # Project convention: ARMT only supports Megatron's SBH layout.
         input_is_sbh = True
+        memory_layer = self._get_memory_layer()
 
         # Step 1: Associate (Memory Retrieval)
         if not self._skip_read_memory_for_current_chunk:
-            retrieved = self.associative_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
+            retrieved = memory_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
             hidden_states = hidden_states + retrieved
 
         # Step 2 & 3: Attention + MLP
@@ -226,11 +263,11 @@ class ARMTLayer(TransformerLayer):
             mem_part,
             input_is_sbh=input_is_sbh,
         )
-        self.associative_layer.update_mem(mem_part, input_is_sbh=input_is_sbh)
+        memory_layer.update_mem(mem_part, input_is_sbh=input_is_sbh)
 
         return hidden_states, context
 
     def reset_memory(self):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
-        self.associative_layer.reset_memory()
+        self._get_memory_layer().reset_memory()
