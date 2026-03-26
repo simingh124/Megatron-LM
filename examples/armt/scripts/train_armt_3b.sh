@@ -2,7 +2,7 @@
 set -euo pipefail
 
 python examples/armt/train.py \
-  --use-recurrent-tbptt \
+  --use-recurrent-model-schedule \
   --num-mem-tokens 16 \
   --recurrent-chunk-size 512 \
   --tensor-model-parallel-size 1 \

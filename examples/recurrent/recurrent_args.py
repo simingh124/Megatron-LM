@@ -5,13 +5,12 @@ from typing import Any
 
 
 RECURRENT_LEGACY_ALIASES = {
-    "use_recurrent_tbptt": "use_armt_tbptt",
     "recurrent_chunk_size": "armt_chunk_size",
     "recurrent_tbptt_mode": "armt_tbptt_mode",
 }
 
 RECURRENT_DEFAULTS = {
-    "use_recurrent_tbptt": False,
+    "use_recurrent_model_schedule": False,
     "recurrent_chunk_size": 512,
     "recurrent_tbptt_mode": True,
     "num_mem_tokens": 16,
@@ -24,12 +23,11 @@ def add_recurrent_args(parser):
     group = parser.add_argument_group("recurrent", "Shared recurrent training arguments")
 
     group.add_argument(
-        "--use-recurrent-tbptt",
-        "--use-armt-tbptt",
-        dest="use_recurrent_tbptt",
+        "--use-recurrent-model-schedule",
+        dest="use_recurrent_model_schedule",
         action="store_true",
-        default=RECURRENT_DEFAULTS["use_recurrent_tbptt"],
-        help="Enable recurrent TBPTT schedule.",
+        default=RECURRENT_DEFAULTS["use_recurrent_model_schedule"],
+        help="Enable the recurrent-model forward/backward schedule.",
     )
     group.add_argument(
         "--num-mem-tokens",

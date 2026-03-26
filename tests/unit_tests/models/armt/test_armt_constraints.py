@@ -14,7 +14,7 @@ def _make_args(**overrides):
         tensor_model_parallel_size=1,
         fp8=None,
         fp8_format=None,
-        use_recurrent_tbptt=True,
+        use_recurrent_model_schedule=True,
         position_embedding_type="rope",
         seq_length=2048,
         recurrent_chunk_size=512,
@@ -63,30 +63,30 @@ def test_valid_config_passes():
     validate_armt_constraints(args)
 
 
-def test_legacy_recurrent_names_are_normalized():
+def test_recurrent_schedule_flag_is_preserved_during_normalization():
     args = Namespace(
-        use_armt_tbptt=True,
+        use_recurrent_model_schedule=True,
         armt_chunk_size=256,
         armt_tbptt_mode=False,
         num_mem_tokens=8,
     )
     normalize_recurrent_args(args)
 
-    assert args.use_recurrent_tbptt is True
+    assert args.use_recurrent_model_schedule is True
     assert args.recurrent_chunk_size == 256
     assert args.recurrent_tbptt_mode is False
     assert args.armt_chunk_size == 256
     assert args.armt_tbptt_mode is False
 
 
-def test_legacy_yaml_like_namespace_passes_validation():
+def test_current_yaml_like_namespace_passes_validation():
     args = Namespace(
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         tensor_model_parallel_size=2,
         fp8=None,
         fp8_format=None,
-        use_armt_tbptt=True,
+        use_recurrent_model_schedule=True,
         position_embedding_type="rope",
         seq_length=2048,
         armt_chunk_size=512,
@@ -103,6 +103,25 @@ def test_armt_defaults_skip_read_memory_on_first_chunk():
     args = parser.parse_args([])
 
     assert args.no_read_memory_from_first_chunk is True
+
+
+def test_armt_recurrent_schedule_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--use-recurrent-model-schedule"])
+
+    assert args.use_recurrent_model_schedule is True
+
+
+def test_armt_legacy_schedule_flags_are_rejected():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--use-recurrent-tbptt"])
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--use-armt-tbptt"])
 
 
 def test_armt_shared_read_flag_can_enable_first_chunk_read():

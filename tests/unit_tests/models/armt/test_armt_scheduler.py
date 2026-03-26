@@ -441,7 +441,7 @@ def test_scalar_metrics_are_token_weighted_across_chunks():
     assert pytest.approx(losses[0]["scalar_metric"].item()) == 7.0 / 3.0
 
 
-def test_get_forward_backward_func_selects_recurrent_tbptt_schedule():
+def test_get_forward_backward_func_selects_recurrent_schedule_only_from_new_flag():
     from megatron.core.pipeline_parallel.schedules import (
         forward_backward_no_pipelining,
         get_forward_backward_func,
@@ -449,13 +449,17 @@ def test_get_forward_backward_func_selects_recurrent_tbptt_schedule():
 
     old_global_args = training_global_vars._GLOBAL_ARGS
     try:
-        training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_recurrent_tbptt=True)
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_recurrent_model_schedule=True)
         func = get_forward_backward_func(pp_size=1, vp_size=None)
         assert func is recurrent_forward_backward_no_pipelining
 
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_recurrent_tbptt=True)
+        func = get_forward_backward_func(pp_size=1, vp_size=None)
+        assert func is forward_backward_no_pipelining
+
         training_global_vars._GLOBAL_ARGS = SimpleNamespace(use_armt_tbptt=True)
         func = get_forward_backward_func(pp_size=1, vp_size=None)
-        assert func is recurrent_forward_backward_no_pipelining
+        assert func is forward_backward_no_pipelining
 
         training_global_vars._GLOBAL_ARGS = SimpleNamespace()
         func = get_forward_backward_func(pp_size=1, vp_size=None)

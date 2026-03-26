@@ -200,7 +200,7 @@ MODEL_ARGS=(
 )
 
 ARMT_ARGS=(
-  --use-armt-tbptt
+  --use-recurrent-model-schedule
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --armt-n-heads ${ARMT_N_HEADS}

@@ -1,4 +1,4 @@
-use_recurrent_tbptt: true
+use_recurrent_model_schedule: true
 num_mem_tokens: 16
 recurrent_chunk_size: 512
 tensor_model_parallel_size: 1

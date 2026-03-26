@@ -205,7 +205,7 @@ MODEL_ARGS=(
 )
 
 RECURRENT_ARGS=(
-  --use-recurrent-tbptt
+  --use-recurrent-model-schedule
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --recurrent-chunk-size ${RECURRENT_CHUNK_SIZE}
 )

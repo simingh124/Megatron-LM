@@ -13,7 +13,7 @@ def _make_args(**overrides):
         tensor_model_parallel_size=1,
         fp8=None,
         fp8_format=None,
-        use_recurrent_tbptt=True,
+        use_recurrent_model_schedule=True,
         position_embedding_type="rope",
         seq_length=2048,
         recurrent_chunk_size=512,
@@ -68,6 +68,22 @@ def test_rmt_specific_flag_is_registered_on_rmt_args():
     args = parser.parse_args([])
 
     assert args.no_read_memory_from_first_chunk is False
+
+
+def test_rmt_recurrent_schedule_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_rmt_args(parser)
+    args = parser.parse_args(["--use-recurrent-model-schedule"])
+
+    assert args.use_recurrent_model_schedule is True
+
+
+def test_rmt_legacy_schedule_flag_is_rejected():
+    parser = argparse.ArgumentParser()
+    add_rmt_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--use-recurrent-tbptt"])
 
 
 def test_rmt_shared_read_flag_can_be_explicitly_enabled():

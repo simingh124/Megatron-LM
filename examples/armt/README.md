@@ -13,14 +13,11 @@ Experimental ARMT training entrypoint for Megatron-LM.
   - `seq_length % recurrent_chunk_size == 0` (unless padding is implemented)
   - `(recurrent_chunk_size + num_mem_tokens) % TP == 0`
 
-Legacy ARMT flag names such as `--use-armt-tbptt` and `--armt-chunk-size` remain accepted as
-compatibility aliases.
-
 ## Usage
 
 ```bash
 python examples/armt/train.py \
-  --use-recurrent-tbptt \
+  --use-recurrent-model-schedule \
   --num-mem-tokens 16 \
   --recurrent-chunk-size 512 \
   --tensor-model-parallel-size 1 \

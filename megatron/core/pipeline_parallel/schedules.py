@@ -141,20 +141,16 @@ def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[i
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-    use_recurrent_tbptt = False
+    use_recurrent_model_schedule = False
     try:
         from megatron.training import global_vars as training_global_vars
     except ModuleNotFoundError:
         training_global_vars = None
     if training_global_vars is not None and training_global_vars._GLOBAL_ARGS is not None:
         args = training_global_vars.get_args()
-        use_recurrent_tbptt = getattr(
-            args,
-            "use_recurrent_tbptt",
-            getattr(args, "use_armt_tbptt", False),
-        )
+        use_recurrent_model_schedule = getattr(args, "use_recurrent_model_schedule", False)
 
-    if use_recurrent_tbptt:
+    if use_recurrent_model_schedule:
         if pp_size != 1 or vp_size is not None:
             raise ValueError(
                 "Recurrent TBPTT schedule only supports PP=1 and no virtual pipeline "
