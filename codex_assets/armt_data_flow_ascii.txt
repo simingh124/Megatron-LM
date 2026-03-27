@@ -1,0 +1,214 @@
+ARMT INTERNAL DATA FLOW
+=======================
+
+Legend
+------
+B = batch size
+S = full sequence length
+C = chunk length
+M = num_mem_tokens
+H = hidden size
+
+
+1) Training / schedule level
+----------------------------
+
+full microbatch [B, S]
+        |
+        v
++----------------------------------------------+
+| recurrent_forward_backward_no_pipelining()   |
+| - chunk_data(..., chunk_size=C)              |
+| - reset_all_memory() once per microbatch     |
+| - loop chunk t = 0 .. T-1                    |
++----------------------------------------------+
+        |
+        v
+chunk t batch fields
++---------------------------------------------------+
+| tokens / labels / loss_mask / attention_mask      |
+| position_ids / packed_seq_params=None             |
++---------------------------------------------------+
+
+
+2) ARMTModel forward for one chunk
+----------------------------------
+
+tokens [B, C]
+   |
+   v
+GPT embedding / preprocess
+   |
+   v
+decoder_input [C, B, H]
+   |
+   +---- append learned memory_embeddings ----+
+   |                                          |
+   v                                          |
+[context tokens | memory slots]               |
+[C + M, B, H]                                 |
+   |                                          |
+   +---- expand padding mask / causal mask ---+
+   |
+   +---- recompute RoPE / Yarn for C + M -----+
+   |
+   v
+decoder (stack of ARMTLayer blocks)
+
+
+3) One ARMTLayer block
+----------------------
+
+input hidden_states [C + M, B, H]
+        |
+        v
++------------------------------------------------------+
+| Step A: associative read                             |
+| - q  = W_mq(hidden_states)                           |
+| - mq = normalize(phi(q))                             |
+| - retrieved = lookup(mq, W_mem, z)                   |
+| - hidden_states = hidden_states + retrieved          |
++------------------------------------------------------+
+        |
+        v
++------------------------------------------------------+
+| Step B: standard TransformerLayer                    |
+| - self-attention                                     |
+| - MLP                                                |
+| runs on full [context | memory slots] sequence       |
++------------------------------------------------------+
+        |
+        v
++------------------------------------------------------+
+| Step C: memory write                                 |
+| - mem_tokens = tail M hidden states                  |
+| - mk   = normalize(phi(W_mk(mem_tokens)))            |
+| - newv = W_mv(mem_tokens)                            |
+| - gate = sigmoid(W_mb(mem_tokens))                   |
+| - delta = newv - previous_retrieval                  |
+| - W_mem <- W_mem + keyed_delta                       |
+| - z     <- z + keyed_mass                            |
++------------------------------------------------------+
+        |
+        v
+output hidden_states [C + M, B, H]
+
+
+4) What actually persists across chunks
+---------------------------------------
+
+NOT persistent across chunks:
+  - current chunk tail memory slot hidden states
+  - current chunk decoder_input
+
+Persistent across chunks:
+  - per-layer runtime state inside AssociativeLayer
+
+    W_mem : [B, heads, d_key_per_head, H_per_head]
+    z     : [B, heads, d_key_per_head]   (optional)
+
+So the cross-chunk path is:
+
+chunk t mem_tokens
+      |
+      v
+update_mem(...)
+      |
+      v
+layer state (W_mem / z)
+      |
+      v
+associate(...) in chunk t+1
+      |
+      v
+retrieved recurrent signal for chunk t+1 tokens
+
+
+5) End of ARMTModel forward
+---------------------------
+
+decoder output [C + M, B, H]
+        |
+        v
+strip tail memory slots
+        |
+        v
+real token hidden states [C, B, H]
+        |
+        v
+standard GPT output head / LM loss
+
+Important:
+  memory slots are NOT directly supervised by labels.
+  They influence loss only indirectly through future chunk state.
+
+
+6) Causality inside one chunk
+-----------------------------
+
+sequence layout:
+
+  token_0  token_1  ... token_(C-1)  mem_0  mem_1 ... mem_(M-1)
+
+because the attention mask stays causal:
+
+  - context token_i cannot attend tail memory slots in the same chunk
+  - tail memory slots can attend earlier context tokens
+
+Therefore:
+  - same-chunk history injection comes from Step A associate(...)
+  - tail memory slots mainly act as chunk summarizers / writers
+  - next-chunk reuse happens through W_mem / z, not by reusing slot hidden states
+
+
+7) TBPTT boundary
+-----------------
+
+if tbptt_mode=True:
+
+  mem_tokens --detach--> update_mem(...)
+                        |
+                        +--> gradients still reach W_mk / W_mv / W_mb
+                        |
+                        +--> gradients do NOT flow back into previous-chunk
+                             transformer activations
+
+So ARMT is:
+  stateful across chunks
+  but autograd-local per chunk
+
+
+8) Compact end-to-end picture
+-----------------------------
+
+ [full seq BxS]
+       |
+       v
+ [chunk_data -> BxC chunks]
+       |
+       v
+ [reset layer state once per microbatch]
+       |
+       v
+ [embed chunk]
+       |
+       v
+ [append M learned memory slots]
+       |
+       v
+ [for each layer]
+       |
+       +--> read W_mem/z -> retrieved recurrent signal
+       |
+       +--> self-attn + MLP on [context | memory slots]
+       |
+       +--> tail M hidden states write back into W_mem/z
+       |
+       v
+ [strip tail memory slots]
+       |
+       v
+ [GPT head / LM loss on real tokens only]
+       |
+       v
+ [next chunk reads updated W_mem/z]

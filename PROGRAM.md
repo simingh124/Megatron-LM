@@ -1,21 +1,24 @@
 # PROGRAM
 
-## 2026-03-27 gdn-new -> armt merge note
-- Merge target was `armt`; source branch was `gdn-new`.
-- Before merging, `git merge-base armt gdn-new` returned `9d91624d9eaffe4e9d63d9601783115c82d6e9ca`, which matched the then-current `armt` HEAD. This means the integration path was a fast-forward, not a real three-way merge.
-- The safe command for this case is `git merge --ff-only gdn-new`. It advanced `armt` to `88b21fc8f99acb0a49fdfdd883ae304735a0fd95` without conflicts.
+## Purpose
+- This file stores repo-specific operational knowledge that is easy to forget and expensive to rediscover: branch/worktree topology, hidden coupling, test-double invariants, and doc/code drift traps.
+- Stable always-on rules belong in `AGENTS.md`; do not duplicate them here unless the repo has a concrete exception or counterexample.
 
-## Reusable conflict precheck
-- Run `git log --oneline --left-right --cherry-pick --graph armt...<branch>` first to see whether both branches have diverged.
-- Run `git diff --name-status --find-renames armt...<branch>` to estimate the file overlap before touching the worktree.
-- If `merge-base` already equals `armt` HEAD, prefer `--ff-only`. It fails fast instead of dropping the repo into a half-merged state.
+## Branch and Worktree Topology
+- `armt` is the integration branch in the root worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM`.
+- `gdn-new` already lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-gdn-new`. Merge it from the `armt` worktree; do not try to re-check out `gdn-new` in the root worktree.
+- `param` already lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-param`. If it needs to start from the latest `armt`, push `armt` first and create/update it explicitly from `armt`.
 
-## Implicit repo constraints observed
-- `gdn-new` is already checked out in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-gdn-new`. Merge it from the `armt` worktree directly; do not try to re-check out `gdn-new` in the root worktree.
-- Root worktree currently contains user-side untracked assets under `codex_assets/`. Leave them untouched unless the task explicitly targets them.
-- The repo-level process requires `PROGRAM.md` to exist and be read before development actions. Keep this file updated after every code-changing task so later work can reuse the same pitfalls and decision trail.
+## Safe Branch Integration
+- Before merging another branch into `armt`, run `git log --oneline --left-right --cherry-pick --graph armt...<branch>` and `git diff --name-status --find-renames armt...<branch>` to estimate divergence and overlap.
+- If `git merge-base armt <branch>` already equals the current `armt` HEAD, use `git merge --ff-only <branch>` instead of a normal merge. This repo has already hit that fast-forward case with `gdn-new`.
 
-## 2026-03-27 AGENTS / PROGRAM split note
-- Stable, always-on execution rules belong in `AGENTS.md` so they are visible before work starts. Keep `PROGRAM.md` for transient discoveries such as branch topology, failed paths, hidden dependencies, and review pitfalls.
-- When summarizing "current changes", run `git status --short` before relying on `git diff --stat`. Purely untracked files do not appear in diff-only summaries.
-- If `codex_assets/` contains explanatory diagrams or exports, either pair them with the narrative doc in the same commit or leave them out of the commit. Orphaned assets are hard to review later.
+## ARMT Test-Double Invariants
+- Since commit `5e491de47`, `ARMTLayer` no longer assumes a single associative backend. It exposes two backend slots, `associative_layer` and `recurrent_memory_layer`, and resolves them through `_get_memory_layer()`.
+- Any test that monkeypatches `ARMTLayer.__init__` must initialize both backend slots to `None` before injecting mocks. Otherwise `_get_memory_layer()` can raise `AttributeError` from the test double even when production code is correct.
+- For chunk-control tests, initialize `_skip_read_memory_for_current_chunk` and `_current_chunk_is_first` in the test double as well, so `reset_memory()` and first-chunk propagation tests match real-layer invariants.
+
+## Recurrent CLI Source of Truth
+- The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
+- Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
+- `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.

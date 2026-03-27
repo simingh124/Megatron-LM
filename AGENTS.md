@@ -4,6 +4,7 @@
 - Read `PROGRAM.md` before any project modification, debugging, benchmark run, or branch integration. It is the project memory for trial-and-error paths, implicit dependencies, worktree topology, and recurring pitfalls.
 - Keep stable repo rules in `AGENTS.md`; keep task-specific discoveries and pitfalls in `PROGRAM.md`. After every project change, append concise, accurate notes to `PROGRAM.md` and remove stale guidance when it is no longer true.
 - Unless the user explicitly requests another location, save Codex-generated artifacts under `codex_assets/`. Do not touch unrelated user assets in that directory.
+- Before summarizing workspace changes or proposing a commit split, run `git status --short` first. Untracked files do not appear in `git diff --stat`.
 
 ## Project Operating Rules
 - Network proxy: before any terminal command that needs network access, run `eval $(curl -s http://deploy.i.shaipower.com/httpproxy)`. If connectivity still fails, run `unset https_proxy http_proxy all_proxy` and retry once without the proxy.
@@ -34,7 +35,7 @@
 - `bash tools/autoformat.sh`: run Black, isort, pylint, ruff, and mypy (best-effort) on changed files.
 - `/mnt/step3-abla/siming/.venv/bin/python -m pytest tests/unit_tests/models/armt -v`: ARMT unit tests.
 - `/mnt/step3-abla/siming/.venv/bin/python -m pytest examples/armt/tests/test_armt_train.py -v`: ARMT GPU integration smoke test.
-- `/mnt/step3-abla/siming/.venv/bin/python examples/armt/train.py --use-armt-tbptt --num-mem-tokens 16 --armt-chunk-size 512 --test-train-run ...`: local ARMT training entrypoint with the required non-persistent test mode.
+- `/mnt/step3-abla/siming/.venv/bin/python examples/armt/train.py --use-recurrent-model-schedule --recurrent-chunk-size 512 --recurrent-tbptt-mode --num-mem-tokens 16 --test-train-run ...`: local ARMT training entrypoint with the required non-persistent test mode and canonical recurrent flags.
 
 ## Coding Style & Naming Conventions
 - Python style uses 4-space indentation and max line length `100`.
@@ -46,6 +47,7 @@
 - Validate constraints before large runs: PP must be `1`, CP must be `1`, FP8 is unsupported, and position embedding must be `rope` or `yarn`.
 - With sequence parallel enabled, ensure `(armt_chunk_size + num_mem_tokens) % TP == 0`.
 - TBPTT chunking behavior is implemented in `megatron/core/pipeline_parallel/recurrent_schedules.py`; update tests whenever chunk semantics change.
+- Prefer canonical recurrent CLI flags in new docs/scripts: `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode`. The legacy toggles `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by argument parsing tests.
 
 ## Testing Guidelines
 - Test framework is `pytest` (`python_files = test_*.py`).
