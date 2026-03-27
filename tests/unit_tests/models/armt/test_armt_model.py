@@ -18,6 +18,10 @@ def _minimal_gpt_init(self, config, transformer_layer_spec, vocab_size, max_sequ
 def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs):
     torch.nn.Module.__init__(self)
     self.config = config
+    self.associative_layer = None
+    self.recurrent_memory_layer = None
+    self._skip_read_memory_for_current_chunk = False
+    self._current_chunk_is_first = False
 
 
 class TestARMTModel:
