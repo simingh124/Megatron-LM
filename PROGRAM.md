@@ -6,12 +6,15 @@
 
 ## Branch and Worktree Topology
 - `armt` is the integration branch in the root worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM`.
-- `gdn-new` already lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-gdn-new`. Merge it from the `armt` worktree; do not try to re-check out `gdn-new` in the root worktree.
 - `param` already lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-param`. If it needs to start from the latest `armt`, push `armt` first and create/update it explicitly from `armt`.
 
 ## Safe Branch Integration
 - Before merging another branch into `armt`, run `git log --oneline --left-right --cherry-pick --graph armt...<branch>` and `git diff --name-status --find-renames armt...<branch>` to estimate divergence and overlap.
-- If `git merge-base armt <branch>` already equals the current `armt` HEAD, use `git merge --ff-only <branch>` instead of a normal merge. This repo has already hit that fast-forward case with `gdn-new`.
+- If `git merge-base armt <branch>` already equals the current `armt` HEAD, use `git merge --ff-only <branch>` instead of a normal merge. This repo already used that fast-forward path when `gdn-new` was integrated into `armt`.
+
+## Worktree Cleanup Order
+- If a branch is checked out in a sibling worktree, remove the worktree first and delete the branch second. `git branch -d <branch>` is blocked while another worktree still owns that checkout.
+- For intentionally disposable sibling worktrees, `git worktree remove --force <path>` is acceptable when the only remaining local files are scratch artifacts under `codex_assets/`.
 
 ## ARMT Test-Double Invariants
 - Since commit `5e491de47`, `ARMTLayer` no longer assumes a single associative backend. It exposes two backend slots, `associative_layer` and `recurrent_memory_layer`, and resolves them through `_get_memory_layer()`.
