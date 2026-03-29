@@ -51,6 +51,11 @@ class RMTModel(GPTModel):
             torch.randn(num_mem_tokens, config.hidden_size) * init_std
         )
 
+    def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
+        if self.num_mem_tokens == 0:
+            return []
+        return [("memory_embeddings", self.memory_embeddings.numel())]
+
     def reset_all_memory(self):
         self.memory_state = None
         self._skip_read_memory_for_current_chunk = False

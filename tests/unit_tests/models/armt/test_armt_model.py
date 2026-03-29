@@ -25,6 +25,78 @@ def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs)
 
 
 class TestARMTModel:
+    @pytest.mark.parametrize("backend_attr", ["associative_layer", "recurrent_memory_layer"])
+    def test_armt_model_memory_parameter_breakdown(self, backend_attr):
+        config = MagicMock()
+        config.hidden_size = 8
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        memory_module = torch.nn.Sequential(
+            torch.nn.Linear(8, 4, bias=False),
+            torch.nn.Linear(4, 2, bias=True),
+        )
+        setattr(layer, backend_attr, memory_module)
+        model.add_module("armt_layer", layer)
+
+        breakdown = model.get_memory_parameter_breakdown()
+
+        assert breakdown == [
+            ("memory_embeddings", 32),
+            (f"armt_layer.{backend_attr}", sum(p.numel() for p in memory_module.parameters())),
+        ]
+
+    def test_armt_model_memory_parameter_breakdown_is_empty_when_num_mem_tokens_is_zero(self):
+        config = MagicMock()
+        config.hidden_size = 8
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=0,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        layer.recurrent_memory_layer = torch.nn.Linear(8, 4, bias=False)
+        model.add_module("armt_layer", layer)
+
+        assert model.get_memory_parameter_breakdown() == []
+
     def test_armt_model_memory_concat_strip(self):
         """验证 ARMTModel 的 memory embedding concat/strip 形状逻辑（S -> S+M -> S）。"""
         config = MagicMock()

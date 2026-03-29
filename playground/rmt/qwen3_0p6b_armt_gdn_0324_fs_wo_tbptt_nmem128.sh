@@ -1,14 +1,16 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B ARMT training from scratch.
+# Qwen3-0.6B ARMT training from scratch with GDN recurrent memory backend.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_armt_0315.sh
+# - playground/rmt/qwen3_0p6b_armt_0324_fs_wo_tbptt.sh
 #
 # Difference from the reference:
-# - No --load / --no-load-optim / --no-load-rng.
-# - ARMT and backbone params are initialized from scratch.
+# - Replace associative memory backend with GDN.
+# - Expose independent launcher switches for:
+#   - RECURRENT_GDN_USE_FLA_KERNEL=0|1
+#   - RECURRENT_GDN_USE_CAUSAL_CONV1D=0|1
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -136,14 +138,23 @@ ROTARY_PERCENT=1.0
 NORM_EPS=1e-6
 
 # ========== ARMT mechanism parameters ==========
-NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-128}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
 ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
 
+RECURRENT_GDN_CONV_KERNEL_SIZE=${RECURRENT_GDN_CONV_KERNEL_SIZE:-4}
+RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM:-64}
+RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM:-64}
+RECURRENT_GDN_NUM_KEY_HEADS=${RECURRENT_GDN_NUM_KEY_HEADS:-16}
+RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS:-16}
+
+RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL:-1}
+RECURRENT_GDN_USE_CAUSAL_CONV1D=${RECURRENT_GDN_USE_CAUSAL_CONV1D:-1}
+
 # ========== Training parameters ==========
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-10}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
@@ -216,6 +227,12 @@ ARMT_ARGS=(
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --armt-n-heads ${ARMT_N_HEADS}
+  --recurrent-memory-backend gated_deltanet
+  --recurrent-gdn-conv-kernel-size ${RECURRENT_GDN_CONV_KERNEL_SIZE}
+  --recurrent-gdn-key-head-dim ${RECURRENT_GDN_KEY_HEAD_DIM}
+  --recurrent-gdn-value-head-dim ${RECURRENT_GDN_VALUE_HEAD_DIM}
+  --recurrent-gdn-num-key-heads ${RECURRENT_GDN_NUM_KEY_HEADS}
+  --recurrent-gdn-num-value-heads ${RECURRENT_GDN_NUM_VALUE_HEADS}
 )
 if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
   ARMT_ARGS+=(--no-read-memory-from-first-chunk)
@@ -224,6 +241,16 @@ else
 fi
 if [[ "${ADD_NO_RECURRENT_TBPTT_MODE}" == "1" ]]; then
   ARMT_ARGS+=(--no-recurrent-tbptt-mode)
+fi
+if [[ "${RECURRENT_GDN_USE_FLA_KERNEL}" == "1" ]]; then
+  ARMT_ARGS+=(--recurrent-gdn-use-fla-kernel)
+else
+  ARMT_ARGS+=(--no-recurrent-gdn-use-fla-kernel)
+fi
+if [[ "${RECURRENT_GDN_USE_CAUSAL_CONV1D}" == "1" ]]; then
+  ARMT_ARGS+=(--recurrent-gdn-use-causal-conv1d)
+else
+  ARMT_ARGS+=(--no-recurrent-gdn-use-causal-conv1d)
 fi
 
 TRAINING_ARGS=(
@@ -304,6 +331,11 @@ echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
+echo "RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL}"
+echo "RECURRENT_GDN_USE_CAUSAL_CONV1D=${RECURRENT_GDN_USE_CAUSAL_CONV1D}"
+echo "RECURRENT_GDN_CONV_KERNEL_SIZE=${RECURRENT_GDN_CONV_KERNEL_SIZE}"
+echo "RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM} RECURRENT_GDN_NUM_KEY_HEADS=${RECURRENT_GDN_NUM_KEY_HEADS}"
+echo "RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM} RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"

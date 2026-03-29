@@ -31,7 +31,7 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import copy
 import dataclasses
 from datetime import datetime, timedelta
@@ -909,6 +909,8 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+    if _maybe_exit_after_parameter_statistics(args):
+        return
     config = get_model_config(model[0])
 
     # Build a separate inference model for RL if requested.
@@ -1161,6 +1163,154 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def _collect_memory_parameter_breakdown(model):
+    """Collect per-module memory parameter counts from models that expose them."""
+    breakdown_by_name = OrderedDict()
+    has_memory_breakdown = False
+    use_chunk_prefix = len(model) > 1
+
+    for model_chunk_idx, model_module in enumerate(model):
+        getter = getattr(model_module, "get_memory_parameter_breakdown", None)
+        if getter is None:
+            continue
+
+        has_memory_breakdown = True
+        chunk_breakdown = getter()
+        chunk_prefix = f"model_chunk{model_chunk_idx}." if use_chunk_prefix else ""
+        for name, count in chunk_breakdown:
+            breakdown_by_name[f"{chunk_prefix}{name}"] = count
+
+    return has_memory_breakdown, list(breakdown_by_name.items())
+
+
+def _format_parameter_count_display(count: int) -> str:
+    """Format a parameter count with optional K/M/B suffix for readability."""
+    raw_count = f"{count:,}"
+    for unit_size, unit_suffix in (
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ):
+        if count >= unit_size:
+            return f"{raw_count} ({count / unit_size:.3f}{unit_suffix})"
+    return raw_count
+
+
+def _format_percentage(numerator: int, denominator: int) -> str:
+    """Format a ratio as a percentage with two decimal places."""
+    if denominator <= 0 or numerator <= 0:
+        return "0.00%"
+    return f"{(100.0 * numerator) / denominator:.2f}%"
+
+
+def _render_ascii_table(headers, rows, indent: str = "") -> str:
+    """Render a simple ASCII table."""
+    string_headers = [str(header) for header in headers]
+    string_rows = [[str(cell) for cell in row] for row in rows]
+    column_count = len(string_headers)
+
+    for row in string_rows:
+        if len(row) != column_count:
+            raise ValueError(
+                f"Expected {column_count} columns in table row, but got {len(row)}: {row}"
+            )
+
+    widths = [len(header) for header in string_headers]
+    for row in string_rows:
+        for column_idx, cell in enumerate(row):
+            widths[column_idx] = max(widths[column_idx], len(cell))
+
+    horizontal_rule = indent + "+" + "+".join("-" * (width + 2) for width in widths) + "+"
+
+    def render_row(row):
+        return (
+            indent
+            + "| "
+            + " | ".join(cell.ljust(widths[column_idx]) for column_idx, cell in enumerate(row))
+            + " |"
+        )
+
+    lines = [horizontal_rule, render_row(string_headers), horizontal_rule]
+    for row in string_rows:
+        lines.append(render_row(row))
+    lines.append(horizontal_rule)
+    return "\n".join(lines)
+
+
+def _format_memory_parameter_report(
+    *,
+    total_model_parameters: int,
+    breakdown,
+    tp_rank: int,
+    pp_rank: int,
+) -> str:
+    """Build a structured memory-parameter report for printing."""
+    total_memory_parameters = sum(count for _, count in breakdown)
+    lines = [
+        ' > memory parameter summary on (tensor, pipeline) model parallel rank ({}, {})'.format(
+            tp_rank,
+            pp_rank,
+        ),
+        f"   total memory params: {_format_parameter_count_display(total_memory_parameters)}",
+        f"   memory / model params: {_format_percentage(total_memory_parameters, total_model_parameters)}",
+    ]
+
+    if not breakdown:
+        return "\n".join(lines)
+
+    rows = [
+        [
+            module_name,
+            _format_parameter_count_display(count),
+            _format_percentage(count, total_model_parameters),
+        ]
+        for module_name, count in breakdown
+    ]
+    lines.append("   modules:")
+    lines.append(
+        _render_ascii_table(
+            headers=["module", "params", "percentage"],
+            rows=rows,
+            indent="   ",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _print_memory_parameter_breakdown(model, total_model_parameters, pg_collection):
+    """Print memory parameter totals for ARMT/RMT models."""
+    has_memory_breakdown, breakdown = _collect_memory_parameter_breakdown(model)
+    if not has_memory_breakdown:
+        return
+
+    if get_pg_rank(pg_collection.dp) != 0 or get_pg_rank(pg_collection.cp) != 0:
+        return
+
+    print(
+        _format_memory_parameter_report(
+            total_model_parameters=total_model_parameters,
+            breakdown=breakdown,
+            tp_rank=get_pg_rank(pg_collection.tp),
+            pp_rank=get_pg_rank(pg_collection.pp),
+        ),
+        flush=True,
+    )
+
+
+def _maybe_exit_after_parameter_statistics(args):
+    """Exit after printing parameter statistics when requested."""
+    if not getattr(args, "param_stats_only", False):
+        return False
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+    print_rank_0(
+        "parameter statistics only (--param-stats-only is on); "
+        "exiting before data iterator setup"
+    )
+    return True
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1249,6 +1399,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             ),
             flush=True,
         )
+    _print_memory_parameter_breakdown(model, num_parameters, pg_collection)
 
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
@@ -1447,13 +1598,14 @@ def setup_model_and_optimizer(
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
+    param_stats_only = getattr(args, "param_stats_only", False)
 
-    wrap_with_ddp = not args.skip_train
+    wrap_with_ddp = not args.skip_train and not param_stats_only
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
-    if args.skip_train:
+    if args.skip_train or param_stats_only:
         optimizer, opt_param_scheduler = None, None
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
@@ -1481,6 +1633,9 @@ def setup_model_and_optimizer(
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
+
+    if param_stats_only:
+        return model, optimizer, opt_param_scheduler
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()

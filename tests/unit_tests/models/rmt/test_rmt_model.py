@@ -26,6 +26,34 @@ def _make_config(hidden_size=256):
 
 
 class TestRMTModel:
+    def test_rmt_model_memory_parameter_breakdown(self):
+        config = _make_config(hidden_size=8)
+
+        with patch("megatron.core.models.rmt.rmt_model.GPTModel.__init__", new=_minimal_gpt_init):
+            model = RMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        assert model.get_memory_parameter_breakdown() == [("memory_embeddings", 32)]
+
+    def test_rmt_model_memory_parameter_breakdown_is_empty_when_num_mem_tokens_is_zero(self):
+        config = _make_config(hidden_size=8)
+
+        with patch("megatron.core.models.rmt.rmt_model.GPTModel.__init__", new=_minimal_gpt_init):
+            model = RMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=0,
+            )
+
+        assert model.get_memory_parameter_breakdown() == []
+
     def test_rmt_model_memory_concat_strip(self):
         config = _make_config(hidden_size=256)
 

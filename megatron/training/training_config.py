@@ -55,6 +55,9 @@ class TrainingConfig:
     test_train_run: bool = False
     """If set, disable training artifact writes so scripts can be smoke-tested safely."""
 
+    param_stats_only: bool = False
+    """If set, build the model and print parameter statistics, then exit before real training."""
+
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 

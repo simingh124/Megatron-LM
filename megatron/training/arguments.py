@@ -292,20 +292,8 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
-def apply_test_train_run_overrides(args):
-    """Disable artifact-producing settings for smoke-test training runs."""
-    if not getattr(args, "test_train_run", False):
-        return False
-
-    assert getattr(args, "ckpt_convert_format", None) is None, (
-        "--test-train-run is incompatible with --ckpt-convert-format because checkpoint "
-        "conversion always writes a converted checkpoint."
-    )
-    assert not getattr(args, "moe_use_upcycling", False), (
-        "--test-train-run is incompatible with --moe-use-upcycling because upcycling always "
-        "writes a converted checkpoint."
-    )
-
+def _apply_no_artifact_run_overrides(args):
+    """Disable artifact-producing settings for non-persistent execution modes."""
     overrides = {
         "tensorboard_dir": None,
         "save": None,
@@ -334,10 +322,49 @@ def apply_test_train_run_overrides(args):
     for attr, value in overrides.items():
         setattr(args, attr, value)
 
+def apply_test_train_run_overrides(args):
+    """Disable artifact-producing settings for smoke-test training runs."""
+    if not getattr(args, "test_train_run", False):
+        return False
+
+    assert getattr(args, "ckpt_convert_format", None) is None, (
+        "--test-train-run is incompatible with --ckpt-convert-format because checkpoint "
+        "conversion always writes a converted checkpoint."
+    )
+    assert not getattr(args, "moe_use_upcycling", False), (
+        "--test-train-run is incompatible with --moe-use-upcycling because upcycling always "
+        "writes a converted checkpoint."
+    )
+
+    _apply_no_artifact_run_overrides(args)
+    return True
+
+
+def apply_param_stats_only_overrides(args):
+    """Disable artifact-producing settings for parameter-statistics-only runs."""
+    if not getattr(args, "param_stats_only", False):
+        return False
+
+    assert getattr(args, "ckpt_convert_format", None) is None, (
+        "--param-stats-only is incompatible with --ckpt-convert-format because checkpoint "
+        "conversion always writes a converted checkpoint."
+    )
+    assert not getattr(args, "moe_use_upcycling", False), (
+        "--param-stats-only is incompatible with --moe-use-upcycling because upcycling always "
+        "writes a converted checkpoint."
+    )
+
+    _apply_no_artifact_run_overrides(args)
     return True
 
 
 def validate_args(args, defaults={}):
+    if apply_param_stats_only_overrides(args):
+        warn_rank_0(
+            "--param-stats-only enabled: disabling TensorBoard, persistent/external logging, "
+            "checkpointing, and gradient artifact saves."
+        )
+
     if apply_test_train_run_overrides(args):
         warn_rank_0(
             "--test-train-run enabled: disabling TensorBoard, persistent/external logging, "
