@@ -47,6 +47,28 @@ class ARMTModel(GPTModel):
             if isinstance(module, ARMTLayer):
                 yield module
 
+    def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
+        if self.num_mem_tokens == 0:
+            return []
+
+        breakdown = [("memory_embeddings", self.memory_embeddings.numel())]
+        for module_name, module in self.named_modules():
+            if not isinstance(module, ARMTLayer):
+                continue
+
+            for backend_attr in ("associative_layer", "recurrent_memory_layer"):
+                backend_module = getattr(module, backend_attr, None)
+                if backend_module is None:
+                    continue
+                breakdown.append(
+                    (
+                        f"{module_name}.{backend_attr}",
+                        sum(param.numel() for param in backend_module.parameters()),
+                    )
+                )
+
+        return breakdown
+
     def set_skip_read_memory_for_current_chunk(self, enabled: bool):
         self._skip_read_memory_for_current_chunk = bool(enabled)
         for module in self._armt_layers():

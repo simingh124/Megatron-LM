@@ -18,11 +18,13 @@ set -ex
 #
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
@@ -53,10 +55,12 @@ TOKENIZER_DIR="${TOKENIZER_DIR:-${ROOT}/tokenizers/qwen3_tokenizer}"
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-${ROOT}/exp_logs/checkpoints/rmt_qwen/${EXP_NAME}}"
 TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-${ROOT}/exp_logs/tensorboard/rmt_qwen/${EXP_NAME}}"
 LOG_DIR="${LOG_DIR:-${ROOT}/exp_logs/output_logs/rmt_qwen/${EXP_NAME}}"
-mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
-mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
+if [[ "${ENABLE_PARAM_STATS_ONLY}" != "1" ]]; then
+  mkdir -p "$(dirname "${CHECKPOINT_PATH}")"
+  mkdir -p "$(dirname "${TENSORBOARD_LOGS_PATH}")"
+fi
 
-if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
+if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" || "${ENABLE_PARAM_STATS_ONLY}" == "1" ]]; then
   ENABLE_TEE_LOG=${ENABLE_TEE_LOG:-0}
   LOG_INTERVAL=${LOG_INTERVAL:-1}
 else
@@ -281,6 +285,9 @@ fi
 if [[ "${ENABLE_TEST_TRAIN_RUN}" == "1" ]]; then
   EXTRA_ARGS+=(--test-train-run)
 fi
+if [[ "${ENABLE_PARAM_STATS_ONLY}" == "1" ]]; then
+  EXTRA_ARGS+=(--param-stats-only)
+fi
 
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
@@ -298,6 +305,7 @@ echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"

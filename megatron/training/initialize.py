@@ -29,6 +29,7 @@ from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_wri
 from megatron.training.utils import print_rank_0, warn_rank_0
 from megatron.training import inprocess_restart
 from megatron.training.arguments import (
+    apply_param_stats_only_overrides,
     apply_test_train_run_overrides,
     parse_args,
     validate_args,
@@ -71,6 +72,7 @@ def initialize_megatron(
     else:
         args = parsed_args
 
+    apply_param_stats_only_overrides(args)
     apply_test_train_run_overrides(args)
 
     # Prep for checkpoint conversion.
@@ -88,10 +90,16 @@ def initialize_megatron(
         )
         load_args_from_checkpoint(args, load_arg='pretrained_checkpoint')
         load_args_from_checkpoint(args)
+        apply_param_stats_only_overrides(args)
         apply_test_train_run_overrides(args)
 
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
+        if apply_param_stats_only_overrides(args):
+            warn_rank_0(
+                "--param-stats-only enabled: disabling TensorBoard, persistent/external "
+                "logging, checkpointing, and gradient artifact saves."
+            )
         if apply_test_train_run_overrides(args):
             warn_rank_0(
                 "--test-train-run enabled: disabling TensorBoard, persistent/external "

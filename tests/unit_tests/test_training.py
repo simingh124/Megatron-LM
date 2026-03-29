@@ -3,13 +3,16 @@
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.enums import ModelType
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training import training as training_module
+from megatron.training.training import build_train_valid_test_data_iterators, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -37,6 +40,92 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_format_parameter_count_display():
+    assert training_module._format_parameter_count_display(999) == "999"
+    assert training_module._format_parameter_count_display(1_500) == "1,500 (1.500K)"
+    assert (
+        training_module._format_parameter_count_display(12_582_912)
+        == "12,582,912 (12.583M)"
+    )
+    assert (
+        training_module._format_parameter_count_display(1_536_000_000)
+        == "1,536,000,000 (1.536B)"
+    )
+
+
+def test_render_ascii_table():
+    table = training_module._render_ascii_table(
+        headers=["a", "bb"],
+        rows=[["ccc", "d"]],
+        indent=" ",
+    )
+
+    assert table == "\n".join(
+        [
+            " +-----+----+",
+            " | a   | bb |",
+            " +-----+----+",
+            " | ccc | d  |",
+            " +-----+----+",
+        ]
+    )
+
+
+def test_format_memory_parameter_report_includes_summary_and_table():
+    report = training_module._format_memory_parameter_report(
+        total_model_parameters=10_000,
+        breakdown=[
+            ("memory_embeddings", 1_000),
+            ("decoder.layers.0.recurrent_memory_layer", 500),
+        ],
+        tp_rank=0,
+        pp_rank=0,
+    )
+
+    assert " > memory parameter summary on (tensor, pipeline) model parallel rank (0, 0)" in report
+    assert "total memory params: 1,500 (1.500K)" in report
+    assert "memory / model params: 15.00%" in report
+    assert "modules:" in report
+    assert "percentage" in report
+    assert "memory_embeddings" in report
+    assert "10.00%" in report
+    assert "5.00%" in report
+
+
+def test_format_memory_parameter_report_omits_module_table_when_breakdown_empty():
+    report = training_module._format_memory_parameter_report(
+        total_model_parameters=10_000,
+        breakdown=[],
+        tp_rank=0,
+        pp_rank=0,
+    )
+
+    assert "total memory params: 0" in report
+    assert "memory / model params: 0.00%" in report
+    assert "modules:" not in report
+
+
+def test_print_memory_parameter_breakdown_uses_structured_report(monkeypatch, capsys):
+    monkeypatch.setattr(
+        training_module,
+        "_collect_memory_parameter_breakdown",
+        lambda model: (True, [("memory_embeddings", 1_000)]),
+    )
+    monkeypatch.setattr(training_module, "get_pg_rank", lambda group: 0)
+
+    pg_collection = SimpleNamespace(dp="dp", cp="cp", tp="tp", pp="pp")
+    training_module._print_memory_parameter_breakdown(
+        [torch.nn.Linear(2, 3)],
+        10_000,
+        pg_collection,
+    )
+
+    captured = capsys.readouterr()
+    assert "total memory params: 1,000 (1.000K)" in captured.out
+    assert "memory / model params: 10.00%" in captured.out
+    assert "percentage" in captured.out
 
 
 class TestTraining:
@@ -77,6 +166,82 @@ class TestTraining:
                 assert old_round_impl(vocab, mult) == _vocab_size_with_padding(
                     vocab, args, False
                 ), (vocab, mult)
+
+    def test_collect_memory_parameter_breakdown_ignores_models_without_interface(self):
+        has_memory_breakdown, breakdown = training_module._collect_memory_parameter_breakdown(
+            [torch.nn.Linear(2, 3)]
+        )
+
+        assert has_memory_breakdown is False
+        assert breakdown == []
+
+    def test_maybe_exit_after_parameter_statistics(self, monkeypatch):
+        barrier_mock = MagicMock()
+        print_mock = MagicMock()
+
+        monkeypatch.setattr(
+            training_module.torch.distributed,
+            "is_initialized",
+            lambda: True,
+        )
+        monkeypatch.setattr(training_module.torch.distributed, "barrier", barrier_mock)
+        monkeypatch.setattr(training_module, "print_rank_0", print_mock)
+
+        args = SimpleNamespace(param_stats_only=True)
+
+        assert training_module._maybe_exit_after_parameter_statistics(args) is True
+        barrier_mock.assert_called_once()
+        print_mock.assert_called_once()
+
+    def test_setup_model_and_optimizer_skips_optimizer_and_checkpoint_load_for_param_stats_only(
+        self, monkeypatch
+    ):
+        args = SimpleNamespace(
+            skip_train=False,
+            param_stats_only=True,
+            moe_use_upcycling=False,
+            load="/tmp/checkpoint",
+            pretrained_checkpoint=None,
+        )
+        get_model_calls = {}
+        fake_model = [torch.nn.Linear(1, 1)]
+
+        monkeypatch.setattr(training_module, "get_args", lambda: args)
+        monkeypatch.setattr(training_module, "get_timers", lambda: MagicMock())
+        monkeypatch.setattr(training_module, "get_one_logger", lambda: None)
+        monkeypatch.setattr(training_module, "unwrap_model", lambda model: model)
+
+        def fake_get_model(model_provider_func, model_type, wrap_with_ddp=True, config=None, pg_collection=None):
+            del model_provider_func, model_type, config, pg_collection
+            get_model_calls["wrap_with_ddp"] = wrap_with_ddp
+            return fake_model
+
+        monkeypatch.setattr(training_module, "get_model", fake_get_model)
+        monkeypatch.setattr(
+            training_module,
+            "get_megatron_optimizer",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("optimizer should not be built")),
+        )
+        monkeypatch.setattr(
+            training_module,
+            "get_megatron_muon_optimizer",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("muon optimizer should not be built")),
+        )
+        monkeypatch.setattr(
+            training_module,
+            "load_checkpoint",
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("checkpoint should not be loaded")),
+        )
+
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            lambda: None,
+            ModelType.encoder_or_decoder,
+        )
+
+        assert model == fake_model
+        assert optimizer is None
+        assert opt_param_scheduler is None
+        assert get_model_calls["wrap_with_ddp"] is False
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
