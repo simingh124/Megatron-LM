@@ -3,6 +3,7 @@
 ## First Read
 - Read `PROGRAM.md` before any project modification, debugging, benchmark run, or branch integration. It is the project memory for trial-and-error paths, implicit dependencies, worktree topology, and recurring pitfalls.
 - Keep stable repo rules in `AGENTS.md`; keep task-specific discoveries and pitfalls in `PROGRAM.md`. After every project change, append concise, accurate notes to `PROGRAM.md` and remove stale guidance when it is no longer true.
+- When creating or editing experiment launchers under `playground/rmt/`, read `playground/rmt/AGENTS.md` first and follow its launcher structure and comment conventions.
 - Unless the user explicitly requests another location, save Codex-generated artifacts under `codex_assets/`. Do not touch unrelated user assets in that directory.
 - Before summarizing workspace changes or proposing a commit split, run `git status --short` first. Untracked files do not appear in `git diff --stat`.
 

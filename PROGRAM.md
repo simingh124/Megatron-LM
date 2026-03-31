@@ -26,3 +26,10 @@
 - The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
 - `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.
+
+## ARMT Windowed Full Attention
+- Decoupled ARMT full attention is implemented in `megatron/core/models/armt/armt_self_attention.py`, not by changing Megatron's global sliding-window config. The layer caches only historical real-token K/V; historical memory-token K/V is intentionally excluded.
+- `full_attn_window_size == recurrent_chunk_size` is a deliberate legacy fast path. In that setting ARMT must fall back to the old non-overlap attention path to keep 10-step losses exactly aligned with the pre-change implementation.
+- Decoupled windows currently only support no-TBPTT and reject `sequence_parallel`; the validation lives in `examples/recurrent/recurrent_args.py`, so launchers should rely on that source of truth instead of re-encoding the rule locally.
+- The `playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt_nmem64_swa512_chunk64.sh` launcher must pass `--full-attn-window-size` explicitly; defining `FULL_ATTN_WINDOW_SIZE` in the shell is not enough and will silently run the legacy equal-window path if the CLI flag is omitted.
+- For the same launcher family, `micro-batch-size=1` with `global-batch-size=480` creates 60 gradient-accumulation microsteps on 8 GPUs and makes the first logged iteration look hung. Use the validated windowed defaults (`mb=4`, `gb=32`) or direct `TRAIN_ITERS/LR_*_ITERS` overrides for smoke checks.
