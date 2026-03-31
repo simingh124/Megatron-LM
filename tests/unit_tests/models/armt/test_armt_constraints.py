@@ -19,6 +19,8 @@ def _make_args(**overrides):
         position_embedding_type="rope",
         seq_length=2048,
         recurrent_chunk_size=512,
+        full_attn_window_size=None,
+        recurrent_tbptt_mode=True,
         num_mem_tokens=16,
         sequence_parallel=False,
     )
@@ -62,6 +64,48 @@ def test_valid_config_passes():
         sequence_parallel=True,
     )
     validate_armt_constraints(args)
+
+
+def test_full_attn_window_defaults_to_chunk_size():
+    args = _make_args(full_attn_window_size=None)
+
+    validate_armt_constraints(args)
+
+    assert args.full_attn_window_size == args.recurrent_chunk_size
+
+
+def test_constraint_full_attn_window_must_not_be_smaller_than_chunk_size():
+    args = _make_args(
+        recurrent_chunk_size=512,
+        full_attn_window_size=256,
+    )
+
+    with pytest.raises(ValueError, match="full_attn_window_size"):
+        validate_armt_constraints(args)
+
+
+def test_windowed_mode_rejects_tbptt():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=512,
+        recurrent_tbptt_mode=True,
+    )
+
+    with pytest.raises(ValueError, match="No-TBPTT"):
+        validate_armt_constraints(args)
+
+
+def test_windowed_mode_rejects_sequence_parallel():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=512,
+        recurrent_tbptt_mode=False,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+
+    with pytest.raises(ValueError, match="sequence_parallel"):
+        validate_armt_constraints(args)
 
 
 def test_recurrent_schedule_flag_is_preserved_during_normalization():
@@ -112,6 +156,14 @@ def test_armt_recurrent_schedule_flag_is_registered():
     args = parser.parse_args(["--use-recurrent-model-schedule"])
 
     assert args.use_recurrent_model_schedule is True
+
+
+def test_armt_full_attn_window_size_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--full-attn-window-size", "1024"])
+
+    assert args.full_attn_window_size == 1024
 
 
 def test_armt_legacy_schedule_flags_are_rejected():

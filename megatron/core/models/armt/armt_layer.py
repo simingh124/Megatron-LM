@@ -30,6 +30,8 @@ class ARMTLayer(TransformerLayer):
         gating: bool = False,
         correction: bool = True,
         tbptt_mode: bool = True,
+        recurrent_chunk_size: Optional[int] = None,
+        full_attn_window_size: Optional[int] = None,
         recurrent_memory_backend: str = "associative",
         recurrent_gdn_use_fla_kernel: bool = True,
         recurrent_gdn_use_causal_conv1d: bool = True,
@@ -43,6 +45,10 @@ class ARMTLayer(TransformerLayer):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
 
         self.num_mem_tokens = num_mem_tokens
+        self.recurrent_chunk_size = recurrent_chunk_size
+        self.full_attn_window_size = (
+            full_attn_window_size if full_attn_window_size is not None else recurrent_chunk_size
+        )
         self.recurrent_memory_backend = recurrent_memory_backend
         self.associative_layer = None
         self.recurrent_memory_layer = None
@@ -79,6 +85,7 @@ class ARMTLayer(TransformerLayer):
             )
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
+        self._current_chunk_start_position = 0
         self.reset_monitoring_stats()
 
     def _get_memory_layer(self):
@@ -93,6 +100,12 @@ class ARMTLayer(TransformerLayer):
 
     def set_current_chunk_is_first(self, enabled: bool):
         self._current_chunk_is_first = bool(enabled)
+
+    def set_current_chunk_start_position(self, position: int):
+        self._current_chunk_start_position = int(position)
+        self_attention = getattr(self, "self_attention", None)
+        if hasattr(self_attention, "set_current_chunk_start_position"):
+            self_attention.set_current_chunk_start_position(position)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats = {}
@@ -270,4 +283,8 @@ class ARMTLayer(TransformerLayer):
     def reset_memory(self):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
+        self._current_chunk_start_position = 0
+        self_attention = getattr(self, "self_attention", None)
+        if hasattr(self_attention, "reset_window_kv_cache"):
+            self_attention.reset_window_kv_cache()
         self._get_memory_layer().reset_memory()

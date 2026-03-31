@@ -22,6 +22,7 @@ def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs)
     self.recurrent_memory_layer = None
     self._skip_read_memory_for_current_chunk = False
     self._current_chunk_is_first = False
+    self._current_chunk_start_position = 0
 
 
 class TestARMTModel:
@@ -189,18 +190,23 @@ class TestARMTModel:
 
         model.set_current_chunk_is_first(True)
         model.set_skip_read_memory_for_current_chunk(True)
+        model.set_current_chunk_start_position(128)
 
         assert model._current_chunk_is_first is True
         assert model._skip_read_memory_for_current_chunk is True
+        assert model._current_chunk_start_position == 128
         assert layer._current_chunk_is_first is True
         assert layer._skip_read_memory_for_current_chunk is True
+        assert layer._current_chunk_start_position == 128
 
         model.reset_all_memory()
 
         assert model._current_chunk_is_first is False
         assert model._skip_read_memory_for_current_chunk is False
+        assert model._current_chunk_start_position == 0
         assert layer._current_chunk_is_first is False
         assert layer._skip_read_memory_for_current_chunk is False
+        assert layer._current_chunk_start_position == 0
         layer.associative_layer.reset_memory.assert_called_once()
 
     def test_armt_model_monitoring_helpers(self):
@@ -322,4 +328,62 @@ class TestARMTModel:
             )
 
         model.rotary_pos_emb.assert_called_once()
+        assert output[1] == "rotary"
+
+    def test_armt_model_rope_extension_uses_chunk_start_offset_for_windowed_attention(self):
+        config = MagicMock()
+        config.hidden_size = 256
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+                recurrent_chunk_size=64,
+                full_attn_window_size=512,
+            )
+
+        S, B, H = 64, 2, 256
+        decoder_input = torch.randn(S, B, H)
+        input_ids = torch.randint(0, 32000, (B, S))
+        position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+
+        model.set_current_chunk_start_position(128)
+        model.rotary_pos_emb = MagicMock(return_value="rotary")
+
+        preproc_output = (
+            decoder_input,
+            "old_rotary",
+            None,
+            None,
+            None,
+            None,
+        )
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel._preprocess",
+            return_value=preproc_output,
+        ):
+            output = model._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=None,
+                packed_seq_params=None,
+                padding_mask=None,
+            )
+
+        model.rotary_pos_emb.assert_called_once_with(
+            S + model.num_mem_tokens,
+            offset=128,
+            packed_seq=False,
+            cp_group=None,
+        )
         assert output[1] == "rotary"

@@ -13,6 +13,7 @@ RECURRENT_LEGACY_ALIASES = {
 RECURRENT_DEFAULTS = {
     "use_recurrent_model_schedule": False,
     "recurrent_chunk_size": 512,
+    "full_attn_window_size": None,
     "recurrent_tbptt_mode": True,
     "num_mem_tokens": 16,
     "no_read_memory_from_first_chunk": False,
@@ -51,6 +52,16 @@ def add_recurrent_args(parser):
         type=int,
         default=RECURRENT_DEFAULTS["recurrent_chunk_size"],
         help="Number of tokens per recurrent TBPTT chunk.",
+    )
+    group.add_argument(
+        "--full-attn-window-size",
+        type=int,
+        default=RECURRENT_DEFAULTS["full_attn_window_size"],
+        help=(
+            "Number of real tokens visible to full attention within a recurrent chunk. "
+            "Defaults to recurrent_chunk_size. Values larger than recurrent_chunk_size "
+            "enable overlapping full-attention windows across chunks."
+        ),
     )
     group.add_argument(
         "--recurrent-tbptt-mode",
@@ -204,6 +215,25 @@ def validate_recurrent_constraints(
     divisibility_expr: str,
 ) -> Namespace:
     args = normalize_recurrent_args(args)
+
+    if args.full_attn_window_size is None:
+        args.full_attn_window_size = args.recurrent_chunk_size
+
+    if args.full_attn_window_size < args.recurrent_chunk_size:
+        raise ValueError(
+            "full_attn_window_size must be greater than or equal to recurrent_chunk_size."
+        )
+
+    using_windowed_full_attention = args.full_attn_window_size > args.recurrent_chunk_size
+    if using_windowed_full_attention and args.recurrent_tbptt_mode:
+        raise ValueError(
+            "Decoupled ARMT full-attention windows currently require No-TBPTT "
+            "(set --no-recurrent-tbptt-mode)."
+        )
+    if using_windowed_full_attention and getattr(args, "sequence_parallel", False):
+        raise ValueError(
+            "Decoupled ARMT full-attention windows do not support sequence_parallel yet."
+        )
 
     if args.pipeline_model_parallel_size != 1:
         raise ValueError(

@@ -142,7 +142,9 @@ def _accumulate_chunk_loss_metrics(
     per_chunk_token_sums[chunk_idx] = current_token_sum + loss_report[1]
 
 
-def _set_recurrent_chunk_model_state(model, *, args, is_first_chunk: bool) -> None:
+def _set_recurrent_chunk_model_state(
+    model, *, args, is_first_chunk: bool, chunk_start_position: int = 0
+) -> None:
     if hasattr(model, "set_current_chunk_is_first"):
         model.set_current_chunk_is_first(is_first_chunk)
 
@@ -153,6 +155,9 @@ def _set_recurrent_chunk_model_state(model, *, args, is_first_chunk: bool) -> No
             and getattr(args, "no_read_memory_from_first_chunk", False)
         )
         model.set_skip_read_memory_for_current_chunk(skip_read_memory)
+
+    if hasattr(model, "set_current_chunk_start_position"):
+        model.set_current_chunk_start_position(chunk_start_position)
 
 
 def _backward_full_microbatch_loss(loss: torch.Tensor, config) -> None:
@@ -340,6 +345,7 @@ def recurrent_forward_backward_no_pipelining(
                 unwrapped_model,
                 args=args,
                 is_first_chunk=chunk_idx == 0,
+                chunk_start_position=chunk_idx * chunk_size,
             )
             try:
                 return run_chunk(chunk_idx, chunk)
@@ -348,6 +354,7 @@ def recurrent_forward_backward_no_pipelining(
                     unwrapped_model,
                     args=None,
                     is_first_chunk=False,
+                    chunk_start_position=0,
                 )
 
         is_last_microbatch = microbatch_id == num_microbatches - 1

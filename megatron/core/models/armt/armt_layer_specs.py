@@ -1,5 +1,6 @@
 """Layer specs for ARMT layers."""
 
+from dataclasses import replace
 from typing import Optional
 
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -7,9 +8,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 from .armt_layer import ARMTLayer
+from .armt_self_attention import ARMTSelfAttention
 
 
 def get_armt_layer_spec(
@@ -34,6 +37,8 @@ def get_armt_layer_spec(
     gating: bool = False,
     correction: bool = True,
     tbptt_mode: bool = True,
+    recurrent_chunk_size: Optional[int] = None,
+    full_attn_window_size: Optional[int] = None,
     recurrent_memory_backend: str = "associative",
     recurrent_gdn_use_fla_kernel: bool = True,
     recurrent_gdn_use_causal_conv1d: bool = True,
@@ -74,6 +79,25 @@ def get_armt_layer_spec(
             kitchen_attention_backend=kitchen_attention_backend,
         )
 
+    if (
+        isinstance(base_spec.submodules.self_attention, ModuleSpec)
+        and base_spec.submodules.self_attention.module is SelfAttention
+    ):
+        armt_self_attention_spec = replace(
+            base_spec.submodules.self_attention,
+            module=ARMTSelfAttention,
+            params={
+                **base_spec.submodules.self_attention.params,
+                "num_mem_tokens": num_mem_tokens,
+                "recurrent_chunk_size": recurrent_chunk_size,
+                "full_attn_window_size": full_attn_window_size,
+            },
+        )
+        base_spec = replace(
+            base_spec,
+            submodules=replace(base_spec.submodules, self_attention=armt_self_attention_spec),
+        )
+
     return ModuleSpec(
         module=ARMTLayer,
         submodules=base_spec.submodules,
@@ -86,6 +110,8 @@ def get_armt_layer_spec(
             "gating": gating,
             "correction": correction,
             "tbptt_mode": tbptt_mode,
+            "recurrent_chunk_size": recurrent_chunk_size,
+            "full_attn_window_size": full_attn_window_size,
             "recurrent_memory_backend": recurrent_memory_backend,
             "recurrent_gdn_use_fla_kernel": recurrent_gdn_use_fla_kernel,
             "recurrent_gdn_use_causal_conv1d": recurrent_gdn_use_causal_conv1d,

@@ -23,6 +23,8 @@ class ARMTModel(GPTModel):
         vocab_size: int,
         max_sequence_length: int,
         num_mem_tokens: int = 16,
+        recurrent_chunk_size: Optional[int] = None,
+        full_attn_window_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(
@@ -34,8 +36,18 @@ class ARMTModel(GPTModel):
         )
 
         self.num_mem_tokens = num_mem_tokens
+        self.recurrent_chunk_size = recurrent_chunk_size or max_sequence_length
+        self.full_attn_window_size = (
+            full_attn_window_size
+            if full_attn_window_size is not None
+            else self.recurrent_chunk_size
+        )
+        self._use_windowed_full_attention = (
+            self.full_attn_window_size > self.recurrent_chunk_size
+        )
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
+        self._current_chunk_start_position = 0
 
         init_std = getattr(config, "init_method_std", 0.02)
         self.memory_embeddings = nn.Parameter(
@@ -79,9 +91,15 @@ class ARMTModel(GPTModel):
         for module in self._armt_layers():
             module.set_current_chunk_is_first(enabled)
 
+    def set_current_chunk_start_position(self, position: int):
+        self._current_chunk_start_position = int(position)
+        for module in self._armt_layers():
+            module.set_current_chunk_start_position(position)
+
     def reset_all_memory(self):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
+        self._current_chunk_start_position = 0
         for module in self._armt_layers():
             module.reset_memory()
 
@@ -171,10 +189,12 @@ class ARMTModel(GPTModel):
                 padding_mask = self._concat_padding_mask(padding_mask)
 
         # Recompute rotary embeddings for the new sequence length.
+        rotary_offset = self._current_chunk_start_position if self._use_windowed_full_attention else 0
         if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             rotary_seq_len = decoder_input.shape[0]
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
+                offset=rotary_offset,
                 packed_seq=packed_seq_params is not None
                 and packed_seq_params.qkv_format == "thd",
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
@@ -183,6 +203,7 @@ class ARMTModel(GPTModel):
             rotary_seq_len = decoder_input.shape[0]
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
+                offset=rotary_offset,
                 packed_seq=packed_seq_params is not None
                 and packed_seq_params.qkv_format == "thd",
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,

@@ -130,6 +130,52 @@ def test_scheduler_sets_skip_read_memory_only_on_first_chunk():
     assert all(call is False for call in first_chunk_calls[1:])
 
 
+def test_scheduler_sets_current_chunk_start_position_per_chunk():
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (1, 8)),
+        "labels": torch.randint(0, 100, (1, 8)),
+        "loss_mask": torch.ones(1, 8),
+    }
+
+    def forward_step_func(data_it, model):
+        del model
+        batch = next(data_it)
+        return torch.zeros([], requires_grad=True), _build_loss_func(batch)
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+
+    unwrapped_model = MagicMock()
+
+    with _patched_schedule(raw_batch, config, unwrapped_model):
+        old_global_args = training_global_vars._GLOBAL_ARGS
+        try:
+            training_global_vars._GLOBAL_ARGS = SimpleNamespace(
+                recurrent_chunk_size=4,
+                no_read_memory_from_first_chunk=True,
+                no_loss_from_first_chunk=False,
+            )
+            recurrent_forward_backward_no_pipelining(
+                forward_step_func=forward_step_func,
+                data_iterator=iter([raw_batch]),
+                model=MagicMock(),
+                num_microbatches=1,
+                seq_length=8,
+                micro_batch_size=1,
+                forward_only=True,
+            )
+        finally:
+            training_global_vars._GLOBAL_ARGS = old_global_args
+
+    start_calls = [
+        call.args[0] for call in unwrapped_model.set_current_chunk_start_position.call_args_list
+    ]
+
+    assert start_calls == [0, 0, 4, 0]
+
+
 def _build_loss_func(batch):
     def _loss_func(output_tensor):
         num_tokens = batch["loss_mask"].float().sum().to(torch.int)
