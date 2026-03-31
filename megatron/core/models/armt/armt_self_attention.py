@@ -1,13 +1,12 @@
 """ARMT self-attention with optional recurrent-window KV reuse."""
 
 import math
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core import tensor_parallel
 from megatron.core.fusions.fused_softmax import SoftmaxOne
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -60,8 +59,9 @@ class ARMTSelfAttention(SelfAttention):
         self._current_chunk_start_position = int(position)
 
     def reset_window_kv_cache(self):
-        self._history_key_cache = None
-        self._history_value_cache = None
+        self._history_key_cache: List[Tensor] = []
+        self._history_value_cache: List[Tensor] = []
+        self._history_cache_num_tokens = 0
         self._current_chunk_start_position = 0
 
     def _split_real_and_memory_tokens(self, tensor: Tensor) -> Tuple[Tensor, Tensor]:
@@ -74,35 +74,93 @@ class ARMTSelfAttention(SelfAttention):
         return tensor[:-self.num_mem_tokens], tensor[-self.num_mem_tokens :]
 
     def _select_history_kv(self, current_real_seq_len: int) -> Tuple[Optional[Tensor], Optional[Tensor]]:
-        if self._history_key_cache is None or self._history_value_cache is None:
+        self._ensure_history_cache_lists()
+
+        if self._history_cache_num_tokens == 0:
             return None, None
 
         history_len = max(self.full_attn_window_size - current_real_seq_len, 0)
         if history_len == 0:
             return None, None
 
-        return (
-            self._history_key_cache[-history_len:],
-            self._history_value_cache[-history_len:],
-        )
+        remaining = min(history_len, self._history_cache_num_tokens)
+        selected_keys = []
+        selected_values = []
+        for key_chunk, value_chunk in zip(
+            reversed(self._history_key_cache),
+            reversed(self._history_value_cache),
+        ):
+            if remaining <= 0:
+                break
+            if key_chunk.size(0) <= remaining:
+                selected_keys.append(key_chunk)
+                selected_values.append(value_chunk)
+                remaining -= key_chunk.size(0)
+                continue
+
+            selected_keys.append(key_chunk[-remaining:])
+            selected_values.append(value_chunk[-remaining:])
+            remaining = 0
+
+        selected_keys.reverse()
+        selected_values.reverse()
+        if len(selected_keys) == 1:
+            return selected_keys[0], selected_values[0]
+
+        return torch.cat(selected_keys, dim=0), torch.cat(selected_values, dim=0)
 
     def _update_history_kv_cache(self, current_real_key: Tensor, current_real_value: Tensor) -> None:
         if current_real_key.size(0) == 0:
             return
 
-        if self._history_key_cache is None:
-            history_key = current_real_key
-            history_value = current_real_value
-        else:
-            history_key = torch.cat([self._history_key_cache, current_real_key], dim=0)
-            history_value = torch.cat([self._history_value_cache, current_real_value], dim=0)
+        self._ensure_history_cache_lists()
+        self._history_key_cache.append(current_real_key)
+        self._history_value_cache.append(current_real_value)
+        self._history_cache_num_tokens += current_real_key.size(0)
+        self._trim_history_cache(self.full_attn_window_size)
 
-        if history_key.size(0) > self.full_attn_window_size:
-            history_key = history_key[-self.full_attn_window_size :]
-            history_value = history_value[-self.full_attn_window_size :]
+    def _ensure_history_cache_lists(self) -> None:
+        if self._history_key_cache is None or self._history_value_cache is None:
+            self._history_key_cache = []
+            self._history_value_cache = []
+            self._history_cache_num_tokens = 0
+            return
 
-        self._history_key_cache = history_key
-        self._history_value_cache = history_value
+        if isinstance(self._history_key_cache, torch.Tensor):
+            self._history_key_cache = [self._history_key_cache]
+        if isinstance(self._history_value_cache, torch.Tensor):
+            self._history_value_cache = [self._history_value_cache]
+        if not hasattr(self, "_history_cache_num_tokens"):
+            self._history_cache_num_tokens = sum(
+                chunk.size(0) for chunk in self._history_key_cache
+            )
+
+    def _trim_history_cache(self, max_tokens: Optional[int]) -> None:
+        if max_tokens is None:
+            return
+
+        if max_tokens <= 0:
+            self._history_key_cache.clear()
+            self._history_value_cache.clear()
+            self._history_cache_num_tokens = 0
+            return
+
+        while self._history_cache_num_tokens > max_tokens and self._history_key_cache:
+            overflow = self._history_cache_num_tokens - max_tokens
+            first_key_chunk = self._history_key_cache[0]
+            first_value_chunk = self._history_value_cache[0]
+            first_chunk_tokens = first_key_chunk.size(0)
+
+            if overflow >= first_chunk_tokens:
+                self._history_key_cache.pop(0)
+                self._history_value_cache.pop(0)
+                self._history_cache_num_tokens -= first_chunk_tokens
+                continue
+
+            self._history_key_cache[0] = first_key_chunk[overflow:]
+            self._history_value_cache[0] = first_value_chunk[overflow:]
+            self._history_cache_num_tokens -= overflow
+            break
 
     def _build_rectangular_causal_mask(self, query_len: int, key_len: int, device) -> Tensor:
         history_len = key_len - query_len
@@ -135,6 +193,25 @@ class ARMTSelfAttention(SelfAttention):
         batch_size = query.size(1)
         query_len = query.size(0)
         key_len = key.size(0)
+        attn_mask = self._build_rectangular_causal_mask(query_len, key_len, query.device)
+        softmax_offset = getattr(self.core_attention, "softmax_offset", None)
+
+        if softmax_offset is None:
+            context = F.scaled_dot_product_attention(
+                query.permute(1, 2, 0, 3),
+                key.permute(1, 2, 0, 3),
+                value.permute(1, 2, 0, 3),
+                attn_mask=~attn_mask,
+                dropout_p=self.config.attention_dropout if self.training else 0.0,
+                is_causal=False,
+                scale=self._get_softmax_scale(),
+            )
+            context = context.permute(2, 0, 1, 3).contiguous()
+            return context.view(
+                context.size(0),
+                context.size(1),
+                self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
+            )
 
         query = query.reshape(query_len, batch_size * self.num_attention_heads_per_partition, -1)
         key = key.view(key_len, batch_size * self.num_attention_heads_per_partition, -1)
@@ -151,36 +228,18 @@ class ARMTSelfAttention(SelfAttention):
         )
         attention_scores = attention_scores * self._get_softmax_scale()
 
-        attention_mask = self._build_rectangular_causal_mask(
-            query_len,
-            key_len,
-            attention_scores.device,
-        )
-        attention_scores = attention_scores.float().masked_fill(attention_mask, -10000.0)
-
-        softmax_offset = getattr(self.core_attention, "softmax_offset", None)
-        if softmax_offset is None:
-            attention_probs = torch.softmax(attention_scores, dim=-1)
-        else:
-            attention_probs = SoftmaxOne(
-                dim=-1,
-                denominator_offset=softmax_offset.to(attention_scores.device),
-            )(attention_scores)
+        attention_scores = attention_scores.float().masked_fill(attn_mask, -10000.0)
+        attention_probs = SoftmaxOne(
+            dim=-1,
+            denominator_offset=softmax_offset.to(attention_scores.device),
+        )(attention_scores)
 
         attention_probs = attention_probs.to(dtype=query.dtype)
-        if not self.config.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
-                attention_probs = F.dropout(
-                    attention_probs,
-                    p=self.config.attention_dropout,
-                    training=self.training,
-                )
-        else:
-            attention_probs = F.dropout(
-                attention_probs,
-                p=self.config.attention_dropout,
-                training=self.training,
-            )
+        attention_probs = F.dropout(
+            attention_probs,
+            p=self.config.attention_dropout,
+            training=self.training,
+        )
 
         output_size = (
             value.size(1),

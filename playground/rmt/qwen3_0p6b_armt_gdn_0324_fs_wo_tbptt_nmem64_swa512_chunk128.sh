@@ -14,8 +14,8 @@ set -ex
 # - Expose independent launcher switches for:
 #   - RECURRENT_GDN_USE_FLA_KERNEL=0|1
 #   - RECURRENT_GDN_USE_CAUSAL_CONV1D=0|1
-# - Use runnable default batch sizes for the windowed configuration to avoid
-#   excessive gradient accumulation before the first logged iteration.
+# - Use a 24-GPU-compatible default micro-batch size that also reduces
+#   gradient-accumulation fragmentation for the chunk128 windowed setup.
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -31,7 +31,7 @@ set -ex
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
-ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
 ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
@@ -161,7 +161,7 @@ RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL:-1}
 RECURRENT_GDN_USE_CAUSAL_CONV1D=${RECURRENT_GDN_USE_CAUSAL_CONV1D:-1}
 
 # ========== Training parameters ==========
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-5}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-10}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
