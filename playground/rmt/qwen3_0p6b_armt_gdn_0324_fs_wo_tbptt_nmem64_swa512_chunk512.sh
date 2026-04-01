@@ -4,18 +4,12 @@ set -ex
 # Qwen3-0.6B ARMT training from scratch with GDN recurrent memory backend.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_armt_0324_fs_wo_tbptt.sh
+# - playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt_nmem64.sh
 #
 # Difference from the reference:
-# - Replace associative memory backend with GDN.
-# - Decouple full attention from recurrent chunking:
-#   - recurrent_chunk_size=128
-#   - full_attn_window_size=512
-# - Expose independent launcher switches for:
-#   - RECURRENT_GDN_USE_FLA_KERNEL=0|1
-#   - RECURRENT_GDN_USE_CAUSAL_CONV1D=0|1
-# - Use a 24-GPU-compatible default micro-batch size that also reduces
-#   gradient-accumulation fragmentation for the chunk128 windowed setup.
+# - Keep recurrent_chunk_size=512 and full_attn_window_size=512.
+# - Force equal-window ARMT full attention onto the custom window-attention path
+#   instead of the legacy TE fast path for a controlled TE-vs-window ablation.
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -26,7 +20,6 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
-#   TRAIN_ITERS / LR_DECAY_ITERS / LR_WARMUP_ITERS override token-derived schedule values
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
@@ -145,9 +138,9 @@ NORM_EPS=1e-6
 
 # ========== ARMT mechanism parameters ==========
 NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-64}
-ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-128}
+ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
 FULL_ATTN_WINDOW_SIZE=${FULL_ATTN_WINDOW_SIZE:-512}
-ARMT_WINDOWED_FULL_ATTN_BACKEND=${ARMT_WINDOWED_FULL_ATTN_BACKEND:-flash_attn}
+ARMT_EQUAL_WINDOW_FULL_ATTN_PATH=${ARMT_EQUAL_WINDOW_FULL_ATTN_PATH:-window}
 ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
@@ -171,19 +164,14 @@ LR_DECAY_TOKENS=${LR_DECAY_TOKENS:-${TRAIN_TOKENS}}
 LR=${LR:-5e-4}
 MIN_LR=${MIN_LR:-1e-5}
 
-WARMUP_TOKENS=${WARMUP_TOKENS:-$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))}
+WARMUP_TOKENS=$(( 1000 * ${GLOBAL_BATCH_SIZE} * ${SEQ_LENGTH} ))
 
-TRAIN_ITERS=${TRAIN_ITERS:-$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))}
-LR_WARMUP_ITERS=${LR_WARMUP_ITERS:-$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))}
-LR_DECAY_ITERS=${LR_DECAY_ITERS:-$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))}
+TRAIN_ITERS=$(( ${TRAIN_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+LR_WARMUP_ITERS=$(( ${WARMUP_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
+LR_DECAY_ITERS=$(( ${LR_DECAY_TOKENS} / ${GLOBAL_BATCH_SIZE} / ${SEQ_LENGTH} ))
 
 if (( LR_WARMUP_ITERS >= LR_DECAY_ITERS )); then
   echo "ERROR: invalid TRAIN_TOKENS/LR_DECAY_TOKENS override: lr_warmup_iters (${LR_WARMUP_ITERS}) must be smaller than lr_decay_iters (${LR_DECAY_ITERS})" >&2
-  exit 1
-fi
-
-if (( TRAIN_ITERS <= 0 )); then
-  echo "ERROR: train_iters (${TRAIN_ITERS}) must be positive" >&2
   exit 1
 fi
 
@@ -240,7 +228,7 @@ ARMT_ARGS=(
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --full-attn-window-size ${FULL_ATTN_WINDOW_SIZE}
-  --armt-windowed-full-attn-backend ${ARMT_WINDOWED_FULL_ATTN_BACKEND}
+  --armt-equal-window-full-attn-path ${ARMT_EQUAL_WINDOW_FULL_ATTN_PATH}
   --armt-n-heads ${ARMT_N_HEADS}
   --recurrent-memory-backend gated_deltanet
   --recurrent-gdn-conv-kernel-size ${RECURRENT_GDN_CONV_KERNEL_SIZE}
@@ -344,7 +332,7 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE} FULL_ATTN_WINDOW_SIZE=${FULL_ATTN_WINDOW_SIZE}"
-echo "ARMT_WINDOWED_FULL_ATTN_BACKEND=${ARMT_WINDOWED_FULL_ATTN_BACKEND}"
+echo "ARMT_EQUAL_WINDOW_FULL_ATTN_PATH=${ARMT_EQUAL_WINDOW_FULL_ATTN_PATH}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL}"
