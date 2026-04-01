@@ -140,6 +140,15 @@ class GatedDeltaNetMemory(nn.Module):
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
 
+    def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
+        recurrent_state_numel = (
+            batch_size
+            * self.num_value_heads
+            * self.key_head_dim
+            * self.value_head_dim
+        )
+        return [("W_mem", recurrent_state_numel)]
+
     def consume_monitoring_primitives(self):
         stats = self._monitoring_stats
         primitives = {}

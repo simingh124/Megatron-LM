@@ -35,6 +35,7 @@ class AssociativeLayer(nn.Module):
         num_mem_tokens: int = 16,
         d_mem: Optional[int] = None,
         n_heads: int = 1,
+        head_dim: Optional[int] = None,
         use_denom: bool = True,
         gating: bool = False,
         correction: bool = True,
@@ -54,10 +55,22 @@ class AssociativeLayer(nn.Module):
         if d_mem is None:
             d_mem = d_model
 
+        if n_heads <= 0:
+            raise ValueError("n_heads must be > 0")
+        if d_mem % n_heads != 0:
+            raise ValueError("d_mem must be divisible by n_heads")
+        if head_dim is None:
+            if d_model % n_heads != 0:
+                raise ValueError("d_model must be divisible by n_heads when head_dim is omitted")
+            head_dim = d_model // n_heads
+        if head_dim <= 0:
+            raise ValueError("head_dim must be > 0")
+
         self.d_model = d_model
         self.num_mem_tokens = num_mem_tokens
         self.d_mem = d_mem
         self.n_heads = n_heads
+        self.head_dim = head_dim
         self.use_denom = use_denom
         self.gating = gating
         self.correction = correction
@@ -65,14 +78,13 @@ class AssociativeLayer(nn.Module):
         self.tbptt_mode = tbptt_mode
 
         self.d_key = 2 * nu * d_mem
-
-        assert d_mem % n_heads == 0, "d_mem must be divisible by n_heads"
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.value_dim = self.n_heads * self.head_dim
 
         self.phi = DPFP(nu)
         self.W_mq = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
         self.W_mk = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
-        self.W_mv = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.W_mv = nn.Linear(d_model, self.value_dim, bias=False, dtype=dtype)
+        self.W_mo = nn.Linear(self.value_dim, d_model, bias=False, dtype=dtype)
 
         # NOTE: Do not init to exact zeros. `W_mv` participates only through the
         # chunk-to-chunk memory state; if it's initialized to zeros, the memory update
@@ -81,7 +93,7 @@ class AssociativeLayer(nn.Module):
         nn.init.normal_(self.W_mv.weight, mean=0.0, std=1e-3)
 
         if gating:
-            self.W_mb = nn.Linear(d_model, d_model, dtype=dtype)
+            self.W_mb = nn.Linear(d_model, self.value_dim, dtype=dtype)
         else:
             self.W_mb = nn.Linear(d_model, n_heads, dtype=dtype)
 
@@ -115,6 +127,11 @@ class AssociativeLayer(nn.Module):
     @staticmethod
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
+
+    def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
+        # Report the logical single-sample memory store size before DPFP expansion.
+        w_mem_numel = batch_size * self.n_heads * (self.d_mem // self.n_heads) * self.head_dim
+        return [("W_mem", w_mem_numel)]
 
     def consume_monitoring_primitives(self):
         stats = self._monitoring_stats
@@ -181,7 +198,7 @@ class AssociativeLayer(nn.Module):
             batch_size,
             self.n_heads,
             self.d_key // self.n_heads,
-            self.d_model // self.n_heads,
+            self.head_dim,
         )
         expected_z_shape = (
             batch_size,
@@ -277,7 +294,7 @@ class AssociativeLayer(nn.Module):
             else:
                 result = num
 
-            result = self._from_heads(result)
+            result = self.W_mo(self._from_heads(result))
 
         if should_track_read_metrics:
             hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)

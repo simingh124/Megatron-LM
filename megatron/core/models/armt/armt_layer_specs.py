@@ -29,6 +29,7 @@ def get_armt_layer_spec(
     num_mem_tokens: int = 16,
     d_mem: Optional[int] = None,
     armt_n_heads: int = 1,
+    armt_head_dim: Optional[int] = None,
     nu: int = 3,
     use_denom: bool = True,
     gating: bool = False,
@@ -42,6 +43,10 @@ def get_armt_layer_spec(
     recurrent_gdn_value_head_dim: Optional[int] = None,
     recurrent_gdn_num_key_heads: Optional[int] = None,
     recurrent_gdn_num_value_heads: Optional[int] = None,
+    recurrent_slot_num_slots: Optional[int] = None,
+    recurrent_slot_num_heads: Optional[int] = None,
+    recurrent_slot_head_dim: Optional[int] = None,
+    recurrent_slot_read_attn_backend: str = "flash",
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
         base_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -81,6 +86,7 @@ def get_armt_layer_spec(
             "num_mem_tokens": num_mem_tokens,
             "d_mem": d_mem,
             "armt_n_heads": armt_n_heads,
+            "armt_head_dim": armt_head_dim,
             "nu": nu,
             "use_denom": use_denom,
             "gating": gating,
@@ -94,5 +100,9 @@ def get_armt_layer_spec(
             "recurrent_gdn_value_head_dim": recurrent_gdn_value_head_dim,
             "recurrent_gdn_num_key_heads": recurrent_gdn_num_key_heads,
             "recurrent_gdn_num_value_heads": recurrent_gdn_num_value_heads,
+            "recurrent_slot_num_slots": recurrent_slot_num_slots,
+            "recurrent_slot_num_heads": recurrent_slot_num_heads,
+            "recurrent_slot_head_dim": recurrent_slot_head_dim,
+            "recurrent_slot_read_attn_backend": recurrent_slot_read_attn_backend,
         },
     )

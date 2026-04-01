@@ -25,6 +25,7 @@ class ARMTLayer(TransformerLayer):
         num_mem_tokens: int = 16,
         d_mem: Optional[int] = None,
         armt_n_heads: int = 1,
+        armt_head_dim: Optional[int] = None,
         nu: int = 3,
         use_denom: bool = True,
         gating: bool = False,
@@ -38,6 +39,10 @@ class ARMTLayer(TransformerLayer):
         recurrent_gdn_value_head_dim: Optional[int] = None,
         recurrent_gdn_num_key_heads: Optional[int] = None,
         recurrent_gdn_num_value_heads: Optional[int] = None,
+        recurrent_slot_num_slots: Optional[int] = None,
+        recurrent_slot_num_heads: Optional[int] = None,
+        recurrent_slot_head_dim: Optional[int] = None,
+        recurrent_slot_read_attn_backend: str = "flash",
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
@@ -59,10 +64,20 @@ class ARMTLayer(TransformerLayer):
                 recurrent_memory_backend,
                 d_mem=d_mem or config.hidden_size,
                 n_heads=armt_n_heads,
+                head_dim=armt_head_dim,
                 use_denom=use_denom,
                 gating=gating,
                 correction=correction,
                 nu=nu,
+                **common_kwargs,
+            )
+        elif recurrent_memory_backend == "cross_attn_slots":
+            self.recurrent_memory_layer = build_recurrent_memory_backend(
+                recurrent_memory_backend,
+                num_slots=recurrent_slot_num_slots or num_mem_tokens,
+                num_heads=recurrent_slot_num_heads or 1,
+                head_dim=recurrent_slot_head_dim,
+                read_attn_backend=recurrent_slot_read_attn_backend,
                 **common_kwargs,
             )
         else:

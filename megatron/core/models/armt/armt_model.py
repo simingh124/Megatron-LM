@@ -1,5 +1,6 @@
 """ARMT model built on top of GPTModel."""
 
+from collections import OrderedDict
 from typing import Optional
 
 import torch
@@ -60,6 +61,7 @@ class ARMTModel(GPTModel):
                 backend_module = getattr(module, backend_attr, None)
                 if backend_module is None:
                     continue
+
                 breakdown.append(
                     (
                         f"{module_name}.{backend_attr}",
@@ -67,6 +69,35 @@ class ARMTModel(GPTModel):
                     )
                 )
 
+        return breakdown
+
+    def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
+        if self.num_mem_tokens == 0:
+            return []
+
+        state_sizes = OrderedDict()
+        for module in self.named_modules():
+            _, module_instance = module
+            if not isinstance(module_instance, ARMTLayer):
+                continue
+
+            for backend_attr in ("associative_layer", "recurrent_memory_layer"):
+                backend_module = getattr(module_instance, backend_attr, None)
+                if backend_module is None:
+                    continue
+
+                state_breakdown_getter = getattr(backend_module, "get_memory_state_breakdown", None)
+                if not callable(state_breakdown_getter):
+                    continue
+
+                for name, count in state_breakdown_getter(batch_size=batch_size):
+                    state_sizes[name] = state_sizes.get(name, 0) + count
+
+        ordered_names = ("initial_slots", "W_mem")
+        breakdown = [(name, state_sizes[name]) for name in ordered_names if name in state_sizes]
+        breakdown.extend(
+            (name, count) for name, count in state_sizes.items() if name not in ordered_names
+        )
         return breakdown
 
     def set_skip_read_memory_for_current_chunk(self, enabled: bool):

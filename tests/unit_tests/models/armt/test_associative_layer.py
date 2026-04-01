@@ -38,6 +38,33 @@ class TestAssociativeLayer:
             tbptt_mode=True,
         )
 
+    def test_associative_layer_accepts_explicit_head_dim_without_hidden_size_match(self):
+        layer = AssociativeLayer(
+            d_model=70,
+            d_mem=64,
+            n_heads=4,
+            head_dim=6,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+
+        retrieved = layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+
+        assert retrieved.shape == (batch_size, 8, layer.d_model)
+        assert layer.W_mem.shape == (
+            batch_size,
+            layer.n_heads,
+            layer.d_key // layer.n_heads,
+            layer.head_dim,
+        )
+
     def test_associative_layer_reset(self, layer):
         """验证 reset_memory 会按 batch 维度初始化/清零 W_mem 与 z。"""
         batch_size = 2
@@ -48,6 +75,21 @@ class TestAssociativeLayer:
         assert torch.allclose(layer.W_mem, torch.zeros_like(layer.W_mem))
         assert torch.allclose(layer.z, torch.zeros_like(layer.z))
         assert layer.W_mem.shape[0] == batch_size
+
+    def test_memory_state_breakdown_uses_pre_dpfp_memory_width(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            head_dim=6,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+
+        assert layer.get_memory_state_breakdown(batch_size=1) == [
+            ("W_mem", layer.n_heads * (layer.d_mem // layer.n_heads) * layer.head_dim)
+        ]
 
     def test_associative_layer_associate_first_chunk(self, layer):
         """验证首个 chunk（memory 为空）时 associate 返回全零检索结果。"""
@@ -216,6 +258,7 @@ class TestAssociativeLayer:
             d_model=128,
             d_mem=64,
             n_heads=4,
+            head_dim=16,
             nu=4,
             use_denom=False,
             tbptt_mode=True,

@@ -1,6 +1,9 @@
 import os
 import random
+import re
+import subprocess
 from importlib.util import find_spec
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -22,8 +25,25 @@ requires_multi_gpu = pytest.mark.skipif(
     reason="Need at least 2 GPUs",
 )
 
+requires_8_gpu = pytest.mark.skipif(
+    torch.cuda.device_count() < 8,
+    reason="Need at least 8 GPUs",
+)
+
 HAS_FLA = find_spec("fla") is not None
 HAS_CAUSAL_CONV1D = find_spec("causal_conv1d") is not None
+REPO_ROOT = Path(__file__).resolve().parents[3]
+LAUNCHER_PATH = (
+    REPO_ROOT / "playground" / "rmt" / "qwen3_0p6b_armt_cross_attn_0324_fs_wo_tbptt.sh"
+)
+_ITERATION_RE = re.compile(
+    r"iteration\s+(\d+)/\s*\d+\s+\|.*?"
+    r"elapsed time per iteration \(ms\):\s*([0-9.+\-Ee]+)\s*\|.*?"
+    r"throughput per GPU \(TFLOP/s/GPU\):\s*([0-9.+\-Ee]+)\s*\|.*?"
+    r"lm loss:\s*([0-9.+\-Ee]+)\s*\|.*?"
+    r"number of skipped iterations:\s*(\d+)\s*\|.*?"
+    r"number of nan iterations:\s*(\d+)\s*\|"
+)
 
 
 def _init_distributed(world_size: int):
@@ -51,6 +71,10 @@ def _build_model(
     recurrent_memory_backend: str = "associative",
     recurrent_gdn_use_fla_kernel: bool = True,
     recurrent_gdn_use_causal_conv1d: bool = True,
+    recurrent_slot_num_slots: int = 8,
+    recurrent_slot_num_heads: int = 4,
+    recurrent_slot_head_dim: int = 16,
+    recurrent_slot_read_attn_backend: str = "sdpa",
 ):
     config = TransformerConfig(
         num_layers=2,
@@ -83,6 +107,10 @@ def _build_model(
         recurrent_gdn_value_head_dim=16,
         recurrent_gdn_num_key_heads=4,
         recurrent_gdn_num_value_heads=4,
+        recurrent_slot_num_slots=recurrent_slot_num_slots,
+        recurrent_slot_num_heads=recurrent_slot_num_heads,
+        recurrent_slot_head_dim=recurrent_slot_head_dim,
+        recurrent_slot_read_attn_backend=recurrent_slot_read_attn_backend,
     )
 
     model = ARMTModel(
@@ -106,6 +134,10 @@ def _run_single_step(
     recurrent_memory_backend: str = "associative",
     recurrent_gdn_use_fla_kernel: bool = True,
     recurrent_gdn_use_causal_conv1d: bool = True,
+    recurrent_slot_num_slots: int = 8,
+    recurrent_slot_num_heads: int = 4,
+    recurrent_slot_head_dim: int = 16,
+    recurrent_slot_read_attn_backend: str = "sdpa",
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
@@ -124,6 +156,10 @@ def _run_single_step(
         recurrent_memory_backend=recurrent_memory_backend,
         recurrent_gdn_use_fla_kernel=recurrent_gdn_use_fla_kernel,
         recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+        recurrent_slot_num_slots=recurrent_slot_num_slots,
+        recurrent_slot_num_heads=recurrent_slot_num_heads,
+        recurrent_slot_head_dim=recurrent_slot_head_dim,
+        recurrent_slot_read_attn_backend=recurrent_slot_read_attn_backend,
     ).cuda()
     model.train()
     model.set_current_chunk_is_first(True)
@@ -161,12 +197,126 @@ def _finalize_distributed():
         dist.destroy_process_group()
 
 
+def _parse_iteration_metrics(output: str):
+    metrics = []
+    for match in _ITERATION_RE.finditer(output):
+        metrics.append(
+            {
+                "iteration": int(match.group(1)),
+                "elapsed_ms": float(match.group(2)),
+                "throughput": float(match.group(3)),
+                "loss": float(match.group(4)),
+                "skipped": int(match.group(5)),
+                "nan": int(match.group(6)),
+            }
+        )
+    return metrics
+
+
+def _run_cross_attn_launcher(read_attn_backend: str, exit_interval: int):
+    artifact_root = (
+        REPO_ROOT / "codex_assets" / "armt_cross_attn_flash_compare" / read_attn_backend
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ENABLE_TEST_TRAIN_RUN": "1",
+            "EXIT_INTERVAL": str(exit_interval),
+            "ENABLE_TEE_LOG": "0",
+            "MASTER_PORT": str(19000 + random.randint(1, 2000)),
+            "CHECKPOINT_PATH": str(artifact_root / "checkpoints"),
+            "TENSORBOARD_LOGS_PATH": str(artifact_root / "tensorboard"),
+            "LOG_DIR": str(artifact_root / "logs"),
+            "RECURRENT_SLOT_READ_ATTN_BACKEND": read_attn_backend,
+        }
+    )
+    return subprocess.run(
+        ["bash", str(LAUNCHER_PATH)],
+        cwd=REPO_ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+
+
+def _assert_launcher_health(output: str, returncode: int, expected_steps: int, backend: str):
+    assert returncode == 0, f"{backend} launcher failed:\n{output[-12000:]}"
+
+    metrics = _parse_iteration_metrics(output)
+    assert len(metrics) == expected_steps, (
+        f"{backend} launcher expected {expected_steps} iteration logs, got {len(metrics)}:\n"
+        f"{output[-12000:]}"
+    )
+
+    for expected_iteration, metric in enumerate(metrics, start=1):
+        assert metric["iteration"] == expected_iteration, metric
+        assert torch.isfinite(torch.tensor(metric["loss"])), metric
+        assert torch.isfinite(torch.tensor(metric["throughput"])), metric
+        assert torch.isfinite(torch.tensor(metric["elapsed_ms"])), metric
+        assert metric["loss"] > 0.0, metric
+        assert metric["throughput"] > 0.0, metric
+        assert metric["elapsed_ms"] > 0.0, metric
+        assert metric["skipped"] == 0, metric
+        assert metric["nan"] == 0, metric
+
+    return metrics
+
+
+def _compute_loss_relative_error(flash_metric, sdpa_metric):
+    return abs(flash_metric["loss"] - sdpa_metric["loss"]) / max(
+        abs(sdpa_metric["loss"]),
+        1e-12,
+    )
+
+
+def _format_loss_comparison_summary(flash_metrics, sdpa_metrics):
+    if len(flash_metrics) != len(sdpa_metrics):
+        raise ValueError(
+            f"flash/sdpa metric length mismatch: {len(flash_metrics)} != {len(sdpa_metrics)}"
+        )
+
+    lines = [
+        "flash vs sdpa loss comparison",
+        "iteration | flash_loss | sdpa_loss | relative_error",
+    ]
+    for flash_metric, sdpa_metric in zip(flash_metrics, sdpa_metrics):
+        relative_error = _compute_loss_relative_error(flash_metric, sdpa_metric)
+        lines.append(
+            f'{flash_metric["iteration"]} | '
+            f'{flash_metric["loss"]:.6f} | '
+            f'{sdpa_metric["loss"]:.6f} | '
+            f"{relative_error:.10f}"
+        )
+
+    return "\n".join(lines)
+
+
+def test_format_loss_comparison_summary_includes_losses_and_relative_error():
+    flash_metrics = [
+        {"iteration": 1, "loss": 2.0, "elapsed_ms": 100.0, "throughput": 10.0, "skipped": 0, "nan": 0},
+        {"iteration": 2, "loss": 1.0, "elapsed_ms": 120.0, "throughput": 12.0, "skipped": 0, "nan": 0},
+    ]
+    sdpa_metrics = [
+        {"iteration": 1, "loss": 2.002, "elapsed_ms": 110.0, "throughput": 11.0, "skipped": 0, "nan": 0},
+        {"iteration": 2, "loss": 0.999, "elapsed_ms": 118.0, "throughput": 12.5, "skipped": 0, "nan": 0},
+    ]
+
+    summary = _format_loss_comparison_summary(flash_metrics, sdpa_metrics)
+
+    assert "iteration | flash_loss | sdpa_loss | relative_error" in summary
+    assert "1 | 2.000000 | 2.002000 | 0.0009990010" in summary
+    assert "2 | 1.000000 | 0.999000 | 0.0010010010" in summary
+
+
 class TestARMTTraining:
     @requires_gpu
     @pytest.mark.parametrize(
         ("recurrent_memory_backend", "recurrent_gdn_use_fla_kernel", "recurrent_gdn_use_causal_conv1d"),
         [
             ("associative", True, True),
+            ("cross_attn_slots", True, True),
             pytest.param(
                 "gated_deltanet",
                 True,
@@ -224,3 +374,34 @@ class TestARMTTraining:
             _run_single_step(tp_size=2, seq_len=64, skip_read_memory_from_first_chunk=True)
         finally:
             _finalize_distributed()
+
+    @requires_8_gpu
+    def test_cross_attn_launcher_flash_matches_sdpa_loss_for_10_steps(self):
+        flash_result = _run_cross_attn_launcher(read_attn_backend="flash", exit_interval=10)
+        flash_metrics = _assert_launcher_health(
+            flash_result.stdout,
+            flash_result.returncode,
+            expected_steps=10,
+            backend="flash",
+        )
+
+        sdpa_result = _run_cross_attn_launcher(read_attn_backend="sdpa", exit_interval=10)
+        sdpa_metrics = _assert_launcher_health(
+            sdpa_result.stdout,
+            sdpa_result.returncode,
+            expected_steps=10,
+            backend="sdpa",
+        )
+
+        comparison_summary = _format_loss_comparison_summary(flash_metrics, sdpa_metrics)
+        print(comparison_summary, flush=True)
+
+        for flash_metric, sdpa_metric in zip(flash_metrics, sdpa_metrics):
+            relative_error = _compute_loss_relative_error(flash_metric, sdpa_metric)
+            assert relative_error <= 1e-3, {
+                "flash_loss": flash_metric["loss"],
+                "sdpa_loss": sdpa_metric["loss"],
+                "relative_error": relative_error,
+                "iteration": flash_metric["iteration"],
+                "comparison_summary": comparison_summary,
+            }

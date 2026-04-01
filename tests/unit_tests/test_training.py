@@ -80,6 +80,10 @@ def test_format_memory_parameter_report_includes_summary_and_table():
             ("memory_embeddings", 1_000),
             ("decoder.layers.0.recurrent_memory_layer", 500),
         ],
+        memory_state_breakdown=[
+            ("initial_slots", 120),
+            ("W_mem", 340),
+        ],
         tp_rank=0,
         pp_rank=0,
     )
@@ -90,6 +94,10 @@ def test_format_memory_parameter_report_includes_summary_and_table():
     assert "modules:" in report
     assert "percentage" in report
     assert "memory_embeddings" in report
+    assert "initial_slots state size (batch=1): 120" in report
+    assert "W_mem state size (batch=1): 340" in report
+    assert report.index("memory / model params: 15.00%") < report.index("initial_slots state size (batch=1): 120")
+    assert report.index("W_mem state size (batch=1): 340") < report.index("modules:")
     assert "10.00%" in report
     assert "5.00%" in report
 
@@ -98,6 +106,7 @@ def test_format_memory_parameter_report_omits_module_table_when_breakdown_empty(
     report = training_module._format_memory_parameter_report(
         total_model_parameters=10_000,
         breakdown=[],
+        memory_state_breakdown=[],
         tp_rank=0,
         pp_rank=0,
     )
@@ -174,6 +183,52 @@ class TestTraining:
 
         assert has_memory_breakdown is False
         assert breakdown == []
+
+    def test_collect_memory_parameter_breakdown_collects_chunk_prefixed_entries(self):
+        model = [
+            SimpleNamespace(
+                get_memory_parameter_breakdown=lambda: [("memory_embeddings", 100)],
+            ),
+            SimpleNamespace(
+                get_memory_parameter_breakdown=lambda: [
+                    ("decoder.layers.0.recurrent_memory_layer", 200)
+                ],
+            ),
+        ]
+
+        has_memory_breakdown, breakdown = training_module._collect_memory_parameter_breakdown(model)
+
+        assert has_memory_breakdown is True
+        assert breakdown == [
+            ("model_chunk0.memory_embeddings", 100),
+            ("model_chunk1.decoder.layers.0.recurrent_memory_layer", 200),
+        ]
+
+    def test_collect_memory_state_breakdown_aggregates_across_model_chunks(self):
+        model = [
+            SimpleNamespace(
+                get_memory_state_breakdown=lambda batch_size=1: [
+                    ("initial_slots", 96 * batch_size),
+                    ("W_mem", 384 * batch_size),
+                ],
+            ),
+            SimpleNamespace(
+                get_memory_state_breakdown=lambda batch_size=1: [
+                    ("W_mem", 128 * batch_size),
+                ],
+            ),
+        ]
+
+        has_memory_state_breakdown, breakdown = training_module._collect_memory_state_breakdown(
+            model,
+            batch_size=1,
+        )
+
+        assert has_memory_state_breakdown is True
+        assert breakdown == [
+            ("initial_slots", 96),
+            ("W_mem", 512),
+        ]
 
     def test_maybe_exit_after_parameter_statistics(self, monkeypatch):
         barrier_mock = MagicMock()

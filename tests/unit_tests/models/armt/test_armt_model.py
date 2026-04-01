@@ -4,6 +4,9 @@ from unittest.mock import MagicMock, patch
 
 from megatron.core.models.armt.armt_model import ARMTModel
 from megatron.core.models.armt.armt_layer import ARMTLayer
+from megatron.core.models.armt.associative_layer import AssociativeLayer
+from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
+from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import build_mean_metric, build_ratio_of_means_metric
 
 
@@ -96,6 +99,124 @@ class TestARMTModel:
         model.add_module("armt_layer", layer)
 
         assert model.get_memory_parameter_breakdown() == []
+
+    def test_armt_model_memory_parameter_breakdown_counts_cross_attention_slot_backend(self):
+        config = MagicMock()
+        config.hidden_size = 16
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+        config.params_dtype = torch.float32
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        layer.recurrent_memory_layer = CrossAttentionSlotMemory(
+            d_model=16,
+            num_mem_tokens=4,
+            num_slots=6,
+            num_heads=4,
+            head_dim=4,
+            dtype=torch.float32,
+        )
+        model.add_module("armt_layer", layer)
+
+        breakdown = model.get_memory_parameter_breakdown()
+        backend_params = sum(p.numel() for p in layer.recurrent_memory_layer.parameters())
+
+        assert breakdown == [
+            ("memory_embeddings", 64),
+            ("armt_layer.recurrent_memory_layer", backend_params),
+        ]
+
+    def test_armt_model_memory_state_breakdown_aggregates_single_sample_state_sizes(self):
+        config = MagicMock()
+        config.hidden_size = 16
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+        config.params_dtype = torch.float32
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            slot_layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            assoc_layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+            gdn_layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=3)
+
+        slot_layer.recurrent_memory_layer = CrossAttentionSlotMemory(
+            d_model=16,
+            num_mem_tokens=4,
+            num_slots=6,
+            num_heads=4,
+            head_dim=4,
+            dtype=torch.float32,
+        )
+        assoc_layer.associative_layer = AssociativeLayer(
+            d_model=16,
+            num_mem_tokens=4,
+            d_mem=16,
+            n_heads=4,
+            head_dim=4,
+            dtype=torch.float32,
+        )
+        gdn_layer.recurrent_memory_layer = GatedDeltaNetMemory(
+            d_model=16,
+            num_mem_tokens=4,
+            key_head_dim=4,
+            value_head_dim=8,
+            num_key_heads=2,
+            num_value_heads=4,
+            use_fla_kernel=False,
+            use_causal_conv1d=False,
+            dtype=torch.float32,
+        )
+        model.add_module("slot_layer", slot_layer)
+        model.add_module("assoc_layer", assoc_layer)
+        model.add_module("gdn_layer", gdn_layer)
+
+        assert model.get_memory_state_breakdown(batch_size=1) == [
+            ("initial_slots", slot_layer.recurrent_memory_layer.initial_slots.numel()),
+            (
+                "W_mem",
+                assoc_layer.associative_layer.n_heads
+                * (assoc_layer.associative_layer.d_mem // assoc_layer.associative_layer.n_heads)
+                * assoc_layer.associative_layer.head_dim
+                + gdn_layer.recurrent_memory_layer.num_value_heads
+                * gdn_layer.recurrent_memory_layer.key_head_dim
+                * gdn_layer.recurrent_memory_layer.value_head_dim,
+            ),
+        ]
 
     def test_armt_model_memory_concat_strip(self):
         """验证 ARMTModel 的 memory embedding concat/strip 形状逻辑（S -> S+M -> S）。"""

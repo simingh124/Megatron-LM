@@ -13,6 +13,10 @@ def _make_args(**overrides):
         pipeline_model_parallel_size=1,
         context_parallel_size=1,
         tensor_model_parallel_size=1,
+        hidden_size=256,
+        armt_d_mem=None,
+        armt_n_heads=1,
+        armt_head_dim=None,
         fp8=None,
         fp8_format=None,
         use_recurrent_model_schedule=True,
@@ -173,6 +177,14 @@ def test_armt_correction_can_be_disabled():
     assert args.armt_correction is False
 
 
+def test_armt_head_dim_arg_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-head-dim", "12"])
+
+    assert args.armt_head_dim == 12
+
+
 def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
     args = _make_args()
     validate_armt_constraints(args)
@@ -232,3 +244,85 @@ def test_gdn_use_causal_conv1d_requires_installed_package():
     ):
         with pytest.raises(ImportError, match="causal_conv1d"):
             validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_requires_explicit_hyperparameters():
+    args = _make_args(
+        recurrent_memory_backend="cross_attn_slots",
+    )
+    with pytest.raises(ValueError, match="explicit recurrent slot hyperparameters"):
+        validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_rejects_non_positive_hyperparameters():
+    args = _make_args(
+        recurrent_memory_backend="cross_attn_slots",
+        recurrent_slot_num_slots=0,
+        recurrent_slot_num_heads=0,
+    )
+    with pytest.raises(ValueError, match="recurrent_slot_num_slots must be > 0"):
+        validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_allows_explicit_head_dim_without_hidden_size_match():
+    args = _make_args(
+        recurrent_memory_backend="cross_attn_slots",
+        recurrent_slot_num_slots=8,
+        recurrent_slot_num_heads=4,
+        recurrent_slot_head_dim=32,
+        hidden_size=96,
+    )
+    validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_can_infer_head_dim_from_hidden_size():
+    args = _make_args(
+        recurrent_memory_backend="cross_attn_slots",
+        recurrent_slot_num_slots=8,
+        recurrent_slot_num_heads=4,
+    )
+    validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_read_backend_defaults_to_flash():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.recurrent_slot_read_attn_backend == "flash"
+
+
+def test_cross_attn_slots_args_are_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(
+        [
+            "--recurrent-memory-backend",
+            "cross_attn_slots",
+            "--recurrent-slot-num-slots",
+            "8",
+            "--recurrent-slot-num-heads",
+            "4",
+            "--recurrent-slot-head-dim",
+            "64",
+            "--recurrent-slot-read-attn-backend",
+            "sdpa",
+        ]
+    )
+
+    assert args.recurrent_memory_backend == "cross_attn_slots"
+    assert args.recurrent_slot_num_slots == 8
+    assert args.recurrent_slot_num_heads == 4
+    assert args.recurrent_slot_head_dim == 64
+    assert args.recurrent_slot_read_attn_backend == "sdpa"
+
+
+def test_associative_allows_explicit_head_dim_without_hidden_size_match():
+    args = _make_args(
+        hidden_size=70,
+        armt_d_mem=64,
+        armt_n_heads=4,
+        armt_head_dim=6,
+    )
+
+    validate_armt_constraints(args)
