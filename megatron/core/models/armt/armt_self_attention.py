@@ -18,6 +18,19 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 
+from .windowed_attention_utils import should_use_windowed_full_attention
+
+
+def _get_flash_attn_func():
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError as exc:
+        raise ImportError(
+            "ARMT windowed full-attention backend 'flash_attn' requires flash-attn to be "
+            "installed. Set --armt-windowed-full-attn-backend native to use the native path."
+        ) from exc
+    return flash_attn_func
+
 
 class ARMTSelfAttention(SelfAttention):
     """Self-attention with a differentiable real-token KV cache for ARMT."""
@@ -33,6 +46,8 @@ class ARMTSelfAttention(SelfAttention):
         num_mem_tokens: int = 16,
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
+        armt_windowed_full_attn_backend: str = "native",
+        armt_equal_window_full_attn_path: str = "legacy",
     ):
         super().__init__(
             config=config,
@@ -47,16 +62,21 @@ class ARMTSelfAttention(SelfAttention):
         self.full_attn_window_size = (
             full_attn_window_size if full_attn_window_size is not None else recurrent_chunk_size
         )
-        self._use_windowed_full_attention = bool(
-            self.recurrent_chunk_size is not None
-            and self.full_attn_window_size is not None
-            and self.full_attn_window_size > self.recurrent_chunk_size
-        )
+        self.armt_windowed_full_attn_backend = armt_windowed_full_attn_backend
+        self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
+        self._configure_windowed_full_attention_mode()
         self._current_chunk_start_position = 0
         self.reset_window_kv_cache()
 
     def set_current_chunk_start_position(self, position: int):
         self._current_chunk_start_position = int(position)
+
+    def _configure_windowed_full_attention_mode(self):
+        self._use_windowed_full_attention = should_use_windowed_full_attention(
+            recurrent_chunk_size=self.recurrent_chunk_size,
+            full_attn_window_size=self.full_attn_window_size,
+            equal_window_full_attn_path=self.armt_equal_window_full_attn_path,
+        )
 
     def reset_window_kv_cache(self):
         self._history_key_cache: List[Tensor] = []
@@ -188,13 +208,59 @@ class ARMTSelfAttention(SelfAttention):
         return softmax_scale
 
     def _compute_windowed_attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
-        key, value = self._repeat_kv_for_gqa(key, value)
-
         batch_size = query.size(1)
         query_len = query.size(0)
         key_len = key.size(0)
-        attn_mask = self._build_rectangular_causal_mask(query_len, key_len, query.device)
         softmax_offset = getattr(self.core_attention, "softmax_offset", None)
+
+        if self.armt_windowed_full_attn_backend == "flash_attn":
+            if softmax_offset is not None:
+                raise RuntimeError(
+                    "ARMT windowed full-attention backend 'flash_attn' does not support "
+                    "softmax_offset. Set --armt-windowed-full-attn-backend native to use "
+                    "the native path."
+                )
+            if not query.is_cuda or not key.is_cuda or not value.is_cuda:
+                raise RuntimeError(
+                    "ARMT windowed full-attention backend 'flash_attn' requires CUDA tensors. "
+                    "Set --armt-windowed-full-attn-backend native to use the native path."
+                )
+            supported_dtypes = (torch.float16, torch.bfloat16)
+            if (
+                query.dtype not in supported_dtypes
+                or key.dtype not in supported_dtypes
+                or value.dtype not in supported_dtypes
+            ):
+                raise RuntimeError(
+                    "ARMT windowed full-attention backend 'flash_attn' requires fp16/bf16 "
+                    "query, key, and value tensors. Set --armt-windowed-full-attn-backend "
+                    "native to use the native path."
+                )
+            flash_attn_func = _get_flash_attn_func()
+
+            # flash-attn supports the same bottom-right causal layout here without an explicit
+            # rectangular mask, unlike PyTorch SDPA's flash backend for this seqlen_q != seqlen_k path.
+            context = flash_attn_func(
+                query.permute(1, 0, 2, 3).contiguous(),
+                key.permute(1, 0, 2, 3).contiguous(),
+                value.permute(1, 0, 2, 3).contiguous(),
+                dropout_p=self.config.attention_dropout if self.training else 0.0,
+                softmax_scale=self._get_softmax_scale(),
+                causal=True,
+            )
+            context = context.permute(1, 0, 2, 3).contiguous()
+            return context.view(
+                context.size(0),
+                context.size(1),
+                self.num_attention_heads_per_partition * self.hidden_size_per_attention_head,
+            )
+        if self.armt_windowed_full_attn_backend != "native":
+            raise RuntimeError(
+                "ARMT windowed full-attention backend must be either 'flash_attn' or 'native'."
+            )
+
+        key, value = self._repeat_kv_for_gqa(key, value)
+        attn_mask = self._build_rectangular_causal_mask(query_len, key_len, query.device)
 
         if softmax_offset is None:
             context = F.scaled_dot_product_attention(

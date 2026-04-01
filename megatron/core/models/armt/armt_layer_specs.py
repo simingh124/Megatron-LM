@@ -39,6 +39,8 @@ def get_armt_layer_spec(
     tbptt_mode: bool = True,
     recurrent_chunk_size: Optional[int] = None,
     full_attn_window_size: Optional[int] = None,
+    armt_windowed_full_attn_backend: str = "native",
+    armt_equal_window_full_attn_path: str = "legacy",
     recurrent_memory_backend: str = "associative",
     recurrent_gdn_use_fla_kernel: bool = True,
     recurrent_gdn_use_causal_conv1d: bool = True,
@@ -91,6 +93,8 @@ def get_armt_layer_spec(
                 "num_mem_tokens": num_mem_tokens,
                 "recurrent_chunk_size": recurrent_chunk_size,
                 "full_attn_window_size": full_attn_window_size,
+                "armt_windowed_full_attn_backend": armt_windowed_full_attn_backend,
+                "armt_equal_window_full_attn_path": armt_equal_window_full_attn_path,
             },
         )
         base_spec = replace(
@@ -112,6 +116,8 @@ def get_armt_layer_spec(
             "tbptt_mode": tbptt_mode,
             "recurrent_chunk_size": recurrent_chunk_size,
             "full_attn_window_size": full_attn_window_size,
+            "armt_windowed_full_attn_backend": armt_windowed_full_attn_backend,
+            "armt_equal_window_full_attn_path": armt_equal_window_full_attn_path,
             "recurrent_memory_backend": recurrent_memory_backend,
             "recurrent_gdn_use_fla_kernel": recurrent_gdn_use_fla_kernel,
             "recurrent_gdn_use_causal_conv1d": recurrent_gdn_use_causal_conv1d,

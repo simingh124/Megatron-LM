@@ -10,6 +10,7 @@ import pytest
 from megatron.core.parallel_state import destroy_model_parallel, initialize_model_parallel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.module import Float16Module
 from megatron.core.models.armt.armt_model import ARMTModel
 from megatron.core.models.armt.armt_layer_specs import get_armt_layer_spec
 
@@ -25,6 +26,11 @@ requires_multi_gpu = pytest.mark.skipif(
 
 HAS_FLA = find_spec("fla") is not None
 HAS_CAUSAL_CONV1D = find_spec("causal_conv1d") is not None
+HAS_FLASH_ATTN = find_spec("flash_attn") is not None
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, Float16Module) else model
 
 
 def _init_distributed(world_size: int):
@@ -55,6 +61,9 @@ def _build_model(
     recurrent_memory_backend: str = "associative",
     recurrent_gdn_use_fla_kernel: bool = True,
     recurrent_gdn_use_causal_conv1d: bool = True,
+    armt_windowed_full_attn_backend: str = "native",
+    armt_equal_window_full_attn_path: str = "legacy",
+    params_dtype: torch.dtype = torch.float32,
 ):
     config = TransformerConfig(
         num_layers=2,
@@ -64,7 +73,7 @@ def _build_model(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=1,
         sequence_parallel=False,
-        params_dtype=torch.float32,
+        params_dtype=params_dtype,
     )
     config.position_embedding_type = "rope"
     config.multi_latent_attention = False
@@ -84,6 +93,8 @@ def _build_model(
         recurrent_memory_backend=recurrent_memory_backend,
         recurrent_gdn_use_fla_kernel=recurrent_gdn_use_fla_kernel,
         recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+        armt_windowed_full_attn_backend=armt_windowed_full_attn_backend,
+        armt_equal_window_full_attn_path=armt_equal_window_full_attn_path,
         recurrent_gdn_conv_kernel_size=2,
         recurrent_gdn_key_head_dim=16,
         recurrent_gdn_value_head_dim=16,
@@ -99,10 +110,19 @@ def _build_model(
         num_mem_tokens=4,
         recurrent_chunk_size=recurrent_chunk_size,
         full_attn_window_size=full_attn_window_size,
+        armt_equal_window_full_attn_path=armt_equal_window_full_attn_path,
         pre_process=True,
         post_process=True,
         parallel_output=True,
     )
+    if params_dtype == torch.float16:
+        config.fp16 = True
+        config.bf16 = False
+        model = Float16Module(config, model)
+    elif params_dtype == torch.bfloat16:
+        config.fp16 = False
+        config.bf16 = True
+        model = Float16Module(config, model)
     return model
 
 
@@ -138,8 +158,9 @@ def _run_single_step(
         recurrent_gdn_use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
     ).cuda()
     model.train()
-    model.set_current_chunk_is_first(True)
-    model.set_skip_read_memory_for_current_chunk(skip_read_memory_from_first_chunk)
+    runtime_model = _unwrap_model(model)
+    runtime_model.set_current_chunk_is_first(True)
+    runtime_model.set_skip_read_memory_for_current_chunk(skip_read_memory_from_first_chunk)
 
     batch_size = 2
     tokens = torch.randint(0, 32000, (batch_size, seq_len), device="cuda")
@@ -174,6 +195,9 @@ def _run_chunked_train_steps(
     recurrent_chunk_size: int,
     full_attn_window_size: int | None,
     steps: int = 10,
+    armt_windowed_full_attn_backend: str = "native",
+    armt_equal_window_full_attn_path: str = "legacy",
+    params_dtype: torch.dtype = torch.float32,
 ):
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
@@ -193,8 +217,12 @@ def _run_chunked_train_steps(
         full_attn_window_size=full_attn_window_size,
         recurrent_tbptt_mode=False,
         recurrent_memory_backend="associative",
+        armt_windowed_full_attn_backend=armt_windowed_full_attn_backend,
+        armt_equal_window_full_attn_path=armt_equal_window_full_attn_path,
+        params_dtype=params_dtype,
     ).cuda()
     model.train()
+    runtime_model = _unwrap_model(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     batch_size = 2
@@ -210,7 +238,7 @@ def _run_chunked_train_steps(
         labels = tokens.clone()
         loss_mask = torch.ones(batch_size, seq_len, device="cuda")
         optimizer.zero_grad(set_to_none=True)
-        model.reset_all_memory()
+        runtime_model.reset_all_memory()
         total_loss = None
         total_weighted_loss = None
         total_tokens = 0
@@ -228,9 +256,9 @@ def _run_chunked_train_steps(
                 diagonal=1,
             )
 
-            model.set_current_chunk_is_first(start == 0)
-            model.set_skip_read_memory_for_current_chunk(start == 0)
-            model.set_current_chunk_start_position(start)
+            runtime_model.set_current_chunk_is_first(start == 0)
+            runtime_model.set_skip_read_memory_for_current_chunk(start == 0)
+            runtime_model.set_current_chunk_start_position(start)
 
             chunk_loss = model(
                 chunk_tokens,
@@ -365,3 +393,48 @@ class TestARMTTraining:
         assert len(legacy_losses) == len(equal_window_losses) == 10
         for legacy_loss, equal_window_loss in zip(legacy_losses, equal_window_losses):
             assert torch.allclose(legacy_loss, equal_window_loss, atol=1e-5, rtol=1e-4)
+
+    @requires_gpu
+    def test_armt_equal_window_forced_window_path_10_step_losses_are_finite(self):
+        _init_distributed(world_size=1)
+        try:
+            losses = _run_chunked_train_steps(
+                recurrent_chunk_size=16,
+                full_attn_window_size=16,
+                steps=10,
+                armt_equal_window_full_attn_path="window",
+            )
+        finally:
+            _finalize_distributed()
+
+        assert len(losses) == 10
+        assert all(torch.isfinite(loss).item() for loss in losses)
+
+    @requires_gpu
+    @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="Need flash-attn for ARMT windowed backend test")
+    def test_armt_windowed_flash_attn_backend_matches_native_losses_over_10_steps(self):
+        params_dtype = (
+            torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+        )
+        _init_distributed(world_size=1)
+        try:
+            native_losses = _run_chunked_train_steps(
+                recurrent_chunk_size=16,
+                full_attn_window_size=32,
+                steps=10,
+                armt_windowed_full_attn_backend="native",
+                params_dtype=params_dtype,
+            )
+            flash_attn_losses = _run_chunked_train_steps(
+                recurrent_chunk_size=16,
+                full_attn_window_size=32,
+                steps=10,
+                armt_windowed_full_attn_backend="flash_attn",
+                params_dtype=params_dtype,
+            )
+        finally:
+            _finalize_distributed()
+
+        assert len(native_losses) == len(flash_attn_losses) == 10
+        for native_loss, flash_attn_loss in zip(native_losses, flash_attn_losses):
+            assert torch.allclose(native_loss, flash_attn_loss, atol=1e-3, rtol=1.5e-3)

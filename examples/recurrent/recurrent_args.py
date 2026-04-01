@@ -14,6 +14,8 @@ RECURRENT_DEFAULTS = {
     "use_recurrent_model_schedule": False,
     "recurrent_chunk_size": 512,
     "full_attn_window_size": None,
+    "armt_windowed_full_attn_backend": "native",
+    "armt_equal_window_full_attn_path": "legacy",
     "recurrent_tbptt_mode": True,
     "num_mem_tokens": 16,
     "no_read_memory_from_first_chunk": False,
@@ -61,6 +63,26 @@ def add_recurrent_args(parser):
             "Number of real tokens visible to full attention within a recurrent chunk. "
             "Defaults to recurrent_chunk_size. Values larger than recurrent_chunk_size "
             "enable overlapping full-attention windows across chunks."
+        ),
+    )
+    group.add_argument(
+        "--armt-windowed-full-attn-backend",
+        type=str,
+        default=RECURRENT_DEFAULTS["armt_windowed_full_attn_backend"],
+        choices=["flash_attn", "native"],
+        help=(
+            "Backend for ARMT decoupled windowed full attention when "
+            "full_attn_window_size > recurrent_chunk_size."
+        ),
+    )
+    group.add_argument(
+        "--armt-equal-window-full-attn-path",
+        type=str,
+        default=RECURRENT_DEFAULTS["armt_equal_window_full_attn_path"],
+        choices=["legacy", "window"],
+        help=(
+            "When full_attn_window_size == recurrent_chunk_size, keep the legacy TE attention "
+            "path or explicitly force the ARMT windowed-attention path."
         ),
     )
     group.add_argument(
@@ -224,7 +246,21 @@ def validate_recurrent_constraints(
             "full_attn_window_size must be greater than or equal to recurrent_chunk_size."
         )
 
-    using_windowed_full_attention = args.full_attn_window_size > args.recurrent_chunk_size
+    using_windowed_full_attention = (
+        args.full_attn_window_size > args.recurrent_chunk_size
+        or (
+            args.full_attn_window_size == args.recurrent_chunk_size
+            and args.armt_equal_window_full_attn_path == "window"
+        )
+    )
+    if args.armt_windowed_full_attn_backend not in ("flash_attn", "native"):
+        raise ValueError(
+            "armt_windowed_full_attn_backend must be either 'flash_attn' or 'native'."
+        )
+    if args.armt_equal_window_full_attn_path not in ("legacy", "window"):
+        raise ValueError(
+            "armt_equal_window_full_attn_path must be either 'legacy' or 'window'."
+        )
     if using_windowed_full_attention and args.recurrent_tbptt_mode:
         raise ValueError(
             "Decoupled ARMT full-attention windows currently require No-TBPTT "
@@ -233,6 +269,14 @@ def validate_recurrent_constraints(
     if using_windowed_full_attention and getattr(args, "sequence_parallel", False):
         raise ValueError(
             "Decoupled ARMT full-attention windows do not support sequence_parallel yet."
+        )
+    if (
+        using_windowed_full_attention
+        and args.armt_windowed_full_attn_backend == "flash_attn"
+        and find_spec("flash_attn") is None
+    ):
+        raise ImportError(
+            "armt_windowed_full_attn_backend='flash_attn' requires flash-attn to be installed."
         )
 
     if args.pipeline_model_parallel_size != 1:

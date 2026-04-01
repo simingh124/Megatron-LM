@@ -11,6 +11,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 
 from .armt_layer import ARMTLayer
 from .monitoring import finalize_metric_primitives, merge_metric_primitives
+from .windowed_attention_utils import should_use_windowed_full_attention
 
 
 class ARMTModel(GPTModel):
@@ -25,6 +26,7 @@ class ARMTModel(GPTModel):
         num_mem_tokens: int = 16,
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
+        armt_equal_window_full_attn_path: str = "legacy",
         **kwargs,
     ):
         super().__init__(
@@ -42,8 +44,11 @@ class ARMTModel(GPTModel):
             if full_attn_window_size is not None
             else self.recurrent_chunk_size
         )
-        self._use_windowed_full_attention = (
-            self.full_attn_window_size > self.recurrent_chunk_size
+        self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
+        self._use_windowed_full_attention = should_use_windowed_full_attention(
+            recurrent_chunk_size=self.recurrent_chunk_size,
+            full_attn_window_size=self.full_attn_window_size,
+            equal_window_full_attn_path=self.armt_equal_window_full_attn_path,
         )
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False

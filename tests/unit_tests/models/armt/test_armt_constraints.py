@@ -23,6 +23,8 @@ def _make_args(**overrides):
         recurrent_tbptt_mode=True,
         num_mem_tokens=16,
         sequence_parallel=False,
+        armt_windowed_full_attn_backend="native",
+        armt_equal_window_full_attn_path="legacy",
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -166,6 +168,22 @@ def test_armt_full_attn_window_size_flag_is_registered():
     assert args.full_attn_window_size == 1024
 
 
+def test_armt_windowed_full_attn_backend_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-windowed-full-attn-backend", "native"])
+
+    assert args.armt_windowed_full_attn_backend == "native"
+
+
+def test_armt_equal_window_full_attn_path_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-equal-window-full-attn-path", "window"])
+
+    assert args.armt_equal_window_full_attn_path == "window"
+
+
 def test_armt_legacy_schedule_flags_are_rejected():
     parser = argparse.ArgumentParser()
     add_armt_args(parser)
@@ -283,4 +301,91 @@ def test_gdn_use_causal_conv1d_requires_installed_package():
         side_effect=lambda name: None if name == "causal_conv1d" else object(),
     ):
         with pytest.raises(ImportError, match="causal_conv1d"):
+            validate_armt_constraints(args)
+
+
+def test_windowed_full_attn_backend_requires_valid_choice():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=512,
+        recurrent_tbptt_mode=False,
+        armt_windowed_full_attn_backend="invalid",
+    )
+
+    with pytest.raises(ValueError, match="armt_windowed_full_attn_backend"):
+        validate_armt_constraints(args)
+
+
+def test_windowed_flash_attn_backend_requires_installed_package():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=512,
+        recurrent_tbptt_mode=False,
+        armt_windowed_full_attn_backend="flash_attn",
+    )
+
+    with patch(
+        "examples.recurrent.recurrent_args.find_spec",
+        side_effect=lambda name: None if name == "flash_attn" else object(),
+    ):
+        with pytest.raises(ImportError, match="flash-attn"):
+            validate_armt_constraints(args)
+
+
+def test_windowed_native_backend_does_not_require_flash_attn_package():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=512,
+        recurrent_tbptt_mode=False,
+        armt_windowed_full_attn_backend="native",
+    )
+
+    with patch(
+        "examples.recurrent.recurrent_args.find_spec",
+        side_effect=lambda name: None if name == "flash_attn" else object(),
+    ):
+        validate_armt_constraints(args)
+
+
+def test_equal_window_does_not_require_flash_attn_package():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=256,
+        recurrent_tbptt_mode=True,
+        armt_windowed_full_attn_backend="flash_attn",
+    )
+
+    with patch(
+        "examples.recurrent.recurrent_args.find_spec",
+        side_effect=lambda name: None if name == "flash_attn" else object(),
+    ):
+        validate_armt_constraints(args)
+
+
+def test_equal_window_window_path_rejects_tbptt():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=256,
+        recurrent_tbptt_mode=True,
+        armt_equal_window_full_attn_path="window",
+    )
+
+    with pytest.raises(ValueError, match="No-TBPTT"):
+        validate_armt_constraints(args)
+
+
+def test_equal_window_window_path_requires_flash_attn_when_requested():
+    args = _make_args(
+        recurrent_chunk_size=256,
+        full_attn_window_size=256,
+        recurrent_tbptt_mode=False,
+        armt_windowed_full_attn_backend="flash_attn",
+        armt_equal_window_full_attn_path="window",
+    )
+
+    with patch(
+        "examples.recurrent.recurrent_args.find_spec",
+        side_effect=lambda name: None if name == "flash_attn" else object(),
+    ):
+        with pytest.raises(ImportError, match="flash-attn"):
             validate_armt_constraints(args)

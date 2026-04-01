@@ -3,8 +3,15 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.models.armt.armt_self_attention import ARMTSelfAttention
+
+
+requires_gpu = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA not available",
+)
 
 
 def _build_minimal_windowed_attention(
@@ -15,12 +22,14 @@ def _build_minimal_windowed_attention(
     num_mem_tokens: int,
     recurrent_chunk_size: int,
     full_attn_window_size: int,
+    backend: str = "native",
 ):
     attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
     torch.nn.Module.__init__(attention)
     attention.num_mem_tokens = num_mem_tokens
     attention.recurrent_chunk_size = recurrent_chunk_size
     attention.full_attn_window_size = full_attn_window_size
+    attention.armt_windowed_full_attn_backend = backend
     attention._use_windowed_full_attention = True
     attention._current_chunk_start_position = 0
     attention._history_key_cache = None
@@ -44,6 +53,30 @@ def _build_minimal_windowed_attention(
     return attention
 
 
+def test_equal_window_defaults_to_legacy_te_path():
+    attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.recurrent_chunk_size = 8
+    attention.full_attn_window_size = 8
+    attention.armt_equal_window_full_attn_path = "legacy"
+
+    ARMTSelfAttention._configure_windowed_full_attention_mode(attention)
+
+    assert attention._use_windowed_full_attention is False
+
+
+def test_equal_window_can_be_forced_onto_window_path():
+    attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.recurrent_chunk_size = 8
+    attention.full_attn_window_size = 8
+    attention.armt_equal_window_full_attn_path = "window"
+
+    ARMTSelfAttention._configure_windowed_full_attention_mode(attention)
+
+    assert attention._use_windowed_full_attention is True
+
+
 def test_windowed_attention_uses_scaled_dot_product_attention():
     seq_with_mem = 3
     batch_size = 1
@@ -59,6 +92,7 @@ def test_windowed_attention_uses_scaled_dot_product_attention():
         num_mem_tokens=1,
         recurrent_chunk_size=2,
         full_attn_window_size=4,
+        backend="native",
     )
 
     def _fake_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
@@ -91,6 +125,7 @@ def test_windowed_attention_history_update_defers_concatenation():
         num_mem_tokens=0,
         recurrent_chunk_size=2,
         full_attn_window_size=4,
+        backend="native",
     )
 
     attention._update_history_kv_cache(chunk_one, chunk_one)
@@ -112,6 +147,7 @@ def test_windowed_attention_history_selection_keeps_recent_real_tokens():
         num_mem_tokens=0,
         recurrent_chunk_size=2,
         full_attn_window_size=4,
+        backend="native",
     )
 
     attention._update_history_kv_cache(chunk_one, chunk_one)
@@ -140,6 +176,7 @@ def test_windowed_attention_matches_reference_softmax_path():
         num_mem_tokens=1,
         recurrent_chunk_size=2,
         full_attn_window_size=4,
+        backend="native",
     )
 
     output = attention._compute_windowed_attention(query, key, value)
@@ -167,3 +204,231 @@ def test_windowed_attention_matches_reference_softmax_path():
     ).reshape(seq_with_mem, batch_size, num_heads * head_dim)
 
     assert torch.allclose(output, reference_output, atol=1e-6, rtol=1e-5)
+
+
+@requires_gpu
+def test_windowed_attention_flash_backend_uses_flash_attn_func():
+    seq_with_mem = 3
+    batch_size = 1
+    num_heads = 2
+    head_dim = 4
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+    query = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
+    key = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
+    value = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda", dtype=dtype)
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="flash_attn",
+    )
+
+    def _fake_flash_attn(query, key, value, dropout_p=0.0, softmax_scale=None, causal=False):
+        del dropout_p, softmax_scale
+        assert causal is True
+        assert query.shape == (batch_size, seq_with_mem, num_heads, head_dim)
+        assert key.shape == (batch_size, seq_with_mem, num_heads, head_dim)
+        return torch.zeros_like(query)
+
+    with patch(
+        "megatron.core.models.armt.armt_self_attention._get_flash_attn_func",
+        return_value=_fake_flash_attn,
+    ) as flash_mock:
+        with patch(
+            "megatron.core.models.armt.armt_self_attention.F.scaled_dot_product_attention"
+        ) as sdpa_mock:
+            output, bias = attention.forward(
+                hidden_states=torch.randn(
+                    seq_with_mem,
+                    batch_size,
+                    num_heads * head_dim,
+                    device="cuda",
+                ),
+                attention_mask=None,
+            )
+
+    flash_mock.assert_called_once()
+    sdpa_mock.assert_not_called()
+    assert output.shape == (seq_with_mem, batch_size, num_heads * head_dim)
+    assert bias is None
+
+
+def test_windowed_attention_flash_backend_rejects_softmax_offset():
+    seq_with_mem = 3
+    batch_size = 1
+    num_heads = 2
+    head_dim = 4
+    query = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    key = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    value = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="flash_attn",
+    )
+    attention.core_attention = SimpleNamespace(softmax_offset=torch.tensor(0.0))
+
+    with pytest.raises(RuntimeError, match="softmax_offset"):
+        attention._compute_windowed_attention(query, key, value)
+
+
+def test_windowed_attention_flash_backend_rejects_cpu_tensors():
+    seq_with_mem = 3
+    batch_size = 1
+    num_heads = 2
+    head_dim = 4
+    query = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    key = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    value = torch.randn(seq_with_mem, batch_size, num_heads, head_dim)
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="flash_attn",
+    )
+
+    with pytest.raises(RuntimeError, match="requires CUDA tensors"):
+        attention._compute_windowed_attention(query, key, value)
+
+
+@requires_gpu
+def test_windowed_attention_flash_backend_rejects_fp32_tensors():
+    seq_with_mem = 3
+    batch_size = 1
+    num_heads = 2
+    head_dim = 4
+    query = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda")
+    key = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda")
+    value = torch.randn(seq_with_mem, batch_size, num_heads, head_dim, device="cuda")
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="flash_attn",
+    )
+
+    with pytest.raises(RuntimeError, match="requires fp16/bf16"):
+        attention._compute_windowed_attention(query, key, value)
+
+
+def test_windowed_attention_native_backend_repeats_kv_for_gqa():
+    seq_with_mem = 3
+    batch_size = 1
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_dim = 4
+    query = torch.randn(seq_with_mem, batch_size, num_query_heads, head_dim)
+    key = torch.randn(seq_with_mem, batch_size, num_kv_heads, head_dim)
+    value = torch.randn(seq_with_mem, batch_size, num_kv_heads, head_dim)
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="native",
+    )
+    attention.num_attention_heads_per_partition = num_query_heads
+    attention.num_query_groups_per_partition = num_kv_heads
+
+    def _fake_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
+        del attn_mask, dropout_p, is_causal, scale
+        assert query.shape == (batch_size, num_query_heads, seq_with_mem, head_dim)
+        assert key.shape == (batch_size, num_query_heads, seq_with_mem, head_dim)
+        assert value.shape == (batch_size, num_query_heads, seq_with_mem, head_dim)
+        return torch.zeros_like(query)
+
+    with patch(
+        "megatron.core.models.armt.armt_self_attention.F.scaled_dot_product_attention",
+        side_effect=_fake_sdpa,
+    ):
+        output = attention._compute_windowed_attention(query, key, value)
+
+    assert output.shape == (seq_with_mem, batch_size, num_query_heads * head_dim)
+
+
+@requires_gpu
+def test_windowed_attention_flash_backend_matches_reference_with_gqa():
+    seq_with_mem = 3
+    batch_size = 2
+    num_query_heads = 4
+    num_kv_heads = 2
+    head_dim = 8
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+    query = torch.randn(
+        seq_with_mem,
+        batch_size,
+        num_query_heads,
+        head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    key = torch.randn(
+        seq_with_mem,
+        batch_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    value = torch.randn(
+        seq_with_mem,
+        batch_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=dtype,
+    )
+    attention = _build_minimal_windowed_attention(
+        query=query,
+        key=key,
+        value=value,
+        num_mem_tokens=1,
+        recurrent_chunk_size=2,
+        full_attn_window_size=4,
+        backend="flash_attn",
+    )
+    attention.num_attention_heads_per_partition = num_query_heads
+    attention.num_query_groups_per_partition = num_kv_heads
+    attention.hidden_size_per_attention_head = head_dim
+
+    flash_output = attention._compute_windowed_attention(query, key, value)
+
+    scale = attention._get_softmax_scale()
+    repeated_key = key.repeat_interleave(num_query_heads // num_kv_heads, dim=2)
+    repeated_value = value.repeat_interleave(num_query_heads // num_kv_heads, dim=2)
+    reference_mask = attention._build_rectangular_causal_mask(
+        seq_with_mem,
+        seq_with_mem,
+        query.device,
+    )
+    reference_output = F.scaled_dot_product_attention(
+        query.permute(1, 2, 0, 3),
+        repeated_key.permute(1, 2, 0, 3),
+        repeated_value.permute(1, 2, 0, 3),
+        attn_mask=~reference_mask,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=scale,
+    ).permute(2, 0, 1, 3).contiguous()
+    reference_output = reference_output.view(
+        seq_with_mem,
+        batch_size,
+        num_query_heads * head_dim,
+    )
+
+    assert torch.allclose(flash_output.float(), reference_output.float(), atol=2e-3, rtol=2e-3)

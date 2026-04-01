@@ -32,6 +32,8 @@ class ARMTLayer(TransformerLayer):
         tbptt_mode: bool = True,
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
+        armt_windowed_full_attn_backend: str = "native",
+        armt_equal_window_full_attn_path: str = "legacy",
         recurrent_memory_backend: str = "associative",
         recurrent_gdn_use_fla_kernel: bool = True,
         recurrent_gdn_use_causal_conv1d: bool = True,
@@ -49,6 +51,8 @@ class ARMTLayer(TransformerLayer):
         self.full_attn_window_size = (
             full_attn_window_size if full_attn_window_size is not None else recurrent_chunk_size
         )
+        self.armt_windowed_full_attn_backend = armt_windowed_full_attn_backend
+        self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
         self.recurrent_memory_backend = recurrent_memory_backend
         self.associative_layer = None
         self.recurrent_memory_layer = None
