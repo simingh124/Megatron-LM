@@ -104,6 +104,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
+from megatron.training.pytorch_profiler_utils import build_pytorch_profiler_trace_handler
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -2034,8 +2035,12 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
-    should_log_to_tensorboard = bool(args.tensorboard_dir) and (
+    should_log_to_tensorboard = (
+        bool(args.tensorboard_dir)
+        and not getattr(args, "disable_tensorboard_writer", False)
+        and (
         iteration % args.tensorboard_log_interval == 0
+        )
     )
     if should_log_to_tensorboard:
         armt_reduce_group = None
@@ -2815,16 +2820,32 @@ def train(
         and torch.distributed.get_rank() in args.profile_ranks
         and args.use_pytorch_profiler
     ):
+        rank = torch.distributed.get_rank()
+        profiler_activities = [torch.profiler.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            profiler_activities.append(torch.profiler.ProfilerActivity.CUDA)
         prof = torch.profiler.profile(
+            activities=profiler_activities,
             schedule=torch.profiler.schedule(
                 wait=max(args.profile_step_start - 1, 0),
                 warmup=1 if args.profile_step_start > 0 else 0,
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-            record_shapes=True,
-            with_stack=True,
+            on_trace_ready=build_pytorch_profiler_trace_handler(
+                trace_dir=args.tensorboard_dir,
+                trace_format=args.pytorch_profiler_trace_format,
+                use_gzip=args.pytorch_profiler_gzip_traces,
+                profile_step_start=args.profile_step_start,
+                profile_step_end=args.profile_step_end,
+                rank=rank,
+            ),
+            record_shapes=args.pytorch_profiler_record_shapes,
+            profile_memory=False,
+            with_stack=args.pytorch_profiler_with_stack,
+            with_flops=False,
+            with_modules=False,
+            acc_events=False,
         )
         prof.start()
 

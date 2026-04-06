@@ -294,8 +294,13 @@ def tuple_type(x):
 
 def _apply_no_artifact_run_overrides(args):
     """Disable artifact-producing settings for non-persistent execution modes."""
+    keep_profiler_trace_dir = bool(
+        getattr(args, "profile", False)
+        and getattr(args, "use_pytorch_profiler", False)
+        and getattr(args, "tensorboard_dir", None)
+    )
+    setattr(args, "disable_tensorboard_writer", keep_profiler_trace_dir)
     overrides = {
-        "tensorboard_dir": None,
         "save": None,
         "save_interval": None,
         "save_retain_interval": None,
@@ -319,6 +324,8 @@ def _apply_no_artifact_run_overrides(args):
         "enable_one_logger": False,
         "save_config_filepath": None,
     }
+    if not keep_profiler_trace_dir:
+        overrides["tensorboard_dir"] = None
     for attr, value in overrides.items():
         setattr(args, attr, value)
 
@@ -360,16 +367,30 @@ def apply_param_stats_only_overrides(args):
 
 def validate_args(args, defaults={}):
     if apply_param_stats_only_overrides(args):
-        warn_rank_0(
-            "--param-stats-only enabled: disabling TensorBoard, persistent/external logging, "
-            "checkpointing, and gradient artifact saves."
-        )
+        if args.profile and args.use_pytorch_profiler and args.tensorboard_dir:
+            warn_rank_0(
+                "--param-stats-only enabled: disabling persistent/external logging, "
+                "checkpointing, TensorBoard scalar logging, and gradient artifact saves "
+                "while keeping --tensorboard-dir only as the PyTorch profiler trace directory."
+            )
+        else:
+            warn_rank_0(
+                "--param-stats-only enabled: disabling TensorBoard, persistent/external logging, "
+                "checkpointing, and gradient artifact saves."
+            )
 
     if apply_test_train_run_overrides(args):
-        warn_rank_0(
-            "--test-train-run enabled: disabling TensorBoard, persistent/external logging, "
-            "checkpointing, and gradient artifact saves."
-        )
+        if args.profile and args.use_pytorch_profiler and args.tensorboard_dir:
+            warn_rank_0(
+                "--test-train-run enabled: disabling persistent/external logging, checkpointing, "
+                "TensorBoard scalar logging, and gradient artifact saves while keeping "
+                "--tensorboard-dir only as the PyTorch profiler trace directory."
+            )
+        else:
+            warn_rank_0(
+                "--test-train-run enabled: disabling TensorBoard, persistent/external logging, "
+                "checkpointing, and gradient artifact saves."
+            )
 
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \

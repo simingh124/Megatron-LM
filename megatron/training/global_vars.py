@@ -173,6 +173,9 @@ def _set_tensorboard_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
                                    'tensorboard writer')
 
+    if getattr(args, 'disable_tensorboard_writer', False):
+        return
+
     if hasattr(args, 'tensorboard_dir') and \
        args.tensorboard_dir and args.rank == (args.world_size - 1):
         try:

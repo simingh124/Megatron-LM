@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass, field
+from typing import Literal
 
 @dataclass(kw_only=True)
 class RNGConfig:
@@ -41,6 +42,19 @@ class ProfilingConfig:
 
     profile_ranks: list[int] = field(default_factory=lambda: [0])
     """Global ranks to profile."""
+
+    pytorch_profiler_record_shapes: bool = False
+    """Record tensor shapes in PyTorch profiler traces."""
+
+    pytorch_profiler_with_stack: bool = False
+    """Record Python stack traces in PyTorch profiler traces."""
+
+    pytorch_profiler_gzip_traces: bool = False
+    """Write PyTorch profiler traces as gzip-compressed JSON."""
+
+    pytorch_profiler_trace_format: Literal["tensorboard", "perfetto"] = "tensorboard"
+    """PyTorch-profiler trace sink. 'perfetto' writes a direct Chrome/Perfetto JSON trace
+    under --tensorboard-dir instead of TensorBoard's trace naming."""
 
     record_memory_history: bool = False
     """Record memory history in last rank."""

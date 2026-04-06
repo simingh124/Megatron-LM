@@ -69,6 +69,30 @@ def test_validate_args_disables_artifact_outputs_for_test_train_run():
     assert args.replication_jump is None
 
 
+def test_validate_args_keeps_tensorboard_dir_for_pytorch_profiler_in_test_train_run():
+    args = validate_args(
+        _build_base_args(
+            test_train_run=True,
+            profile=True,
+            use_pytorch_profiler=True,
+            tensorboard_dir="/tmp/tensorboard",
+            save="/tmp/checkpoints",
+            save_interval=10,
+            log_progress=True,
+            config_logger_dir="/tmp/config_logger",
+            wandb_project="proj",
+        )
+    )
+
+    assert args.tensorboard_dir == "/tmp/tensorboard"
+    assert args.disable_tensorboard_writer is True
+    assert args.save is None
+    assert args.save_interval is None
+    assert args.log_progress is False
+    assert args.config_logger_dir == ""
+    assert args.wandb_project is None
+
+
 def test_validate_args_keeps_artifact_outputs_when_test_train_run_disabled():
     args = validate_args(
         _build_base_args(
@@ -106,6 +130,7 @@ def test_validate_args_keeps_artifact_outputs_when_test_train_run_disabled():
     assert args.non_persistent_ckpt_type == "global"
     assert args.non_persistent_save_interval == 3
     assert args.non_persistent_global_ckpt_dir == "/tmp/non_persistent"
+    assert not getattr(args, "disable_tensorboard_writer", False)
 
 
 def test_validate_args_rejects_checkpoint_conversion_for_test_train_run():
