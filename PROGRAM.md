@@ -27,6 +27,13 @@
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
 - `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.
 
+## Profiling With No-Artifact Modes
+- `--test-train-run` and `--param-stats-only` route through `megatron/training/arguments.py::_apply_no_artifact_run_overrides()`. If PyTorch profiler is enabled (`--profile --use-pytorch-profiler`), that override must preserve `tensorboard_dir`; the repo now reuses that path as the profiler trace directory for both TensorBoard-style exports and direct Perfetto JSON output.
+- For profiler/smoke launchers, keep the real token-derived `TRAIN_ITERS` defaults intact and cap the short run with `EXIT_INTERVAL` instead. Overriding `TRAIN_ITERS` for no-artifact verification is now treated as the wrong pattern for this repo.
+- Launcher-side `--tensorboard-dir` alone is not enough for this combination. When profiling smoke runs, verify the effective warning text mentions that `--tensorboard-dir` is being kept specifically as the PyTorch profiler trace directory.
+- For no-artifact runs that keep `tensorboard_dir` only for native-profiler export, also suppress Megatron's `SummaryWriter`; otherwise the same directory silently accumulates `events.out.tfevents*` side files even though the intended artifact is just the Perfetto trace.
+- The lightweight PyTorch-profiler path for this repo is now controlled by `--pytorch-profiler-record-shapes`, `--pytorch-profiler-with-stack`, `--pytorch-profiler-gzip-traces`, and `--pytorch-profiler-trace-format`. Keeping shapes/stacks disabled and using `perfetto` export preserves CPU op traces plus the GPU stream execution lanes (`kernel`, `gpu_memcpy`, `gpu_memset`) while dropping unrelated annotation/correlation payload from the final exported trace.
+
 ## ARMT Windowed Full Attention
 - Decoupled ARMT full attention is implemented in `megatron/core/models/armt/armt_self_attention.py`, not by changing Megatron's global sliding-window config. The layer caches only historical real-token K/V; historical memory-token K/V is intentionally excluded.
 - `full_attn_window_size == recurrent_chunk_size` is a deliberate legacy fast path. In that setting ARMT must fall back to the old non-overlap attention path to keep 10-step losses exactly aligned with the pre-change implementation.
