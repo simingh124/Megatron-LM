@@ -23,6 +23,8 @@ def _build_layer(**overrides):
         use_causal_conv1d=False,
         dtype=torch.float32,
         tbptt_mode=True,
+        use_input_pre_norm=False,
+        normalization="LayerNorm",
     )
     kwargs.update(overrides)
     return GatedDeltaNetMemory(**kwargs)
@@ -43,6 +45,26 @@ def test_gdn_memory_reset_and_first_chunk_returns_zero():
         layer.value_head_dim,
     )
     assert torch.allclose(retrieved, torch.zeros_like(retrieved), atol=1e-6)
+
+
+def test_gdn_memory_input_pre_norm_defaults_to_disabled():
+    layer = _build_layer()
+
+    assert layer.use_input_pre_norm is False
+    assert layer.input_pre_norm is None
+
+
+def test_gdn_memory_can_enable_input_pre_norm():
+    layer = _build_layer(use_input_pre_norm=True, normalization="RMSNorm")
+    batch_size = 2
+    layer.reset_memory(batch_size=batch_size)
+
+    layer.update_mem(torch.randn(batch_size, layer.num_mem_tokens, layer.d_model), input_is_sbh=False)
+    retrieved = layer.associate(torch.randn(batch_size, 6, layer.d_model), input_is_sbh=False)
+
+    assert isinstance(layer.input_pre_norm, torch.nn.RMSNorm)
+    assert retrieved.shape == (batch_size, 6, layer.d_model)
+    assert torch.isfinite(retrieved).all()
 
 
 def test_gdn_memory_tbptt_detaches_inputs_but_trains_backend_params():

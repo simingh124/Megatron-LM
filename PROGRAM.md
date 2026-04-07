@@ -23,10 +23,18 @@
 - For chunk-control tests, initialize `_skip_read_memory_for_current_chunk` and `_current_chunk_is_first` in the test double as well, so `reset_memory()` and first-chunk propagation tests match real-layer invariants.
 - For ARMT/RMT-scoped changes, default to targeted verification on the affected ARMT/RMT tests and the directly related training/plumbing tests. Do not routinely rerun unrelated baseline Megatron tests that are outside the ARMT/RMT change surface unless the edit clearly crosses those boundaries.
 
+## ARMT Memory Parameter Reporting
+- `megatron/training/training.py` does not know backend-specific memory modules. The printed memory-parameter summary is driven entirely by `model.get_memory_parameter_breakdown()`.
+- For ARMT, new recurrent memory backends automatically show up in the training-side memory summary if they are attached on each layer as `recurrent_memory_layer` and expose their trainable tensors through standard `nn.Module.parameters()`. No training-side special-case hook is needed.
+- ARMT now keeps the `modules:` table coarse-grained and prints runtime memory-state summaries separately before that table: `initial_slots` totals come from `CrossAttentionSlotMemory.initial_slots`; `W_mem` totals are single-sample (`batch=1`) logical memory-store sizes. For `AssociativeLayer`, use pre-DPFP width (`d_mem * head_dim` per head), not the expanded `d_key = 2 * nu * d_mem`, so the report stays comparable with other backends' memory storage.
+- ARMT recurrent backend head-dim decoupling is now projection-based: external hidden/state width stays `hidden_size`, while backend multi-head projection width may use explicit `head_dim`. If associative parameter shapes change, keep `examples/armt/tools/convert_baseline_to_armt.py` in sync with runtime shapes, especially `W_mv`, `W_mo`, and gated `W_mb`.
+
 ## Recurrent CLI Source of Truth
 - The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
 - `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.
+- `--recurrent-mem-qk-norm` is the single ARMT memory qk-norm switch. It must drive `gated_deltanet`, `associative`, and `cross_attn_slots`; avoid reintroducing older backend-specific names such as `recurrent_slot_qk_norm`.
+- Launcher env wiring mirrors the CLI name as `RECURRENT_MEM_QK_NORM`. Keep base launchers aligned with the code default (`false`), and put opt-in norm defaults only in explicit `*_w_norm.sh` variants together with `RECURRENT_MEMORY_INPUT_PRE_NORM=1`.
 
 ## Profiling With No-Artifact Modes
 - `--test-train-run` and `--param-stats-only` route through `megatron/training/arguments.py::_apply_no_artifact_run_overrides()`. If PyTorch profiler is enabled (`--profile --use-pytorch-profiler`), that override must preserve `tensorboard_dir`; the repo now reuses that path as the profiler trace directory for both TensorBoard-style exports and direct Perfetto JSON output.

@@ -1184,6 +1184,23 @@ def _collect_memory_parameter_breakdown(model):
     return has_memory_breakdown, list(breakdown_by_name.items())
 
 
+def _collect_memory_state_breakdown(model, batch_size: int = 1):
+    """Collect aggregated memory-state sizes from models that expose them."""
+    breakdown_by_name = OrderedDict()
+    has_memory_state_breakdown = False
+
+    for model_module in model:
+        getter = getattr(model_module, "get_memory_state_breakdown", None)
+        if getter is None:
+            continue
+
+        has_memory_state_breakdown = True
+        for name, count in getter(batch_size=batch_size):
+            breakdown_by_name[name] = breakdown_by_name.get(name, 0) + count
+
+    return has_memory_state_breakdown, list(breakdown_by_name.items())
+
+
 def _format_parameter_count_display(count: int) -> str:
     """Format a parameter count with optional K/M/B suffix for readability."""
     raw_count = f"{count:,}"
@@ -1242,6 +1259,7 @@ def _format_memory_parameter_report(
     *,
     total_model_parameters: int,
     breakdown,
+    memory_state_breakdown=None,
     tp_rank: int,
     pp_rank: int,
 ) -> str:
@@ -1255,6 +1273,12 @@ def _format_memory_parameter_report(
         f"   total memory params: {_format_parameter_count_display(total_memory_parameters)}",
         f"   memory / model params: {_format_percentage(total_memory_parameters, total_model_parameters)}",
     ]
+    if memory_state_breakdown:
+        for state_name, count in memory_state_breakdown:
+            lines.append(
+                f"   {state_name} state size (batch=1): "
+                f"{_format_parameter_count_display(count)}"
+            )
 
     if not breakdown:
         return "\n".join(lines)
@@ -1281,7 +1305,11 @@ def _format_memory_parameter_report(
 def _print_memory_parameter_breakdown(model, total_model_parameters, pg_collection):
     """Print memory parameter totals for ARMT/RMT models."""
     has_memory_breakdown, breakdown = _collect_memory_parameter_breakdown(model)
-    if not has_memory_breakdown:
+    has_memory_state_breakdown, memory_state_breakdown = _collect_memory_state_breakdown(
+        model,
+        batch_size=1,
+    )
+    if not has_memory_breakdown and not has_memory_state_breakdown:
         return
 
     if get_pg_rank(pg_collection.dp) != 0 or get_pg_rank(pg_collection.cp) != 0:
@@ -1291,6 +1319,7 @@ def _print_memory_parameter_breakdown(model, total_model_parameters, pg_collecti
         _format_memory_parameter_report(
             total_model_parameters=total_model_parameters,
             breakdown=breakdown,
+            memory_state_breakdown=memory_state_breakdown,
             tp_rank=get_pg_rank(pg_collection.tp),
             pp_rank=get_pg_rank(pg_collection.pp),
         ),

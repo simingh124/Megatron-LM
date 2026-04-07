@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
+from .norm_utils import build_recurrent_norm
 
 
 class DPFP(nn.Module):
@@ -35,12 +36,17 @@ class AssociativeLayer(nn.Module):
         num_mem_tokens: int = 16,
         d_mem: Optional[int] = None,
         n_heads: int = 1,
+        head_dim: Optional[int] = None,
         use_denom: bool = True,
         gating: bool = False,
         correction: bool = True,
         nu: int = 3,
         dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
+        use_qk_norm: bool = False,
+        use_input_pre_norm: bool = False,
+        normalization: str = "LayerNorm",
+        norm_epsilon: float = 1e-5,
         *,
         hidden_size: Optional[int] = None,
     ):
@@ -54,25 +60,47 @@ class AssociativeLayer(nn.Module):
         if d_mem is None:
             d_mem = d_model
 
+        if n_heads <= 0:
+            raise ValueError("n_heads must be > 0")
+        if d_mem % n_heads != 0:
+            raise ValueError("d_mem must be divisible by n_heads")
+        if head_dim is None:
+            if d_model % n_heads != 0:
+                raise ValueError("d_model must be divisible by n_heads when head_dim is omitted")
+            head_dim = d_model // n_heads
+        if head_dim <= 0:
+            raise ValueError("head_dim must be > 0")
+
         self.d_model = d_model
         self.num_mem_tokens = num_mem_tokens
         self.d_mem = d_mem
         self.n_heads = n_heads
+        self.head_dim = head_dim
         self.use_denom = use_denom
         self.gating = gating
         self.correction = correction
         self.nu = nu
         self.tbptt_mode = tbptt_mode
+        self.use_qk_norm = use_qk_norm
+        self.use_input_pre_norm = use_input_pre_norm
 
         self.d_key = 2 * nu * d_mem
+        self.value_dim = self.n_heads * self.head_dim
 
-        assert d_mem % n_heads == 0, "d_mem must be divisible by n_heads"
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.input_pre_norm = None
+        if self.use_input_pre_norm:
+            self.input_pre_norm = build_recurrent_norm(
+                d_model,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
 
         self.phi = DPFP(nu)
         self.W_mq = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
         self.W_mk = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
-        self.W_mv = nn.Linear(d_model, d_model, bias=False, dtype=dtype)
+        self.W_mv = nn.Linear(d_model, self.value_dim, bias=False, dtype=dtype)
+        self.W_mo = nn.Linear(self.value_dim, d_model, bias=False, dtype=dtype)
 
         # NOTE: Do not init to exact zeros. `W_mv` participates only through the
         # chunk-to-chunk memory state; if it's initialized to zeros, the memory update
@@ -81,7 +109,7 @@ class AssociativeLayer(nn.Module):
         nn.init.normal_(self.W_mv.weight, mean=0.0, std=1e-3)
 
         if gating:
-            self.W_mb = nn.Linear(d_model, d_model, dtype=dtype)
+            self.W_mb = nn.Linear(d_model, self.value_dim, dtype=dtype)
         else:
             self.W_mb = nn.Linear(d_model, n_heads, dtype=dtype)
 
@@ -115,6 +143,11 @@ class AssociativeLayer(nn.Module):
     @staticmethod
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
+
+    def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
+        # Report the logical single-sample memory store size before DPFP expansion.
+        w_mem_numel = batch_size * self.n_heads * (self.d_mem // self.n_heads) * self.head_dim
+        return [("W_mem", w_mem_numel)]
 
     def consume_monitoring_primitives(self):
         stats = self._monitoring_stats
@@ -181,7 +214,7 @@ class AssociativeLayer(nn.Module):
             batch_size,
             self.n_heads,
             self.d_key // self.n_heads,
-            self.d_model // self.n_heads,
+            self.head_dim,
         )
         expected_z_shape = (
             batch_size,
@@ -257,6 +290,8 @@ class AssociativeLayer(nn.Module):
         hidden_states = self._gather_if_tp(hidden_states)
         if hidden_states.dtype != self.W_mq.weight.dtype:
             hidden_states = hidden_states.to(dtype=self.W_mq.weight.dtype)
+        if self.input_pre_norm is not None:
+            hidden_states = self.input_pre_norm(hidden_states)
 
         self._maybe_initialize_memory(
             batch_size=hidden_states.shape[0], device=hidden_states.device
@@ -268,7 +303,8 @@ class AssociativeLayer(nn.Module):
         else:
             q = self._to_heads(self.W_mq(hidden_states))
             mq = self.phi(q)
-            mq = F.normalize(mq, dim=-1, p=2.0)
+            if self.use_qk_norm:
+                mq = F.normalize(mq, dim=-1, p=2.0)
 
             num = torch.einsum("bhsk,bhkd->bhsd", mq, self.W_mem)
             if self.use_denom:
@@ -277,7 +313,7 @@ class AssociativeLayer(nn.Module):
             else:
                 result = num
 
-            result = self._from_heads(result)
+            result = self.W_mo(self._from_heads(result))
 
         if should_track_read_metrics:
             hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
@@ -297,6 +333,8 @@ class AssociativeLayer(nn.Module):
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_mq.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_mq.weight.dtype)
+        if self.input_pre_norm is not None:
+            mem_tokens = self.input_pre_norm(mem_tokens)
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
@@ -308,7 +346,8 @@ class AssociativeLayer(nn.Module):
 
         k = self._to_heads(self.W_mk(mem_tokens))
         mk = self.phi(k)
-        mk = F.normalize(mk, dim=-1, p=2.0)
+        if self.use_qk_norm:
+            mk = F.normalize(mk, dim=-1, p=2.0)
 
         new_mv = self._to_heads(self.W_mv(mem_tokens))
 

@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from megatron.core.models.armt.armt_layer import ARMTLayer
+from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
 from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
@@ -307,3 +308,148 @@ class TestARMTLayer:
 
         assert layer.associative_layer is None
         assert isinstance(layer.recurrent_memory_layer, GatedDeltaNetMemory)
+
+    def test_armt_layer_can_build_associative_backend_with_explicit_head_dim(self, mock_config):
+        mock_config.hidden_size = 70
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                d_mem=64,
+                armt_n_heads=4,
+                armt_head_dim=6,
+            )
+
+        assert layer.recurrent_memory_layer is None
+        assert layer.associative_layer.head_dim == 6
+        assert layer.associative_layer.W_mv.out_features == 24
+
+    def test_armt_layer_can_build_cross_attention_slot_backend(self, mock_config):
+        mock_config.hidden_size = 70
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_memory_backend="cross_attn_slots",
+                recurrent_slot_num_slots=8,
+                recurrent_slot_num_heads=3,
+                recurrent_slot_head_dim=5,
+                recurrent_slot_read_attn_backend="sdpa",
+            )
+
+        assert layer.associative_layer is None
+        assert isinstance(layer.recurrent_memory_layer, CrossAttentionSlotMemory)
+        assert layer.recurrent_memory_layer.read_attn_backend == "sdpa"
+        assert layer.recurrent_memory_layer.W_read_q.out_features == 15
+
+    def test_armt_layer_passes_norm_switches_to_cross_attention_slot_backend(self, mock_config):
+        mock_config.hidden_size = 70
+        mock_config.normalization = "RMSNorm"
+        mock_config.layernorm_epsilon = 1e-6
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_memory_backend="cross_attn_slots",
+                recurrent_slot_num_slots=8,
+                recurrent_slot_num_heads=3,
+                recurrent_slot_head_dim=5,
+                recurrent_slot_read_attn_backend="sdpa",
+                recurrent_mem_qk_norm=True,
+                recurrent_memory_input_pre_norm=True,
+            )
+
+        assert layer.recurrent_memory_layer.use_qk_norm is True
+        assert layer.recurrent_memory_layer.use_input_pre_norm is True
+        assert isinstance(layer.recurrent_memory_layer.input_pre_norm, torch.nn.RMSNorm)
+
+    def test_armt_layer_passes_qk_norm_to_associative_backend(self, mock_config):
+        mock_config.hidden_size = 70
+        mock_config.normalization = "RMSNorm"
+        mock_config.layernorm_epsilon = 1e-6
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_mem_qk_norm=True,
+                recurrent_memory_input_pre_norm=True,
+                d_mem=64,
+                armt_n_heads=4,
+                armt_head_dim=6,
+            )
+
+        assert layer.associative_layer.use_qk_norm is True
+        assert layer.associative_layer.use_input_pre_norm is True
+
+    def test_armt_layer_passes_qk_norm_to_gdn_backend(self, mock_config):
+        mock_config.hidden_size = 64
+        mock_config.normalization = "RMSNorm"
+        mock_config.layernorm_epsilon = 1e-6
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_memory_backend="gated_deltanet",
+                recurrent_mem_qk_norm=False,
+                recurrent_memory_input_pre_norm=True,
+                recurrent_gdn_use_fla_kernel=False,
+                recurrent_gdn_use_causal_conv1d=False,
+                recurrent_gdn_conv_kernel_size=2,
+                recurrent_gdn_key_head_dim=16,
+                recurrent_gdn_value_head_dim=16,
+                recurrent_gdn_num_key_heads=4,
+                recurrent_gdn_num_value_heads=4,
+            )
+
+        assert layer.recurrent_memory_layer.use_qk_l2norm is False
+        assert layer.recurrent_memory_layer.use_input_pre_norm is True

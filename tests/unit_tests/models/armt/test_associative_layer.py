@@ -1,5 +1,6 @@
 import torch
 import pytest
+from unittest.mock import patch
 
 from megatron.core.models.armt.associative_layer import DPFP, AssociativeLayer
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
@@ -38,6 +39,138 @@ class TestAssociativeLayer:
             tbptt_mode=True,
         )
 
+    def test_associative_layer_accepts_explicit_head_dim_without_hidden_size_match(self):
+        layer = AssociativeLayer(
+            d_model=70,
+            d_mem=64,
+            n_heads=4,
+            head_dim=6,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+
+        retrieved = layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+
+        assert retrieved.shape == (batch_size, 8, layer.d_model)
+        assert layer.W_mem.shape == (
+            batch_size,
+            layer.n_heads,
+            layer.d_key // layer.n_heads,
+            layer.head_dim,
+        )
+
+    def test_associative_layer_input_pre_norm_defaults_to_disabled(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+
+        assert layer.use_input_pre_norm is False
+        assert layer.input_pre_norm is None
+
+    def test_associative_layer_qk_norm_defaults_to_disabled(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+
+        assert layer.use_qk_norm is False
+
+    def test_associative_layer_qk_norm_controls_normalize_calls(self):
+        batch_size = 2
+
+        disabled_layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+            use_qk_norm=False,
+        )
+        disabled_layer.reset_memory(batch_size)
+        disabled_layer._first_chunk = False
+
+        with patch(
+            "megatron.core.models.armt.associative_layer.F.normalize",
+            side_effect=lambda x, *args, **kwargs: x,
+        ) as normalize_mock:
+            disabled_layer.update_mem(
+                torch.randn(batch_size, disabled_layer.num_mem_tokens, disabled_layer.d_model),
+                input_is_sbh=False,
+            )
+            disabled_layer.associate(
+                torch.randn(batch_size, 8, disabled_layer.d_model),
+                input_is_sbh=False,
+            )
+
+        assert normalize_mock.call_count == 0
+
+        enabled_layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+            use_qk_norm=True,
+        )
+        enabled_layer.reset_memory(batch_size)
+        enabled_layer._first_chunk = False
+
+        with patch(
+            "megatron.core.models.armt.associative_layer.F.normalize",
+            side_effect=lambda x, *args, **kwargs: x,
+        ) as normalize_mock:
+            enabled_layer.update_mem(
+                torch.randn(batch_size, enabled_layer.num_mem_tokens, enabled_layer.d_model),
+                input_is_sbh=False,
+            )
+            enabled_layer.associate(
+                torch.randn(batch_size, 8, enabled_layer.d_model),
+                input_is_sbh=False,
+            )
+
+        assert normalize_mock.call_count == 2
+
+    def test_associative_layer_can_enable_input_pre_norm(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+            use_input_pre_norm=True,
+            normalization="RMSNorm",
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        retrieved = layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+
+        assert isinstance(layer.input_pre_norm, torch.nn.RMSNorm)
+        assert retrieved.shape == (batch_size, 8, layer.d_model)
+        assert torch.isfinite(retrieved).all()
+
     def test_associative_layer_reset(self, layer):
         """验证 reset_memory 会按 batch 维度初始化/清零 W_mem 与 z。"""
         batch_size = 2
@@ -48,6 +181,21 @@ class TestAssociativeLayer:
         assert torch.allclose(layer.W_mem, torch.zeros_like(layer.W_mem))
         assert torch.allclose(layer.z, torch.zeros_like(layer.z))
         assert layer.W_mem.shape[0] == batch_size
+
+    def test_memory_state_breakdown_uses_pre_dpfp_memory_width(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            head_dim=6,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+        )
+
+        assert layer.get_memory_state_breakdown(batch_size=1) == [
+            ("W_mem", layer.n_heads * (layer.d_mem // layer.n_heads) * layer.head_dim)
+        ]
 
     def test_associative_layer_associate_first_chunk(self, layer):
         """验证首个 chunk（memory 为空）时 associate 返回全零检索结果。"""
@@ -216,6 +364,7 @@ class TestAssociativeLayer:
             d_model=128,
             d_mem=64,
             n_heads=4,
+            head_dim=16,
             nu=4,
             use_denom=False,
             tbptt_mode=True,

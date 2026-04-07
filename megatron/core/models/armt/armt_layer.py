@@ -25,6 +25,7 @@ class ARMTLayer(TransformerLayer):
         num_mem_tokens: int = 16,
         d_mem: Optional[int] = None,
         armt_n_heads: int = 1,
+        armt_head_dim: Optional[int] = None,
         nu: int = 3,
         use_denom: bool = True,
         gating: bool = False,
@@ -42,6 +43,12 @@ class ARMTLayer(TransformerLayer):
         recurrent_gdn_value_head_dim: Optional[int] = None,
         recurrent_gdn_num_key_heads: Optional[int] = None,
         recurrent_gdn_num_value_heads: Optional[int] = None,
+        recurrent_slot_num_slots: Optional[int] = None,
+        recurrent_slot_num_heads: Optional[int] = None,
+        recurrent_slot_head_dim: Optional[int] = None,
+        recurrent_slot_read_attn_backend: str = "flash",
+        recurrent_mem_qk_norm: bool = False,
+        recurrent_memory_input_pre_norm: bool = False,
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
@@ -62,6 +69,9 @@ class ARMTLayer(TransformerLayer):
             "num_mem_tokens": num_mem_tokens,
             "dtype": getattr(config, "params_dtype", torch.bfloat16),
             "tbptt_mode": tbptt_mode,
+            "normalization": getattr(config, "normalization", "LayerNorm"),
+            "norm_epsilon": getattr(config, "layernorm_epsilon", 1e-5),
+            "use_input_pre_norm": recurrent_memory_input_pre_norm,
         }
 
         if recurrent_memory_backend == "associative":
@@ -69,10 +79,22 @@ class ARMTLayer(TransformerLayer):
                 recurrent_memory_backend,
                 d_mem=d_mem or config.hidden_size,
                 n_heads=armt_n_heads,
+                head_dim=armt_head_dim,
                 use_denom=use_denom,
                 gating=gating,
                 correction=correction,
                 nu=nu,
+                use_qk_norm=recurrent_mem_qk_norm,
+                **common_kwargs,
+            )
+        elif recurrent_memory_backend == "cross_attn_slots":
+            self.recurrent_memory_layer = build_recurrent_memory_backend(
+                recurrent_memory_backend,
+                num_slots=recurrent_slot_num_slots or num_mem_tokens,
+                num_heads=recurrent_slot_num_heads or 1,
+                head_dim=recurrent_slot_head_dim,
+                read_attn_backend=recurrent_slot_read_attn_backend,
+                use_qk_norm=recurrent_mem_qk_norm,
                 **common_kwargs,
             )
         else:
@@ -85,6 +107,7 @@ class ARMTLayer(TransformerLayer):
                 num_value_heads=recurrent_gdn_num_value_heads,
                 use_fla_kernel=recurrent_gdn_use_fla_kernel,
                 use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
+                use_qk_l2norm=recurrent_mem_qk_norm,
                 **common_kwargs,
             )
         self._skip_read_memory_for_current_chunk = False

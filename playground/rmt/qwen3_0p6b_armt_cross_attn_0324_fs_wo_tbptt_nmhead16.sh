@@ -1,14 +1,20 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B ARMT training from scratch.
+# Qwen3-0.6B ARMT training from scratch with cross-attention slot recurrent memory backend.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_armt_0315.sh
+# - playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt.sh
 #
 # Difference from the reference:
-# - No --load / --no-load-optim / --no-load-rng.
-# - ARMT and backbone params are initialized from scratch.
+# - Replace the GDN recurrent memory backend with cross-attention slots.
+# - This launcher is scoped to the cross-attention memory backend only and does
+#   not expose associative-memory-only ARMT hyperparameters.
+# - Expose launcher switches for:
+#   - RECURRENT_SLOT_NUM_SLOTS
+#   - RECURRENT_SLOT_NUM_HEADS
+#   - RECURRENT_SLOT_HEAD_DIM
+#   - RECURRENT_SLOT_READ_ATTN_BACKEND
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -24,14 +30,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
-ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-1}
+ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
 
-USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
-OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
-OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
-USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
+USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
+USE_NCCL_UB=${USE_NCCL_UB:-0}
 
-LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
+LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
@@ -136,11 +142,15 @@ ROTARY_PERCENT=1.0
 NORM_EPS=1e-6
 
 # ========== ARMT mechanism parameters ==========
-NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-16}
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-64}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
-ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
+
+RECURRENT_SLOT_NUM_SLOTS=${RECURRENT_SLOT_NUM_SLOTS:-64}
+RECURRENT_SLOT_NUM_HEADS=${RECURRENT_SLOT_NUM_HEADS:-16}
+RECURRENT_SLOT_HEAD_DIM=${RECURRENT_SLOT_HEAD_DIM:-64}
+RECURRENT_SLOT_READ_ATTN_BACKEND=${RECURRENT_SLOT_READ_ATTN_BACKEND:-flash}
 
 # ========== Training parameters ==========
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
@@ -215,7 +225,11 @@ ARMT_ARGS=(
   --use-recurrent-model-schedule
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
-  --armt-n-heads ${ARMT_N_HEADS}
+  --recurrent-memory-backend cross_attn_slots
+  --recurrent-slot-num-slots ${RECURRENT_SLOT_NUM_SLOTS}
+  --recurrent-slot-num-heads ${RECURRENT_SLOT_NUM_HEADS}
+  --recurrent-slot-head-dim ${RECURRENT_SLOT_HEAD_DIM}
+  --recurrent-slot-read-attn-backend ${RECURRENT_SLOT_READ_ATTN_BACKEND}
 )
 if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
   ARMT_ARGS+=(--no-read-memory-from-first-chunk)
@@ -304,6 +318,10 @@ echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
+echo "RECURRENT_SLOT_NUM_SLOTS=${RECURRENT_SLOT_NUM_SLOTS}"
+echo "RECURRENT_SLOT_NUM_HEADS=${RECURRENT_SLOT_NUM_HEADS}"
+echo "RECURRENT_SLOT_HEAD_DIM=${RECURRENT_SLOT_HEAD_DIM}"
+echo "RECURRENT_SLOT_READ_ATTN_BACKEND=${RECURRENT_SLOT_READ_ATTN_BACKEND}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"

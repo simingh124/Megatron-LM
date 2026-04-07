@@ -24,6 +24,15 @@ def add_armt_args(parser):
         help="Number of heads for memory operations",
     )
     group.add_argument(
+        "--armt-head-dim",
+        type=int,
+        default=None,
+        help=(
+            "Optional per-head value/read dimension for associative memory. "
+            "Defaults to hidden_size // armt_n_heads when omitted."
+        ),
+    )
+    group.add_argument(
         "--armt-nu",
         type=int,
         default=3,
@@ -60,6 +69,23 @@ def add_armt_args(parser):
 def validate_armt_constraints(args):
     if not hasattr(args, "no_read_memory_from_first_chunk"):
         args.no_read_memory_from_first_chunk = True
+    armt_n_heads = getattr(args, "armt_n_heads", 1)
+    if armt_n_heads <= 0:
+        raise ValueError("armt_n_heads must be > 0")
+
+    armt_head_dim = getattr(args, "armt_head_dim", None)
+    if armt_head_dim is not None and armt_head_dim <= 0:
+        raise ValueError("armt_head_dim must be > 0")
+
+    hidden_size = getattr(args, "hidden_size", None)
+    d_mem = getattr(args, "armt_d_mem", None)
+    effective_d_mem = hidden_size if d_mem is None else d_mem
+    if effective_d_mem is not None and effective_d_mem % armt_n_heads != 0:
+        raise ValueError("armt_d_mem (or hidden_size when omitted) must be divisible by armt_n_heads")
+
+    if armt_head_dim is None and hidden_size is not None and hidden_size % armt_n_heads != 0:
+        raise ValueError("hidden_size must be divisible by armt_n_heads when armt_head_dim is omitted")
+
     return validate_recurrent_constraints(
         args,
         model_name="ARMT",

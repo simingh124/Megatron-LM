@@ -1,5 +1,6 @@
 """Shared recurrent training arguments and validation helpers."""
 
+import argparse
 from argparse import Namespace
 from importlib.util import find_spec
 from typing import Any
@@ -28,6 +29,12 @@ RECURRENT_DEFAULTS = {
     "recurrent_gdn_value_head_dim": None,
     "recurrent_gdn_num_key_heads": None,
     "recurrent_gdn_num_value_heads": None,
+    "recurrent_slot_num_slots": None,
+    "recurrent_slot_num_heads": None,
+    "recurrent_slot_head_dim": None,
+    "recurrent_slot_read_attn_backend": "flash",
+    "recurrent_mem_qk_norm": False,
+    "recurrent_memory_input_pre_norm": False,
 }
 
 
@@ -132,7 +139,7 @@ def add_recurrent_args(parser):
     )
     group.add_argument(
         "--recurrent-memory-backend",
-        choices=["associative", "gated_deltanet"],
+        choices=["associative", "gated_deltanet", "cross_attn_slots"],
         default=RECURRENT_DEFAULTS["recurrent_memory_backend"],
         help="Recurrent memory backend used inside ARMT layers.",
     )
@@ -191,6 +198,42 @@ def add_recurrent_args(parser):
         type=int,
         default=RECURRENT_DEFAULTS["recurrent_gdn_num_value_heads"],
         help="Number of value heads for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-slot-num-slots",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_slot_num_slots"],
+        help="Number of persistent memory slots for the cross_attn_slots backend.",
+    )
+    group.add_argument(
+        "--recurrent-slot-num-heads",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_slot_num_heads"],
+        help="Number of attention heads for the cross_attn_slots backend.",
+    )
+    group.add_argument(
+        "--recurrent-slot-head-dim",
+        type=int,
+        default=RECURRENT_DEFAULTS["recurrent_slot_head_dim"],
+        help="Optional per-head dimension for the cross_attn_slots backend.",
+    )
+    group.add_argument(
+        "--recurrent-slot-read-attn-backend",
+        choices=["sdpa", "flash"],
+        default=RECURRENT_DEFAULTS["recurrent_slot_read_attn_backend"],
+        help="Read-path attention backend for the cross_attn_slots backend.",
+    )
+    group.add_argument(
+        "--recurrent-mem-qk-norm",
+        action=argparse.BooleanOptionalAction,
+        default=RECURRENT_DEFAULTS["recurrent_mem_qk_norm"],
+        help="Apply backend-specific QK normalization inside the active recurrent memory backend.",
+    )
+    group.add_argument(
+        "--recurrent-memory-input-pre-norm",
+        action=argparse.BooleanOptionalAction,
+        default=RECURRENT_DEFAULTS["recurrent_memory_input_pre_norm"],
+        help="Apply input pre-norm before recurrent memory associate()/update_mem() projections.",
     )
     return parser
 
@@ -353,6 +396,37 @@ def validate_recurrent_constraints(
         if args.recurrent_gdn_use_causal_conv1d and find_spec("causal_conv1d") is None:
             raise ImportError(
                 "recurrent_gdn_use_causal_conv1d=True requires causal_conv1d to be installed."
+            )
+
+    if args.recurrent_memory_backend == "cross_attn_slots":
+        required_fields = (
+            "recurrent_slot_num_slots",
+            "recurrent_slot_num_heads",
+        )
+        missing = [field for field in required_fields if getattr(args, field, None) is None]
+        if missing:
+            raise ValueError(
+                "cross_attn_slots backend requires explicit recurrent slot hyperparameters: "
+                + ", ".join(missing)
+            )
+
+        if args.recurrent_slot_num_slots <= 0:
+            raise ValueError("recurrent_slot_num_slots must be > 0")
+        if args.recurrent_slot_num_heads <= 0:
+            raise ValueError("recurrent_slot_num_heads must be > 0")
+
+        hidden_size = getattr(args, "hidden_size", None)
+        if args.recurrent_slot_head_dim is not None:
+            if args.recurrent_slot_head_dim <= 0:
+                raise ValueError("recurrent_slot_head_dim must be > 0")
+        elif hidden_size is not None and hidden_size % args.recurrent_slot_num_heads != 0:
+            raise ValueError(
+                "hidden_size must be divisible by recurrent_slot_num_heads when head_dim is omitted"
+            )
+
+        if args.recurrent_slot_read_attn_backend not in ("sdpa", "flash"):
+            raise ValueError(
+                "recurrent_slot_read_attn_backend must be one of ('sdpa', 'flash')"
             )
 
     return args

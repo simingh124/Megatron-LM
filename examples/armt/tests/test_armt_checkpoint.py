@@ -87,3 +87,26 @@ def test_baseline_to_armt_conversion():
             armt_state["decoder.layers.0.associative_layer.W_mv.weight"],
             torch.zeros(hidden_size, hidden_size),
         )
+
+
+def test_baseline_to_armt_conversion_supports_explicit_head_dim():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hidden_size = 32
+        baseline = _write_baseline(tmpdir, hidden_size)
+        armt_path = os.path.join(tmpdir, "armt.pt")
+
+        config = ARMTCheckpointConfig(
+            num_mem_tokens=4,
+            hidden_size=hidden_size,
+            num_layers=1,
+            d_mem=30,
+            armt_n_heads=3,
+            armt_head_dim=5,
+            gating=True,
+        )
+        convert_baseline_to_armt(baseline, armt_path, config)
+
+        armt_state = torch.load(armt_path, map_location="cpu")
+        assert armt_state["decoder.layers.0.associative_layer.W_mv.weight"].shape == (15, hidden_size)
+        assert armt_state["decoder.layers.0.associative_layer.W_mo.weight"].shape == (hidden_size, 15)
+        assert armt_state["decoder.layers.0.associative_layer.W_mb.weight"].shape == (15, hidden_size)
