@@ -18,3 +18,19 @@ def test_cross_attn_launcher_only_uses_cross_attn_memory_hyperparameters():
     assert "${RECURRENT_SLOT_NUM_HEADS}" in script
     assert "RECURRENT_SLOT_READ_ATTN_BACKEND=${RECURRENT_SLOT_READ_ATTN_BACKEND:-flash}" in script
     assert "--recurrent-slot-read-attn-backend ${RECURRENT_SLOT_READ_ATTN_BACKEND}" in script
+
+
+def test_cross_attn_w_norm_launcher_has_norm_defaults_and_resume_switch():
+    script = (
+        REPO_ROOT
+        / "playground"
+        / "rmt"
+        / "qwen3_0p6b_armt_cross_attn_0324_fs_wo_tbptt_w_norm.sh"
+    ).read_text()
+
+    assert "RECURRENT_MEM_QK_NORM=${RECURRENT_MEM_QK_NORM:-1}" in script
+    assert "RECURRENT_MEMORY_INPUT_PRE_NORM=${RECURRENT_MEMORY_INPUT_PRE_NORM:-1}" in script
+    assert "--recurrent-mem-qk-norm" in script
+    assert "--recurrent-memory-input-pre-norm" in script
+    assert 'if [[ "${ENABLE_RESUME}" == "1" ]]; then' in script
+    assert 'CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")' in script
