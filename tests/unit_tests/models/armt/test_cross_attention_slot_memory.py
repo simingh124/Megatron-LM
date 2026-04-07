@@ -15,6 +15,9 @@ def _build_layer(**overrides):
         dtype=torch.float32,
         tbptt_mode=True,
         read_attn_backend="sdpa",
+        use_qk_norm=False,
+        use_input_pre_norm=False,
+        normalization="LayerNorm",
     )
     kwargs.update(overrides)
     return CrossAttentionSlotMemory(**kwargs)
@@ -31,6 +34,50 @@ def test_cross_attention_slot_memory_defaults_read_backend_to_flash():
     )
 
     assert layer.read_attn_backend == "flash"
+
+
+def test_cross_attention_slot_memory_norm_switches_default_to_disabled():
+    layer = _build_layer()
+
+    assert layer.use_qk_norm is False
+    assert layer.use_input_pre_norm is False
+    assert layer.input_pre_norm is None
+    assert layer.read_q_norm is None
+    assert layer.read_k_norm is None
+    assert layer.write_q_norm is None
+    assert layer.write_k_norm is None
+
+
+def test_cross_attention_slot_memory_can_enable_norm_switches():
+    layer = _build_layer(
+        use_qk_norm=True,
+        use_input_pre_norm=True,
+        normalization="RMSNorm",
+    )
+
+    assert layer.use_qk_norm is True
+    assert layer.use_input_pre_norm is True
+    assert isinstance(layer.input_pre_norm, torch.nn.RMSNorm)
+    assert isinstance(layer.read_q_norm, torch.nn.RMSNorm)
+    assert isinstance(layer.read_k_norm, torch.nn.RMSNorm)
+    assert isinstance(layer.write_q_norm, torch.nn.RMSNorm)
+    assert isinstance(layer.write_k_norm, torch.nn.RMSNorm)
+
+
+def test_cross_attention_slot_memory_norm_switches_preserve_shape_and_finiteness():
+    layer = _build_layer(
+        use_qk_norm=True,
+        use_input_pre_norm=True,
+        normalization="RMSNorm",
+    )
+    batch_size = 2
+    layer.reset_memory(batch_size=batch_size)
+
+    layer.update_mem(torch.randn(batch_size, layer.num_mem_tokens, layer.d_model), input_is_sbh=False)
+    retrieved = layer.associate(torch.randn(batch_size, 6, layer.d_model), input_is_sbh=False)
+
+    assert retrieved.shape == (batch_size, 6, layer.d_model)
+    assert torch.isfinite(retrieved).all()
 
 
 def test_cross_attention_slot_memory_reset_and_first_chunk_returns_zero():

@@ -97,6 +97,8 @@ def model_provider(
         recurrent_slot_num_heads=args.recurrent_slot_num_heads,
         recurrent_slot_head_dim=args.recurrent_slot_head_dim,
         recurrent_slot_read_attn_backend=args.recurrent_slot_read_attn_backend,
+        recurrent_mem_qk_norm=args.recurrent_mem_qk_norm,
+        recurrent_memory_input_pre_norm=args.recurrent_memory_input_pre_norm,
     )
 
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)

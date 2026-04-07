@@ -1,5 +1,6 @@
 """Shared recurrent training arguments and validation helpers."""
 
+import argparse
 from argparse import Namespace
 from importlib.util import find_spec
 from typing import Any
@@ -29,6 +30,8 @@ RECURRENT_DEFAULTS = {
     "recurrent_slot_num_heads": None,
     "recurrent_slot_head_dim": None,
     "recurrent_slot_read_attn_backend": "flash",
+    "recurrent_mem_qk_norm": False,
+    "recurrent_memory_input_pre_norm": False,
 }
 
 
@@ -186,6 +189,18 @@ def add_recurrent_args(parser):
         choices=["sdpa", "flash"],
         default=RECURRENT_DEFAULTS["recurrent_slot_read_attn_backend"],
         help="Read-path attention backend for the cross_attn_slots backend.",
+    )
+    group.add_argument(
+        "--recurrent-mem-qk-norm",
+        action=argparse.BooleanOptionalAction,
+        default=RECURRENT_DEFAULTS["recurrent_mem_qk_norm"],
+        help="Apply backend-specific QK normalization inside the active recurrent memory backend.",
+    )
+    group.add_argument(
+        "--recurrent-memory-input-pre-norm",
+        action=argparse.BooleanOptionalAction,
+        default=RECURRENT_DEFAULTS["recurrent_memory_input_pre_norm"],
+        help="Apply input pre-norm before recurrent memory associate()/update_mem() projections.",
     )
     return parser
 

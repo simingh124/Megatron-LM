@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
+from .norm_utils import build_recurrent_norm
 
 
 class DPFP(nn.Module):
@@ -42,6 +43,10 @@ class AssociativeLayer(nn.Module):
         nu: int = 3,
         dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
+        use_qk_norm: bool = False,
+        use_input_pre_norm: bool = False,
+        normalization: str = "LayerNorm",
+        norm_epsilon: float = 1e-5,
         *,
         hidden_size: Optional[int] = None,
     ):
@@ -76,9 +81,20 @@ class AssociativeLayer(nn.Module):
         self.correction = correction
         self.nu = nu
         self.tbptt_mode = tbptt_mode
+        self.use_qk_norm = use_qk_norm
+        self.use_input_pre_norm = use_input_pre_norm
 
         self.d_key = 2 * nu * d_mem
         self.value_dim = self.n_heads * self.head_dim
+
+        self.input_pre_norm = None
+        if self.use_input_pre_norm:
+            self.input_pre_norm = build_recurrent_norm(
+                d_model,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
 
         self.phi = DPFP(nu)
         self.W_mq = nn.Linear(d_model, d_mem, bias=False, dtype=dtype)
@@ -274,6 +290,8 @@ class AssociativeLayer(nn.Module):
         hidden_states = self._gather_if_tp(hidden_states)
         if hidden_states.dtype != self.W_mq.weight.dtype:
             hidden_states = hidden_states.to(dtype=self.W_mq.weight.dtype)
+        if self.input_pre_norm is not None:
+            hidden_states = self.input_pre_norm(hidden_states)
 
         self._maybe_initialize_memory(
             batch_size=hidden_states.shape[0], device=hidden_states.device
@@ -285,7 +303,8 @@ class AssociativeLayer(nn.Module):
         else:
             q = self._to_heads(self.W_mq(hidden_states))
             mq = self.phi(q)
-            mq = F.normalize(mq, dim=-1, p=2.0)
+            if self.use_qk_norm:
+                mq = F.normalize(mq, dim=-1, p=2.0)
 
             num = torch.einsum("bhsk,bhkd->bhsd", mq, self.W_mem)
             if self.use_denom:
@@ -314,6 +333,8 @@ class AssociativeLayer(nn.Module):
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_mq.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_mq.weight.dtype)
+        if self.input_pre_norm is not None:
+            mem_tokens = self.input_pre_norm(mem_tokens)
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
@@ -325,7 +346,8 @@ class AssociativeLayer(nn.Module):
 
         k = self._to_heads(self.W_mk(mem_tokens))
         mk = self.phi(k)
-        mk = F.normalize(mk, dim=-1, p=2.0)
+        if self.use_qk_norm:
+            mk = F.normalize(mk, dim=-1, p=2.0)
 
         new_mv = self._to_heads(self.W_mv(mem_tokens))
 

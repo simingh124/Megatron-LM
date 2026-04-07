@@ -13,6 +13,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from megatron.core import parallel_state, tensor_parallel
 
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
+from .norm_utils import build_recurrent_norm
 
 _ATTN_EPSILON = 1e-5
 _ENTROPY_EPSILON = 1e-8
@@ -32,6 +33,10 @@ class CrossAttentionSlotMemory(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
         read_attn_backend: str = "flash",
+        use_qk_norm: bool = False,
+        use_input_pre_norm: bool = False,
+        normalization: str = "LayerNorm",
+        norm_epsilon: float = 1e-5,
         *,
         hidden_size: Optional[int] = None,
     ):
@@ -63,6 +68,8 @@ class CrossAttentionSlotMemory(nn.Module):
         self.head_dim = head_dim
         self.tbptt_mode = tbptt_mode
         self.read_attn_backend = read_attn_backend
+        self.use_qk_norm = use_qk_norm
+        self.use_input_pre_norm = use_input_pre_norm
 
         projection_size = self.num_heads * self.head_dim
         self.W_read_q = nn.Linear(d_model, projection_size, bias=False, dtype=dtype)
@@ -76,6 +83,45 @@ class CrossAttentionSlotMemory(nn.Module):
         self.W_write_o = nn.Linear(projection_size, d_model, bias=False, dtype=dtype)
         self.W_gate = nn.Linear(2 * d_model, d_model, bias=True, dtype=dtype)
         self.slot_norm = nn.LayerNorm(d_model, eps=1e-5, dtype=dtype)
+
+        self.input_pre_norm = None
+        if self.use_input_pre_norm:
+            self.input_pre_norm = build_recurrent_norm(
+                d_model,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
+
+        self.read_q_norm = None
+        self.read_k_norm = None
+        self.write_q_norm = None
+        self.write_k_norm = None
+        if self.use_qk_norm:
+            self.read_q_norm = build_recurrent_norm(
+                self.head_dim,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
+            self.read_k_norm = build_recurrent_norm(
+                self.head_dim,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
+            self.write_q_norm = build_recurrent_norm(
+                self.head_dim,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
+            self.write_k_norm = build_recurrent_norm(
+                self.head_dim,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
 
         self.initial_slots = nn.Parameter(torch.empty(num_slots, d_model, dtype=dtype))
         nn.init.normal_(self.initial_slots, mean=0.0, std=0.02)
@@ -229,6 +275,12 @@ class CrossAttentionSlotMemory(nn.Module):
         batch_size, num_heads, seq_len, head_dim = x.shape
         return x.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads * head_dim)
 
+    @staticmethod
+    def _apply_norm(x: torch.Tensor, norm: Optional[nn.Module]) -> torch.Tensor:
+        if norm is None:
+            return x
+        return norm(x)
+
     def _flash_read_attention_context(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
     ):
@@ -270,6 +322,8 @@ class CrossAttentionSlotMemory(nn.Module):
         hidden_states = self._gather_if_tp(hidden_states)
         if hidden_states.dtype != self.W_read_q.weight.dtype:
             hidden_states = hidden_states.to(dtype=self.W_read_q.weight.dtype)
+        if self.input_pre_norm is not None:
+            hidden_states = self.input_pre_norm(hidden_states)
 
         self._maybe_initialize_memory(batch_size=hidden_states.shape[0], device=hidden_states.device)
         should_track_read_metrics = not self._first_chunk
@@ -277,8 +331,8 @@ class CrossAttentionSlotMemory(nn.Module):
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)
         else:
-            query = self._to_heads(self.W_read_q(hidden_states))
-            key = self._to_heads(self.W_read_k(self.mem_slots))
+            query = self._apply_norm(self._to_heads(self.W_read_q(hidden_states)), self.read_q_norm)
+            key = self._apply_norm(self._to_heads(self.W_read_k(self.mem_slots)), self.read_k_norm)
             value = self._to_heads(self.W_read_v(self.mem_slots))
 
             retrieved = self._read_attention(query, key, value)
@@ -300,6 +354,8 @@ class CrossAttentionSlotMemory(nn.Module):
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_write_q.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_write_q.weight.dtype)
+        if self.input_pre_norm is not None:
+            mem_tokens = self.input_pre_norm(mem_tokens)
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
@@ -309,8 +365,8 @@ class CrossAttentionSlotMemory(nn.Module):
         else:
             slot_state = self.mem_slots
 
-        query = self._to_heads(self.W_write_q(mem_tokens))
-        key = self._to_heads(self.W_write_k(slot_state))
+        query = self._apply_norm(self._to_heads(self.W_write_q(mem_tokens)), self.write_q_norm)
+        key = self._apply_norm(self._to_heads(self.W_write_k(slot_state)), self.write_k_norm)
         value = self._to_heads(self.W_write_v(mem_tokens))
 
         scores = torch.matmul(query, key.transpose(-1, -2)) / (self.head_dim**0.5)

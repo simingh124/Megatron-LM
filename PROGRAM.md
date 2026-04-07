@@ -32,3 +32,5 @@
 - The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
 - `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.
+- `--recurrent-mem-qk-norm` is the single ARMT memory qk-norm switch. It must drive `gated_deltanet`, `associative`, and `cross_attn_slots`; avoid reintroducing older backend-specific names such as `recurrent_slot_qk_norm`.
+- Launcher env wiring mirrors the CLI name as `RECURRENT_MEM_QK_NORM`. Keep base launchers aligned with the code default (`false`), and put opt-in norm defaults only in explicit `*_w_norm.sh` variants together with `RECURRENT_MEMORY_INPUT_PRE_NORM=1`.

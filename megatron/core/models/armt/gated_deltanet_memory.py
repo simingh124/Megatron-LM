@@ -10,6 +10,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.ssm.gated_delta_net import torch_chunk_gated_delta_rule
 
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
+from .norm_utils import build_recurrent_norm
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -47,6 +48,9 @@ class GatedDeltaNetMemory(nn.Module):
         use_qk_l2norm: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
+        use_input_pre_norm: bool = False,
+        normalization: str = "LayerNorm",
+        norm_epsilon: float = 1e-5,
         *,
         hidden_size: Optional[int] = None,
     ):
@@ -88,6 +92,7 @@ class GatedDeltaNetMemory(nn.Module):
         self.use_causal_conv1d = use_causal_conv1d
         self.use_qk_l2norm = use_qk_l2norm
         self.tbptt_mode = tbptt_mode
+        self.use_input_pre_norm = use_input_pre_norm
 
         self.qk_dim = self.key_head_dim * self.num_key_heads
         self.v_dim = self.value_head_dim * self.num_value_heads
@@ -108,6 +113,15 @@ class GatedDeltaNetMemory(nn.Module):
         self.A_log = nn.Parameter(torch.empty(self.num_value_heads, dtype=dtype))
         self.out_norm = nn.RMSNorm(self.value_head_dim, eps=1e-6, dtype=dtype)
         self.out_proj = nn.Linear(self.v_dim, d_model, bias=False, dtype=dtype)
+
+        self.input_pre_norm = None
+        if self.use_input_pre_norm:
+            self.input_pre_norm = build_recurrent_norm(
+                d_model,
+                normalization=normalization,
+                eps=norm_epsilon,
+                dtype=dtype,
+            )
 
         nn.init.uniform_(self.conv1d.weight, -0.05, 0.05)
         nn.init.uniform_(self.A_log, 0.0, 1.0)
@@ -279,6 +293,8 @@ class GatedDeltaNetMemory(nn.Module):
         return qkv.transpose(1, 2).contiguous()
 
     def _project_hidden_states(self, hidden_states: torch.Tensor, *, allow_causal_kernel: bool):
+        if self.input_pre_norm is not None:
+            hidden_states = self.input_pre_norm(hidden_states)
         projected = self.in_proj(hidden_states)
         qkv, gate, beta, alpha = torch.split(
             projected,

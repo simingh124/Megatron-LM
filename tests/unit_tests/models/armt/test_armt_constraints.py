@@ -292,6 +292,53 @@ def test_cross_attn_slots_read_backend_defaults_to_flash():
     assert args.recurrent_slot_read_attn_backend == "flash"
 
 
+def test_recurrent_memory_norm_switches_default_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.recurrent_mem_qk_norm is False
+    assert args.recurrent_memory_input_pre_norm is False
+
+
+def test_recurrent_memory_norm_switches_are_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(
+        [
+            "--recurrent-mem-qk-norm",
+            "--recurrent-memory-input-pre-norm",
+        ]
+    )
+
+    assert args.recurrent_mem_qk_norm is True
+    assert args.recurrent_memory_input_pre_norm is True
+
+
+def test_recurrent_memory_norm_switches_can_be_disabled_explicitly():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(
+        [
+            "--recurrent-mem-qk-norm",
+            "--no-recurrent-mem-qk-norm",
+            "--recurrent-memory-input-pre-norm",
+            "--no-recurrent-memory-input-pre-norm",
+        ]
+    )
+
+    assert args.recurrent_mem_qk_norm is False
+    assert args.recurrent_memory_input_pre_norm is False
+
+
+def test_recurrent_slot_qk_norm_legacy_flag_is_rejected():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--recurrent-slot-qk-norm"])
+
+
 def test_cross_attn_slots_args_are_registered():
     parser = argparse.ArgumentParser()
     add_armt_args(parser)
