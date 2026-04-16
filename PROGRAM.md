@@ -29,6 +29,10 @@
 - ARMT now keeps the `modules:` table coarse-grained and prints runtime memory-state summaries separately before that table: `initial_slots` totals come from `CrossAttentionSlotMemory.initial_slots`; `W_mem` totals are single-sample (`batch=1`) logical memory-store sizes. For `AssociativeLayer`, use pre-DPFP width (`d_mem * head_dim` per head), not the expanded `d_key = 2 * nu * d_mem`, so the report stays comparable with other backends' memory storage.
 - ARMT recurrent backend head-dim decoupling is now projection-based: external hidden/state width stays `hidden_size`, while backend multi-head projection width may use explicit `head_dim`. If associative parameter shapes change, keep `examples/armt/tools/convert_baseline_to_armt.py` in sync with runtime shapes, especially `W_mv`, `W_mo`, and gated `W_mb`.
 
+## ARMT TensorBoard Monitoring
+- `ARMTModel.consume_all_monitoring_primitives()` always emits the aggregated `armt/...` metrics. Per-layer copies are emitted only when `--armt-log-layer-metrics-to-tensorboard` is enabled, and they now append the layer tag as `armt/.../layer_XX`; `XX` follows the transformer `layer_number` (or module order fallback in lightweight tests).
+- Keep `train/chunk_XX_loss` chunk-scoped only. It is published by the recurrent scheduler, not by individual ARMT layers, so do not treat it as a candidate for per-layer expansion.
+
 ## Recurrent CLI Source of Truth
 - The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.

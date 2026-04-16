@@ -21,6 +21,7 @@ def _minimal_gpt_init(self, config, transformer_layer_spec, vocab_size, max_sequ
 def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs):
     torch.nn.Module.__init__(self)
     self.config = config
+    self.layer_number = layer_number
     self.associative_layer = None
     self.recurrent_memory_layer = None
     self._skip_read_memory_for_current_chunk = False
@@ -331,7 +332,7 @@ class TestARMTModel:
         layer.associative_layer.reset_memory.assert_called_once()
 
     def test_armt_model_monitoring_helpers(self):
-        """验证模型级 monitoring reset/consume 会跨 ARMT 层聚合。"""
+        """验证默认只产出聚合 monitoring 指标。"""
         config = MagicMock()
         config.hidden_size = 256
         config.sequence_parallel = False
@@ -377,7 +378,7 @@ class TestARMTModel:
         layer_two.consume_monitoring_primitives = MagicMock(
             return_value={
                 "armt/read/retrieved_norm_mean": build_mean_metric(
-                    torch.tensor(6.0),
+                    torch.tensor(9.0),
                     torch.tensor(3.0),
                 ),
                 "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
@@ -397,8 +398,81 @@ class TestARMTModel:
 
         metrics = model.consume_all_monitoring_metrics()
 
-        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(13.0 / 5.0)
         assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(45.0 / 52.0)
+        assert "armt/read/retrieved_norm_mean/layer_01" not in metrics
+        assert "armt/read/retrieved_norm_mean/layer_02" not in metrics
+
+    def test_armt_model_monitoring_helpers_with_layer_metrics_enabled(self):
+        """验证显式开关打开后会同时产出逐层 monitoring 指标。"""
+        config = MagicMock()
+        config.hidden_size = 256
+        config.sequence_parallel = False
+        config.position_embedding_type = "rope"
+        config.multi_latent_attention = False
+        config.init_method_std = 0.02
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+                log_layer_metrics_to_tensorboard=True,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+        layer_one.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(4.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
+                    torch.tensor(6.0),
+                    torch.tensor(3.0),
+                    torch.tensor(18.0),
+                    torch.tensor(2.0),
+                ),
+            }
+        )
+        layer_two.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(9.0),
+                    torch.tensor(3.0),
+                ),
+                "armt/token/mem_ctx_norm_ratio": build_ratio_of_means_metric(
+                    torch.tensor(9.0),
+                    torch.tensor(1.0),
+                    torch.tensor(8.0),
+                    torch.tensor(4.0),
+                ),
+            }
+        )
+        model.add_module("armt_layer_one", layer_one)
+        model.add_module("armt_layer_two", layer_two)
+
+        metrics = model.consume_all_monitoring_metrics()
+
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(13.0 / 5.0)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(45.0 / 52.0)
+        assert float(metrics["armt/read/retrieved_norm_mean/layer_01"]) == pytest.approx(2.0)
+        assert float(metrics["armt/read/retrieved_norm_mean/layer_02"]) == pytest.approx(3.0)
+        assert float(metrics["armt/token/mem_ctx_norm_ratio/layer_01"]) == pytest.approx(
+            2.0 / 9.0
+        )
+        assert float(metrics["armt/token/mem_ctx_norm_ratio/layer_02"]) == pytest.approx(4.5)
 
     def test_armt_model_rope_extension(self):
         """验证 _preprocess 在拼接 memory tokens 后会重新生成/扩展 RoPE 到 S+M。"""

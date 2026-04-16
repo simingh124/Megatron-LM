@@ -28,6 +28,7 @@ class ARMTModel(GPTModel):
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
         armt_equal_window_full_attn_path: str = "legacy",
+        log_layer_metrics_to_tensorboard: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -46,6 +47,7 @@ class ARMTModel(GPTModel):
             else self.recurrent_chunk_size
         )
         self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
+        self.log_layer_metrics_to_tensorboard = bool(log_layer_metrics_to_tensorboard)
         self._use_windowed_full_attention = should_use_windowed_full_attention(
             recurrent_chunk_size=self.recurrent_chunk_size,
             full_attn_window_size=self.full_attn_window_size,
@@ -64,6 +66,13 @@ class ARMTModel(GPTModel):
         for module in self.modules():
             if isinstance(module, ARMTLayer):
                 yield module
+
+    @staticmethod
+    def _layer_monitoring_metric_name(metric_name: str, layer_number: int) -> str:
+        layer_tag = f"layer_{layer_number:02d}"
+        if metric_name.startswith("armt/"):
+            return f"{metric_name}/{layer_tag}"
+        return f"armt/{metric_name}/{layer_tag}"
 
     def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
         if self.num_mem_tokens == 0:
@@ -145,8 +154,15 @@ class ARMTModel(GPTModel):
 
     def consume_all_monitoring_primitives(self):
         primitives = {}
-        for module in self._armt_layers():
-            merge_metric_primitives(primitives, module.consume_monitoring_primitives())
+        for fallback_layer_idx, module in enumerate(self._armt_layers(), start=1):
+            layer_number = getattr(module, "layer_number", fallback_layer_idx)
+            layer_primitives = module.consume_monitoring_primitives()
+            merge_metric_primitives(primitives, layer_primitives)
+            if self.log_layer_metrics_to_tensorboard:
+                for metric_name, primitive in layer_primitives.items():
+                    primitives[
+                        self._layer_monitoring_metric_name(metric_name, int(layer_number))
+                    ] = primitive
         return primitives
 
     def consume_all_monitoring_metrics(self):

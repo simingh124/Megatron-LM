@@ -62,6 +62,15 @@ def add_armt_args(parser):
         default=True,
         help="Apply correction term in delta updates",
     )
+    group.add_argument(
+        "--armt-log-layer-metrics-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit per-layer ARMT TensorBoard metrics under armt/.../layer_XX in addition to "
+            "the existing aggregated armt/* metrics. Requires TensorBoard logging to be enabled."
+        ),
+    )
 
     return parser
 

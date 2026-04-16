@@ -20,6 +20,10 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
                 torch.tensor(4.0),
                 torch.tensor(2.0),
             ),
+            "armt/read/retrieved_norm_mean/layer_01": build_mean_metric(
+                torch.tensor(9.0),
+                torch.tensor(3.0),
+            ),
             "train/chunk_00_loss": build_ratio_metric(
                 torch.tensor(9.0),
                 torch.tensor(3.0),
@@ -89,6 +93,7 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
 
     tb_metric_names = [call.args[0] for call in writer.add_scalar.call_args_list]
     assert "armt/read/retrieved_norm_mean" in tb_metric_names
+    assert "armt/read/retrieved_norm_mean/layer_01" in tb_metric_names
     assert "armt/token/mem_ctx_norm_ratio" in tb_metric_names
     assert "train/chunk_00_loss" in tb_metric_names
     assert "batch-size-tokens" in tb_metric_names
@@ -103,5 +108,6 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
     for call in wandb_writer.log.call_args_list:
         wandb_metric_names.extend(call.args[0].keys())
     assert "armt/read/retrieved_norm_mean" not in wandb_metric_names
+    assert "armt/read/retrieved_norm_mean/layer_01" not in wandb_metric_names
     assert "armt/token/mem_ctx_norm_ratio" not in wandb_metric_names
     assert "train/chunk_00_loss" not in wandb_metric_names

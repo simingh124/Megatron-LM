@@ -116,6 +116,7 @@ def model_provider(
         recurrent_chunk_size=args.recurrent_chunk_size,
         full_attn_window_size=args.full_attn_window_size,
         armt_equal_window_full_attn_path=args.armt_equal_window_full_attn_path,
+        log_layer_metrics_to_tensorboard=args.armt_log_layer_metrics_to_tensorboard,
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),
