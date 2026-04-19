@@ -292,8 +292,14 @@ class GatedDeltaNetMemory(nn.Module):
 
         return qkv.transpose(1, 2).contiguous()
 
-    def _project_hidden_states(self, hidden_states: torch.Tensor, *, allow_causal_kernel: bool):
-        if self.input_pre_norm is not None:
+    def _project_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        allow_causal_kernel: bool,
+        input_already_pre_normed: bool = False,
+    ):
+        if self.input_pre_norm is not None and not input_already_pre_normed:
             hidden_states = self.input_pre_norm(hidden_states)
         projected = self.in_proj(hidden_states)
         qkv, gate, beta, alpha = torch.split(
@@ -440,12 +446,16 @@ class GatedDeltaNetMemory(nn.Module):
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)
 
-    def update_mem(self, mem_tokens: torch.Tensor, input_is_sbh: bool):
+    def update_mem(
+        self,
+        mem_tokens: torch.Tensor,
+        input_is_sbh: bool,
+        input_already_pre_normed: bool = False,
+    ):
         mem_tokens, input_is_sbh = self._to_batch_first(mem_tokens, input_is_sbh=input_is_sbh)
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.in_proj.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.in_proj.weight.dtype)
-
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
         if self.tbptt_mode:
@@ -457,6 +467,7 @@ class GatedDeltaNetMemory(nn.Module):
         query, key, value, _, beta, alpha = self._project_hidden_states(
             mem_tokens,
             allow_causal_kernel=not self.tbptt_mode,
+            input_already_pre_normed=input_already_pre_normed,
         )
         g, beta = self._compute_g_and_beta(alpha, beta)
         _, final_state = self._run_gated_delta_rule(

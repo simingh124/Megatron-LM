@@ -1,5 +1,6 @@
 """ARMT transformer layer with pluggable recurrent memory backends."""
 
+import logging
 from typing import Optional
 
 import torch
@@ -12,6 +13,13 @@ from .monitoring import build_mean_metric, build_ratio_of_means_metric, merge_me
 from .recurrent_memory import build_recurrent_memory_backend
 
 _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
+_SUPPORTED_MEMORY_WRITE_SOURCES = (
+    "mem_tokens",
+    "post_mlp_context",
+    "post_attn_context",
+    "pre_attn_context",
+)
+_LOGGER = logging.getLogger(__name__)
 
 
 class ARMTLayer(TransformerLayer):
@@ -49,6 +57,7 @@ class ARMTLayer(TransformerLayer):
         recurrent_slot_read_attn_backend: str = "flash",
         recurrent_mem_qk_norm: bool = False,
         recurrent_memory_input_pre_norm: bool = False,
+        armt_memory_write_source: str = "mem_tokens",
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
@@ -61,6 +70,13 @@ class ARMTLayer(TransformerLayer):
         self.armt_windowed_full_attn_backend = armt_windowed_full_attn_backend
         self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
         self.recurrent_memory_backend = recurrent_memory_backend
+        self.recurrent_memory_input_pre_norm = recurrent_memory_input_pre_norm
+        if armt_memory_write_source not in _SUPPORTED_MEMORY_WRITE_SOURCES:
+            raise ValueError(
+                "armt_memory_write_source must be one of "
+                f"{_SUPPORTED_MEMORY_WRITE_SOURCES}, got {armt_memory_write_source!r}"
+            )
+        self.armt_memory_write_source = armt_memory_write_source
         self.associative_layer = None
         self.recurrent_memory_layer = None
 
@@ -71,7 +87,9 @@ class ARMTLayer(TransformerLayer):
             "tbptt_mode": tbptt_mode,
             "normalization": getattr(config, "normalization", "LayerNorm"),
             "norm_epsilon": getattr(config, "layernorm_epsilon", 1e-5),
-            "use_input_pre_norm": recurrent_memory_input_pre_norm,
+            "use_input_pre_norm": (
+                recurrent_memory_input_pre_norm and armt_memory_write_source != "pre_attn_context"
+            ),
         }
 
         if recurrent_memory_backend == "associative":
@@ -113,6 +131,14 @@ class ARMTLayer(TransformerLayer):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
         self._current_chunk_start_position = 0
+        self._captured_input_layernorm_output = None
+        self._pre_attn_capture_fallback_warned = False
+        self._input_layernorm_capture_handle = None
+        input_layernorm = getattr(self, "input_layernorm", None)
+        if hasattr(input_layernorm, "register_forward_hook"):
+            self._input_layernorm_capture_handle = input_layernorm.register_forward_hook(
+                self._capture_input_layernorm_output
+            )
         self.reset_monitoring_stats()
 
     def _get_memory_layer(self):
@@ -138,6 +164,13 @@ class ARMTLayer(TransformerLayer):
         self._monitoring_stats = {}
         self._get_memory_layer().reset_monitoring_stats()
 
+    def _capture_input_layernorm_output(self, module, inputs, output):
+        del module, inputs
+        self._captured_input_layernorm_output = output
+
+    def _uses_mem_tokens(self) -> bool:
+        return self.armt_memory_write_source == "mem_tokens" and self.num_mem_tokens > 0
+
     def _accumulate_monitoring_stat(self, name: str, value: torch.Tensor):
         value = value.detach()
         if value.numel() != 1:
@@ -162,6 +195,37 @@ class ARMTLayer(TransformerLayer):
             if parallel_state.get_tensor_model_parallel_world_size() > 1:
                 return tensor_parallel.gather_from_tensor_model_parallel_region(hidden_states)
         return hidden_states
+
+    def _prepare_hidden_states_for_memory_ops(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if getattr(self.config, "sequence_parallel", False):
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, group=tp_group
+            )
+        return self._gather_hidden_for_monitoring(hidden_states)
+
+    def _empty_like_sequence(self, hidden_states: torch.Tensor, *, input_is_sbh: bool) -> torch.Tensor:
+        if input_is_sbh:
+            return hidden_states[:0, :, :]
+        return hidden_states[:, :0, :]
+
+    def _split_context_and_mem(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        input_is_sbh: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._uses_mem_tokens():
+            return hidden_states, self._empty_like_sequence(hidden_states, input_is_sbh=input_is_sbh)
+        if input_is_sbh:
+            return (
+                hidden_states[:-self.num_mem_tokens, :, :],
+                hidden_states[-self.num_mem_tokens :, :, :],
+            )
+        return (
+            hidden_states[:, :-self.num_mem_tokens, :],
+            hidden_states[:, -self.num_mem_tokens :, :],
+        )
 
     def _update_token_monitoring_stats(
         self,
@@ -258,52 +322,123 @@ class ARMTLayer(TransformerLayer):
         merge_metric_primitives(primitives, self._get_memory_layer().consume_monitoring_primitives())
         return primitives
 
-    def forward(
+    def _resolve_write_source(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
+        *,
+        memory_layer,
+        pre_attn_hidden_states: torch.Tensor,
+        attn_hidden_states: torch.Tensor,
+        post_mlp_hidden_states: torch.Tensor,
+        input_is_sbh: bool,
+    ) -> tuple[torch.Tensor, bool]:
+        if self.armt_memory_write_source == "mem_tokens":
+            prepared = self._prepare_hidden_states_for_memory_ops(post_mlp_hidden_states)
+            _, mem_part = self._split_context_and_mem(prepared, input_is_sbh=input_is_sbh)
+            return mem_part, False
+
+        if self.armt_memory_write_source == "post_attn_context":
+            prepared = self._prepare_hidden_states_for_memory_ops(attn_hidden_states)
+            context_part, _ = self._split_context_and_mem(prepared, input_is_sbh=input_is_sbh)
+            return context_part, False
+
+        if self.armt_memory_write_source == "post_mlp_context":
+            prepared = self._prepare_hidden_states_for_memory_ops(post_mlp_hidden_states)
+            context_part, _ = self._split_context_and_mem(prepared, input_is_sbh=input_is_sbh)
+            return context_part, False
+
+        if self.armt_memory_write_source == "pre_attn_context":
+            prepared = pre_attn_hidden_states
+            input_already_pre_normed = False
+            if self.recurrent_memory_input_pre_norm:
+                captured = self._captured_input_layernorm_output
+                if captured is not None:
+                    prepared = captured
+                else:
+                    if not self._pre_attn_capture_fallback_warned:
+                        _LOGGER.warning(
+                            "ARMTLayer pre-attn write source fell back to recomputing "
+                            "input_layernorm because _captured_input_layernorm_output is None."
+                        )
+                        self._pre_attn_capture_fallback_warned = True
+                    input_layernorm = getattr(self, "input_layernorm", None)
+                    if input_layernorm is None:
+                        raise RuntimeError(
+                            "pre_attn_context with recurrent_memory_input_pre_norm=True "
+                            "requires TransformerLayer.input_layernorm"
+                        )
+                    prepared = input_layernorm(prepared)
+                input_already_pre_normed = True
+            prepared = self._prepare_hidden_states_for_memory_ops(prepared)
+            context_part, _ = self._split_context_and_mem(prepared, input_is_sbh=input_is_sbh)
+            return context_part, input_already_pre_normed
+
+        raise RuntimeError(
+            f"Unsupported armt_memory_write_source: {self.armt_memory_write_source!r}"
+        )
+
+    def forward(self, *args, **kwargs):
+        # Keep TransformerLayer.forward compatibility for local cudagraph inference.
+        kwargs.pop("dynamic_inference_decode_only", None)
+
+        if args:
+            hidden_states = args[0]
+            attention_args = args[1:]
+        else:
+            if "hidden_states" not in kwargs:
+                raise TypeError("ARMTLayer.forward missing required argument: 'hidden_states'")
+            hidden_states = kwargs.pop("hidden_states")
+            attention_args = ()
+
         # Project convention: ARMT only supports Megatron's SBH layout.
         input_is_sbh = True
         memory_layer = self._get_memory_layer()
+        self._captured_input_layernorm_output = None
+        pre_attn_hidden_states = hidden_states
 
         # Step 1: Associate (Memory Retrieval)
         if not self._skip_read_memory_for_current_chunk:
             retrieved = memory_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
             hidden_states = hidden_states + retrieved
 
+        pre_attn_hidden_states = hidden_states
+
         # Step 2 & 3: Attention + MLP
-        hidden_states, context = super().forward(
+        attn_hidden_states, context = self._forward_attention(
             hidden_states,
-            attention_mask=attention_mask,
+            *attention_args,
             **kwargs,
+        )
+        hidden_states = self._forward_mlp(
+            attn_hidden_states,
+            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
         )
 
         # Step 4: Update Memory and collect token monitoring stats.
-        if getattr(self.config, "sequence_parallel", False):
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-            monitoring_hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states, group=tp_group
-            )
-        else:
-            monitoring_hidden_states = hidden_states
-
-        monitoring_hidden_states = self._gather_hidden_for_monitoring(monitoring_hidden_states)
-
-        if input_is_sbh:
-            context_part = monitoring_hidden_states[:-self.num_mem_tokens, :, :]
-            mem_part = monitoring_hidden_states[-self.num_mem_tokens :, :, :]
-        else:
-            context_part = monitoring_hidden_states[:, :-self.num_mem_tokens, :]
-            mem_part = monitoring_hidden_states[:, -self.num_mem_tokens :, :]
+        monitoring_hidden_states = self._prepare_hidden_states_for_memory_ops(hidden_states)
+        context_part, mem_part = self._split_context_and_mem(
+            monitoring_hidden_states,
+            input_is_sbh=input_is_sbh,
+        )
 
         self._update_token_monitoring_stats(
             context_part,
             mem_part,
             input_is_sbh=input_is_sbh,
         )
-        memory_layer.update_mem(mem_part, input_is_sbh=input_is_sbh)
+        write_part, input_already_pre_normed = self._resolve_write_source(
+            memory_layer=memory_layer,
+            pre_attn_hidden_states=pre_attn_hidden_states,
+            attn_hidden_states=attn_hidden_states,
+            post_mlp_hidden_states=hidden_states,
+            input_is_sbh=input_is_sbh,
+        )
+        if write_part.numel() != 0:
+            memory_layer.update_mem(
+                write_part,
+                input_is_sbh=input_is_sbh,
+                input_already_pre_normed=input_already_pre_normed,
+            )
 
         return hidden_states, context
 
@@ -311,6 +446,7 @@ class ARMTLayer(TransformerLayer):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
         self._current_chunk_start_position = 0
+        self._captured_input_layernorm_output = None
         self_attention = getattr(self, "self_attention", None)
         if hasattr(self_attention, "reset_window_kv_cache"):
             self_attention.reset_window_kv_cache()

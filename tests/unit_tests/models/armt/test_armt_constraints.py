@@ -255,11 +255,30 @@ def test_armt_head_dim_arg_is_registered():
     assert args.armt_head_dim == 12
 
 
+def test_armt_memory_write_source_arg_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-memory-write-source", "post_attn_context"])
+
+    assert args.armt_memory_write_source == "post_attn_context"
+
+
 def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
     args = _make_args()
     validate_armt_constraints(args)
 
     assert args.no_read_memory_from_first_chunk is True
+
+
+def test_armt_non_mem_write_source_forces_zero_mem_tokens():
+    args = _make_args(
+        armt_memory_write_source="post_mlp_context",
+        num_mem_tokens=16,
+    )
+
+    validate_armt_constraints(args)
+
+    assert args.num_mem_tokens == 0
 
 
 def test_gdn_requires_explicit_hyperparameters():

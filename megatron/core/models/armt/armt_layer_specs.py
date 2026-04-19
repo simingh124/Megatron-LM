@@ -56,6 +56,7 @@ def get_armt_layer_spec(
     recurrent_slot_read_attn_backend: str = "flash",
     recurrent_mem_qk_norm: bool = False,
     recurrent_memory_input_pre_norm: bool = False,
+    armt_memory_write_source: str = "mem_tokens",
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
         base_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -140,5 +141,6 @@ def get_armt_layer_spec(
             "recurrent_slot_read_attn_backend": recurrent_slot_read_attn_backend,
             "recurrent_mem_qk_norm": recurrent_mem_qk_norm,
             "recurrent_memory_input_pre_norm": recurrent_memory_input_pre_norm,
+            "armt_memory_write_source": armt_memory_write_source,
         },
     )

@@ -70,7 +70,7 @@ class TestARMTModel:
             (f"armt_layer.{backend_attr}", sum(p.numel() for p in memory_module.parameters())),
         ]
 
-    def test_armt_model_memory_parameter_breakdown_is_empty_when_num_mem_tokens_is_zero(self):
+    def test_armt_model_omits_memory_embeddings_parameter_when_num_mem_tokens_is_zero(self):
         config = MagicMock()
         config.hidden_size = 8
         config.sequence_parallel = False
@@ -99,7 +99,10 @@ class TestARMTModel:
         layer.recurrent_memory_layer = torch.nn.Linear(8, 4, bias=False)
         model.add_module("armt_layer", layer)
 
-        assert model.get_memory_parameter_breakdown() == []
+        assert model.memory_embeddings is None
+        assert "memory_embeddings" not in dict(model.named_parameters())
+        assert "memory_embeddings" not in model.state_dict()
+        assert model.get_memory_parameter_breakdown() == [("armt_layer.recurrent_memory_layer", 32)]
 
     def test_armt_model_memory_parameter_breakdown_counts_cross_attention_slot_backend(self):
         config = MagicMock()

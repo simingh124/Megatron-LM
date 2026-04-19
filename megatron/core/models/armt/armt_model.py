@@ -56,9 +56,14 @@ class ARMTModel(GPTModel):
         self._current_chunk_start_position = 0
 
         init_std = getattr(config, "init_method_std", 0.02)
-        self.memory_embeddings = nn.Parameter(
-            torch.randn(num_mem_tokens, config.hidden_size) * init_std
-        )
+        if num_mem_tokens > 0:
+            self.memory_embeddings = nn.Parameter(
+                torch.randn(num_mem_tokens, config.hidden_size) * init_std
+            )
+        else:
+            # Avoid keeping a zero-sized trainable parameter around. It is semantically unused
+            # and can create padding-only distributed-optimizer buckets during checkpoint save.
+            self.register_parameter("memory_embeddings", None)
 
     def _armt_layers(self):
         for module in self.modules():
@@ -66,10 +71,9 @@ class ARMTModel(GPTModel):
                 yield module
 
     def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
-        if self.num_mem_tokens == 0:
-            return []
-
-        breakdown = [("memory_embeddings", self.memory_embeddings.numel())]
+        breakdown = []
+        if self.memory_embeddings is not None and self.memory_embeddings.numel() > 0:
+            breakdown.append(("memory_embeddings", self.memory_embeddings.numel()))
         for module_name, module in self.named_modules():
             if not isinstance(module, ARMTLayer):
                 continue
@@ -89,9 +93,6 @@ class ARMTModel(GPTModel):
         return breakdown
 
     def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
-        if self.num_mem_tokens == 0:
-            return []
-
         state_sizes = OrderedDict()
         for module in self.named_modules():
             _, module_instance = module
@@ -153,12 +154,16 @@ class ARMTModel(GPTModel):
         return finalize_metric_primitives(self.consume_all_monitoring_primitives())
 
     def _concat_memory_embeddings(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if self.num_mem_tokens == 0:
+            return decoder_input
         batch_size = decoder_input.shape[1]
         mem = self.memory_embeddings.unsqueeze(1).expand(-1, batch_size, -1)
         mem = mem.to(dtype=decoder_input.dtype, device=decoder_input.device)
         return torch.cat([decoder_input, mem], dim=0)
 
     def _concat_padding_mask(self, padding_mask: torch.Tensor) -> torch.Tensor:
+        if self.num_mem_tokens == 0:
+            return padding_mask
         batch_size = padding_mask.shape[0]
         mem_mask = torch.zeros(
             batch_size,
@@ -261,6 +266,8 @@ class ARMTModel(GPTModel):
     def _adjust_attention_mask(self, attention_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
         if attention_mask is None:
             return None
+        if self.num_mem_tokens == 0:
+            return attention_mask
 
         new_seq_len = seq_len + self.num_mem_tokens
         causal_mask = torch.triu(
@@ -281,6 +288,8 @@ class ARMTModel(GPTModel):
         return new_mask
 
     def _strip_memory_tokens(self, hidden_states: torch.Tensor, seq_len: int) -> torch.Tensor:
+        if self.num_mem_tokens == 0:
+            return hidden_states
         if getattr(self.config, "sequence_parallel", False):
             tp_group = parallel_state.get_tensor_model_parallel_group()
             gathered = tensor_parallel.gather_from_sequence_parallel_region(

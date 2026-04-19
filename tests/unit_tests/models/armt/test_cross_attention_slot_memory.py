@@ -1,5 +1,6 @@
 import pytest
 import torch
+from unittest.mock import patch
 
 from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
@@ -78,6 +79,24 @@ def test_cross_attention_slot_memory_norm_switches_preserve_shape_and_finiteness
 
     assert retrieved.shape == (batch_size, 6, layer.d_model)
     assert torch.isfinite(retrieved).all()
+
+
+def test_cross_attention_slot_memory_can_skip_redundant_input_pre_norm_on_update():
+    layer = _build_layer(
+        use_input_pre_norm=True,
+        normalization="RMSNorm",
+    )
+    batch_size = 2
+    layer.reset_memory(batch_size=batch_size)
+
+    with patch.object(layer.input_pre_norm, "forward", side_effect=lambda x: x) as forward_mock:
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+            input_already_pre_normed=True,
+        )
+
+    forward_mock.assert_not_called()
 
 
 def test_cross_attention_slot_memory_reset_and_first_chunk_returns_zero():
