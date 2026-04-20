@@ -553,7 +553,7 @@ def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
 
     unwrapped_model = MagicMock()
     unwrapped_model.consume_all_monitoring_primitives.return_value = {
-        "armt/read/retrieved_norm_mean": build_mean_metric(
+        "armt/read/context_retrieved_norm_mean": build_mean_metric(
             torch.tensor(6.0),
             torch.tensor(3.0),
         ),
@@ -609,7 +609,7 @@ def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
 
     assert float(metrics["train/chunk_00_loss"]) == pytest.approx(1.0)
     assert float(metrics["train/chunk_01_loss"]) == pytest.approx(2.0)
-    assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(2.0)
     unwrapped_model.reset_all_monitoring_stats.assert_called_once()
     unwrapped_model.reset_all_memory.assert_called_once()
 
@@ -643,7 +643,7 @@ def test_scheduler_forward_only_does_not_publish_monitoring_metrics():
 
     unwrapped_model = MagicMock()
     unwrapped_model.consume_all_monitoring_primitives.return_value = {
-        "armt/read/retrieved_norm_mean": build_mean_metric(
+        "armt/read/context_retrieved_norm_mean": build_mean_metric(
             torch.tensor(4.0),
             torch.tensor(2.0),
         ),
@@ -694,6 +694,96 @@ def test_scheduler_forward_only_does_not_publish_monitoring_metrics():
         )
 
     assert consume_armt_tensorboard_metrics() == {}
+
+
+def test_scheduler_skips_publishing_monitoring_metrics_when_collection_disabled():
+    clear_armt_tensorboard_metrics()
+    batch_size, seq_length = 1, 8
+    chunk_size = 4
+
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (batch_size, seq_length)),
+        "labels": torch.randint(0, 100, (batch_size, seq_length)),
+        "loss_mask": torch.ones(batch_size, seq_length),
+    }
+
+    def forward_step_func(data_it, model):
+        del model
+        batch = next(data_it)
+        output_tensor = torch.zeros([], requires_grad=True)
+
+        def _loss_func(_output_tensor):
+            num_tokens = batch["loss_mask"].float().sum().to(torch.int)
+            loss_reduced = {
+                "lm loss": torch.cat([num_tokens.float().view(1), num_tokens.view(1)]),
+            }
+            return _output_tensor * 0.0, num_tokens, loss_reduced
+
+        return output_tensor, _loss_func
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
+
+    unwrapped_model = MagicMock()
+    unwrapped_model.should_collect_monitoring_for_current_iteration.return_value = False
+    unwrapped_model.consume_all_monitoring_primitives.return_value = {
+        "armt/read/context_retrieved_norm_mean": build_mean_metric(
+            torch.tensor(4.0),
+            torch.tensor(2.0),
+        ),
+    }
+
+    with (
+        patch(f"{SCHEDULE_MODULE}.get_model_config", return_value=config),
+        patch(f"{SCHEDULE_MODULE}.get_model_type", return_value=MagicMock()),
+        patch(f"{SCHEDULE_MODULE}.unwrap_model", return_value=unwrapped_model),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_tensor_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_context_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_pipeline_model_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_position_embedding_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            f"{SCHEDULE_MODULE}.parallel_state.get_data_parallel_group",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "megatron.training.utils.get_batch_on_this_tp_rank",
+            side_effect=lambda it: raw_batch,
+        ),
+        patch(f"{SCHEDULE_MODULE}.backward_step"),
+    ):
+        recurrent_forward_backward_no_pipelining(
+            forward_step_func=forward_step_func,
+            data_iterator=iter([raw_batch]),
+            model=MagicMock(),
+            num_microbatches=1,
+            chunk_size=chunk_size,
+            seq_length=seq_length,
+            micro_batch_size=batch_size,
+            forward_only=False,
+        )
+
+    assert consume_armt_tensorboard_metrics() == {}
+    unwrapped_model.consume_all_monitoring_primitives.assert_not_called()
 
 
 def test_no_loss_from_first_chunk_requires_loss_mask():

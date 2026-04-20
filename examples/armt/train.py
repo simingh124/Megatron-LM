@@ -97,12 +97,16 @@ def model_provider(
         recurrent_gdn_value_head_dim=args.recurrent_gdn_value_head_dim,
         recurrent_gdn_num_key_heads=args.recurrent_gdn_num_key_heads,
         recurrent_gdn_num_value_heads=args.recurrent_gdn_num_value_heads,
+        recurrent_gdn_read_mode=args.recurrent_gdn_read_mode,
         recurrent_slot_num_slots=args.recurrent_slot_num_slots,
         recurrent_slot_num_heads=args.recurrent_slot_num_heads,
         recurrent_slot_head_dim=args.recurrent_slot_head_dim,
         recurrent_slot_read_attn_backend=args.recurrent_slot_read_attn_backend,
         recurrent_mem_qk_norm=args.recurrent_mem_qk_norm,
         recurrent_memory_input_pre_norm=args.recurrent_memory_input_pre_norm,
+        log_read_position_metrics_to_tensorboard=(
+            args.armt_log_read_position_metrics_to_tensorboard
+        ),
     )
 
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)

@@ -11,13 +11,16 @@ from torch.backends.cuda import SDPAParams
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.transformer.transformer_config import TransformerConfig
 
+from .init_utils import init_linear_weight_and_bias, init_parameter
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
 from .norm_utils import build_recurrent_norm
 
 _ATTN_EPSILON = 1e-5
 _ENTROPY_EPSILON = 1e-8
 _READ_ATTN_BACKENDS = ("sdpa", "flash")
+_READ_POSITION_MONITORING_PREFIX = "read_position"
 
 
 class CrossAttentionSlotMemory(nn.Module):
@@ -30,22 +33,32 @@ class CrossAttentionSlotMemory(nn.Module):
         num_slots: int = 16,
         num_heads: int = 1,
         head_dim: Optional[int] = None,
-        dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
         read_attn_backend: str = "flash",
         use_qk_norm: bool = False,
         use_input_pre_norm: bool = False,
+        log_read_position_metrics_to_tensorboard: bool = False,
         normalization: str = "LayerNorm",
         norm_epsilon: float = 1e-5,
+        config: Optional[TransformerConfig] = None,
+        dtype: Optional[torch.dtype] = None,
         *,
         hidden_size: Optional[int] = None,
     ):
         super().__init__()
 
+        if config is None:
+            raise ValueError("config must be provided for CrossAttentionSlotMemory")
+        self.config = config
+
         if hidden_size is not None:
             d_model = hidden_size
         if d_model is None:
-            raise ValueError("d_model (or hidden_size) must be provided for CrossAttentionSlotMemory")
+            d_model = self.config.hidden_size
+        elif d_model != self.config.hidden_size:
+            raise ValueError(
+                "d_model must match config.hidden_size for CrossAttentionSlotMemory"
+            )
         if num_slots <= 0:
             raise ValueError("num_slots must be > 0")
         if num_heads <= 0:
@@ -61,6 +74,11 @@ class CrossAttentionSlotMemory(nn.Module):
                 f"read_attn_backend must be one of {_READ_ATTN_BACKENDS}, got {read_attn_backend}"
             )
 
+        if dtype is None:
+            dtype = self.config.params_dtype
+        elif dtype != self.config.params_dtype:
+            raise ValueError("dtype must match config.params_dtype for CrossAttentionSlotMemory")
+
         self.d_model = d_model
         self.num_mem_tokens = num_mem_tokens
         self.num_slots = num_slots
@@ -70,6 +88,10 @@ class CrossAttentionSlotMemory(nn.Module):
         self.read_attn_backend = read_attn_backend
         self.use_qk_norm = use_qk_norm
         self.use_input_pre_norm = use_input_pre_norm
+        self.log_read_position_metrics_to_tensorboard = bool(
+            log_read_position_metrics_to_tensorboard
+        )
+        self._collect_monitoring_for_current_iteration = True
 
         projection_size = self.num_heads * self.head_dim
         self.W_read_q = nn.Linear(d_model, projection_size, bias=False, dtype=dtype)
@@ -124,12 +146,41 @@ class CrossAttentionSlotMemory(nn.Module):
             )
 
         self.initial_slots = nn.Parameter(torch.empty(num_slots, d_model, dtype=dtype))
-        nn.init.normal_(self.initial_slots, mean=0.0, std=0.02)
+        self.reset_parameters()
 
         self.register_buffer("mem_slots", torch.empty(0), persistent=False)
         self._first_chunk = True
         self._pending_reset = True
         self.reset_monitoring_stats()
+
+    def reset_parameters(self):
+        for linear in (
+            self.W_read_q,
+            self.W_read_k,
+            self.W_read_v,
+            self.W_write_q,
+            self.W_write_k,
+            self.W_write_v,
+            self.W_gate,
+        ):
+            init_linear_weight_and_bias(
+                linear,
+                self.config.init_method,
+                perform_initialization=self.config.perform_initialization,
+            )
+
+        for linear in (self.W_read_o, self.W_write_o):
+            init_linear_weight_and_bias(
+                linear,
+                self.config.output_layer_init_method,
+                perform_initialization=self.config.perform_initialization,
+            )
+
+        init_parameter(
+            self.initial_slots,
+            self.config.embedding_init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
 
     def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
         del batch_size
@@ -137,6 +188,9 @@ class CrossAttentionSlotMemory(nn.Module):
 
     def set_tbptt_mode(self, enabled: bool):
         self.tbptt_mode = enabled
+
+    def set_collect_monitoring_for_current_iteration(self, enabled: bool):
+        self._collect_monitoring_for_current_iteration = bool(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats: Dict[str, torch.Tensor] = {}
@@ -158,18 +212,146 @@ class CrossAttentionSlotMemory(nn.Module):
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
 
+    @staticmethod
+    def _position_metric_tag(position: int) -> str:
+        return f"pos_{position:04d}"
+
+    def _accumulate_read_position_monitoring_stats(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> None:
+        if hidden_states.shape != retrieved_states.shape:
+            raise ValueError(
+                "CrossAttentionSlotMemory read position monitoring expects hidden/retrieved "
+                f"tensors with matching shapes, got {tuple(hidden_states.shape)} and "
+                f"{tuple(retrieved_states.shape)}"
+            )
+
+        hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+        retrieved_norms = torch.linalg.vector_norm(retrieved_states.float(), dim=-1)
+        token_count = self._count_tensor(hidden_states.shape[0], hidden_states.device)
+
+        for position in range(hidden_states.shape[1]):
+            position_tag = self._position_metric_tag(position)
+            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
+            self._accumulate_monitoring_stat(
+                f"{stats_prefix}/hidden_norm_sum",
+                hidden_norms[:, position].sum(),
+            )
+            self._accumulate_monitoring_stat(
+                f"{stats_prefix}/retrieved_norm_sum",
+                retrieved_norms[:, position].sum(),
+            )
+            self._accumulate_monitoring_stat(f"{stats_prefix}/count", token_count)
+
+    def _iter_read_monitoring_parts(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> Tuple[Tuple[str, torch.Tensor, torch.Tensor], ...]:
+        if hidden_states.shape != retrieved_states.shape:
+            raise ValueError(
+                "CrossAttentionSlotMemory read monitoring expects hidden/retrieved tensors "
+                f"with matching shapes, got {tuple(hidden_states.shape)} and "
+                f"{tuple(retrieved_states.shape)}"
+            )
+
+        memory_tokens = min(self.num_mem_tokens, hidden_states.shape[1])
+        context_tokens = hidden_states.shape[1] - memory_tokens
+        partitions = []
+        if context_tokens > 0:
+            partitions.append(
+                (
+                    "context",
+                    hidden_states[:, :context_tokens, :],
+                    retrieved_states[:, :context_tokens, :],
+                )
+            )
+        if memory_tokens > 0:
+            partitions.append(
+                (
+                    "memory",
+                    hidden_states[:, context_tokens:, :],
+                    retrieved_states[:, context_tokens:, :],
+                )
+            )
+        return tuple(partitions)
+
+    def _accumulate_read_monitoring_stats(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> None:
+        if self.log_read_position_metrics_to_tensorboard:
+            self._accumulate_read_position_monitoring_stats(hidden_states, retrieved_states)
+
+        for (
+            partition_name,
+            hidden_part,
+            retrieved_part,
+        ) in self._iter_read_monitoring_parts(
+            hidden_states,
+            retrieved_states,
+        ):
+            hidden_norms = torch.linalg.vector_norm(hidden_part.float(), dim=-1)
+            retrieved_norms = torch.linalg.vector_norm(retrieved_part.float(), dim=-1)
+            token_count = self._count_tensor(hidden_norms.numel(), hidden_part.device)
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_hidden_norm_sum", hidden_norms.sum()
+            )
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_retrieved_norm_sum", retrieved_norms.sum()
+            )
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_retrieved_norm_count", token_count
+            )
+
+    def _prepare_memory_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.input_pre_norm is not None:
+            return self.input_pre_norm(hidden_states)
+        return hidden_states
+
     def consume_monitoring_primitives(self):
+        if not self._collect_monitoring_for_current_iteration:
+            self.reset_monitoring_stats()
+            return {}
+
         stats = self._monitoring_stats
         primitives = {}
 
-        if "retrieved_norm_count" in stats:
-            primitives["armt/read/retrieved_norm_mean"] = build_mean_metric(
-                stats["retrieved_norm_sum"],
-                stats["retrieved_norm_count"],
+        for partition_name in ("context", "memory"):
+            retrieved_count_key = f"{partition_name}_retrieved_norm_count"
+            if retrieved_count_key not in stats:
+                continue
+            primitives[f"armt/read/{partition_name}_retrieved_norm_mean"] = build_mean_metric(
+                stats[f"{partition_name}_retrieved_norm_sum"],
+                stats[retrieved_count_key],
             )
-            primitives["armt/read/retrieved_to_hidden_ratio"] = build_ratio_metric(
-                stats["retrieved_norm_sum"],
-                stats["hidden_norm_sum"],
+            primitives[
+                f"armt/read/retrieved_to_{partition_name}_hidden_ratio"
+            ] = build_ratio_metric(
+                stats[f"{partition_name}_retrieved_norm_sum"],
+                stats[f"{partition_name}_hidden_norm_sum"],
+            )
+
+        position_count_keys = sorted(
+            key
+            for key in stats
+            if key.startswith(f"{_READ_POSITION_MONITORING_PREFIX}/") and key.endswith("/count")
+        )
+        for count_key in position_count_keys:
+            position_tag = count_key.split("/")[1]
+            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
+            primitives[f"armt/read/retrieved_norm_mean/{position_tag}"] = build_mean_metric(
+                stats[f"{stats_prefix}/retrieved_norm_sum"],
+                stats[count_key],
+            )
+            primitives[f"armt/read/retrieved_to_hidden_ratio/{position_tag}"] = (
+                build_ratio_metric(
+                    stats[f"{stats_prefix}/retrieved_norm_sum"],
+                    stats[f"{stats_prefix}/hidden_norm_sum"],
+                )
             )
 
         if "delta_mem_elem_count" in stats:
@@ -322,8 +504,7 @@ class CrossAttentionSlotMemory(nn.Module):
         hidden_states = self._gather_if_tp(hidden_states)
         if hidden_states.dtype != self.W_read_q.weight.dtype:
             hidden_states = hidden_states.to(dtype=self.W_read_q.weight.dtype)
-        if self.input_pre_norm is not None:
-            hidden_states = self.input_pre_norm(hidden_states)
+        memory_input_states = self._prepare_memory_input(hidden_states)
 
         self._maybe_initialize_memory(batch_size=hidden_states.shape[0], device=hidden_states.device)
         should_track_read_metrics = not self._first_chunk
@@ -331,20 +512,21 @@ class CrossAttentionSlotMemory(nn.Module):
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)
         else:
-            query = self._apply_norm(self._to_heads(self.W_read_q(hidden_states)), self.read_q_norm)
+            query = self._apply_norm(
+                self._to_heads(self.W_read_q(memory_input_states)),
+                self.read_q_norm,
+            )
             key = self._apply_norm(self._to_heads(self.W_read_k(self.mem_slots)), self.read_k_norm)
             value = self._to_heads(self.W_read_v(self.mem_slots))
 
             retrieved = self._read_attention(query, key, value)
             result = self.W_read_o(self._from_heads(retrieved))
 
-        if should_track_read_metrics:
-            hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
-            retrieved_norms = torch.linalg.vector_norm(result.float(), dim=-1)
-            token_count = self._count_tensor(hidden_norms.numel(), hidden_states.device)
-            self._accumulate_monitoring_stat("hidden_norm_sum", hidden_norms.sum())
-            self._accumulate_monitoring_stat("retrieved_norm_sum", retrieved_norms.sum())
-            self._accumulate_monitoring_stat("retrieved_norm_count", token_count)
+        if should_track_read_metrics and self._collect_monitoring_for_current_iteration:
+            self._accumulate_read_monitoring_stats(
+                hidden_states,
+                result,
+            )
 
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)
@@ -354,8 +536,7 @@ class CrossAttentionSlotMemory(nn.Module):
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_write_q.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_write_q.weight.dtype)
-        if self.input_pre_norm is not None:
-            mem_tokens = self.input_pre_norm(mem_tokens)
+        mem_tokens = self._prepare_memory_input(mem_tokens)
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
 
@@ -382,38 +563,41 @@ class CrossAttentionSlotMemory(nn.Module):
         updated_slots = (1.0 - write_gate) * slot_state + write_gate * delta_slots
         self.mem_slots = self.slot_norm(updated_slots)
 
-        slot_delta = self.mem_slots - slot_state
-        self._accumulate_monitoring_stat("delta_mem_sq_sum", slot_delta.float().square().sum())
-        self._accumulate_monitoring_stat(
-            "delta_mem_elem_count",
-            self._count_tensor(slot_delta.numel(), slot_delta.device),
-        )
-        self._accumulate_monitoring_stat("write_gate_sum", write_gate.float().sum())
-        self._accumulate_monitoring_stat(
-            "write_gate_elem_count",
-            self._count_tensor(write_gate.numel(), write_gate.device),
-        )
-        self._accumulate_monitoring_stat("slot_sq_sum", self.mem_slots.float().square().sum())
-        self._accumulate_monitoring_stat(
-            "slot_elem_count",
-            self._count_tensor(self.mem_slots.numel(), self.mem_slots.device),
-        )
+        if self._collect_monitoring_for_current_iteration:
+            slot_delta = self.mem_slots - slot_state
+            self._accumulate_monitoring_stat("delta_mem_sq_sum", slot_delta.float().square().sum())
+            self._accumulate_monitoring_stat(
+                "delta_mem_elem_count",
+                self._count_tensor(slot_delta.numel(), slot_delta.device),
+            )
+            self._accumulate_monitoring_stat("write_gate_sum", write_gate.float().sum())
+            self._accumulate_monitoring_stat(
+                "write_gate_elem_count",
+                self._count_tensor(write_gate.numel(), write_gate.device),
+            )
+            self._accumulate_monitoring_stat("slot_sq_sum", self.mem_slots.float().square().sum())
+            self._accumulate_monitoring_stat(
+                "slot_elem_count",
+                self._count_tensor(self.mem_slots.numel(), self.mem_slots.device),
+            )
 
-        slot_mass = write_weights.sum(dim=-2)
-        slot_prob = slot_mass / torch.clamp(slot_mass.sum(dim=-1, keepdim=True), min=_ENTROPY_EPSILON)
-        slot_entropy = -(slot_prob * torch.log(slot_prob + _ENTROPY_EPSILON)).sum(dim=-1)
-        max_slot_mass_ratio = slot_mass.max(dim=-1).values / torch.clamp(
-            slot_mass.sum(dim=-1), min=_ENTROPY_EPSILON
-        )
-        self._accumulate_monitoring_stat("slot_usage_entropy_sum", slot_entropy.sum())
-        self._accumulate_monitoring_stat(
-            "slot_usage_entropy_count",
-            self._count_tensor(slot_entropy.numel(), slot_entropy.device),
-        )
-        self._accumulate_monitoring_stat("max_slot_mass_ratio_sum", max_slot_mass_ratio.sum())
-        self._accumulate_monitoring_stat(
-            "max_slot_mass_ratio_count",
-            self._count_tensor(max_slot_mass_ratio.numel(), max_slot_mass_ratio.device),
-        )
+            slot_mass = write_weights.sum(dim=-2)
+            slot_prob = slot_mass / torch.clamp(
+                slot_mass.sum(dim=-1, keepdim=True), min=_ENTROPY_EPSILON
+            )
+            slot_entropy = -(slot_prob * torch.log(slot_prob + _ENTROPY_EPSILON)).sum(dim=-1)
+            max_slot_mass_ratio = slot_mass.max(dim=-1).values / torch.clamp(
+                slot_mass.sum(dim=-1), min=_ENTROPY_EPSILON
+            )
+            self._accumulate_monitoring_stat("slot_usage_entropy_sum", slot_entropy.sum())
+            self._accumulate_monitoring_stat(
+                "slot_usage_entropy_count",
+                self._count_tensor(slot_entropy.numel(), slot_entropy.device),
+            )
+            self._accumulate_monitoring_stat("max_slot_mass_ratio_sum", max_slot_mass_ratio.sum())
+            self._accumulate_monitoring_stat(
+                "max_slot_mass_ratio_count",
+                self._count_tensor(max_slot_mass_ratio.numel(), max_slot_mass_ratio.device),
+            )
 
         self._first_chunk = False

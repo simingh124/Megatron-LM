@@ -71,6 +71,15 @@ def add_armt_args(parser):
             "the existing aggregated armt/* metrics. Requires TensorBoard logging to be enabled."
         ),
     )
+    group.add_argument(
+        "--armt-log-read-position-metrics-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit aggregated per-position ARMT read metrics under "
+            "armt/read/*/pos_XXXX. Requires TensorBoard logging to be enabled."
+        ),
+    )
 
     return parser
 

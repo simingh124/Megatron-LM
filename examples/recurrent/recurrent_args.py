@@ -29,6 +29,7 @@ RECURRENT_DEFAULTS = {
     "recurrent_gdn_value_head_dim": None,
     "recurrent_gdn_num_key_heads": None,
     "recurrent_gdn_num_value_heads": None,
+    "recurrent_gdn_read_mode": "normal",
     "recurrent_slot_num_slots": None,
     "recurrent_slot_num_heads": None,
     "recurrent_slot_head_dim": None,
@@ -198,6 +199,15 @@ def add_recurrent_args(parser):
         type=int,
         default=RECURRENT_DEFAULTS["recurrent_gdn_num_value_heads"],
         help="Number of value heads for recurrent GDN backend.",
+    )
+    group.add_argument(
+        "--recurrent-gdn-read-mode",
+        choices=["buggy", "normal"],
+        default=RECURRENT_DEFAULTS["recurrent_gdn_read_mode"],
+        help=(
+            "Read path for the recurrent GDN backend: keep the legacy delta-rule path "
+            "(`buggy`) or use the normal direct state readout (`normal`)."
+        ),
     )
     group.add_argument(
         "--recurrent-slot-num-slots",
@@ -387,6 +397,8 @@ def validate_recurrent_constraints(
             raise ValueError("recurrent_gdn_num_key_heads must be a multiple of TP")
         if args.recurrent_gdn_num_value_heads % tp != 0:
             raise ValueError("recurrent_gdn_num_value_heads must be a multiple of TP")
+        if args.recurrent_gdn_read_mode not in ("buggy", "normal"):
+            raise ValueError("recurrent_gdn_read_mode must be either 'buggy' or 'normal'")
 
         if args.recurrent_gdn_use_fla_kernel and find_spec("fla") is None:
             raise ImportError(

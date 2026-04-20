@@ -4,6 +4,101 @@ from unittest.mock import patch
 
 from megatron.core.models.armt.associative_layer import DPFP, AssociativeLayer
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+class _ScaleNorm(torch.nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states * self.scale
+
+
+def _build_config(hidden_size: int, *, dtype: torch.dtype = torch.float32, num_layers: int = 2):
+    return TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=4 if hidden_size % 4 == 0 else 1,
+        ffn_hidden_size=hidden_size * 4,
+        params_dtype=dtype,
+    )
+
+
+def _build_layer(**overrides):
+    d_model = overrides.get("d_model", overrides.get("hidden_size", 256))
+    params_dtype = overrides.pop("dtype", torch.float32)
+    num_layers = overrides.pop("num_layers", 2)
+    kwargs = dict(
+        config=overrides.pop("config", _build_config(d_model, dtype=params_dtype, num_layers=num_layers)),
+        d_model=d_model,
+        num_mem_tokens=16,
+        d_mem=64,
+        n_heads=4,
+        nu=4,
+        tbptt_mode=True,
+        dtype=params_dtype,
+        use_qk_norm=False,
+        use_input_pre_norm=False,
+        normalization="LayerNorm",
+    )
+    kwargs.update(overrides)
+    return AssociativeLayer(**kwargs)
+
+
+def _expected_partitioned_read_metrics(
+    hidden_states: torch.Tensor,
+    retrieved_states: torch.Tensor,
+    num_mem_tokens: int,
+):
+    memory_tokens = min(num_mem_tokens, hidden_states.shape[1])
+    context_tokens = hidden_states.shape[1] - memory_tokens
+    expected = {}
+
+    if context_tokens > 0:
+        context_hidden = hidden_states[:, :context_tokens, :]
+        context_retrieved = retrieved_states[:, :context_tokens, :]
+        expected["armt/read/context_retrieved_norm_mean"] = torch.linalg.vector_norm(
+            context_retrieved.float(), dim=-1
+        ).mean()
+        expected["armt/read/retrieved_to_context_hidden_ratio"] = (
+            torch.linalg.vector_norm(context_retrieved.float(), dim=-1).sum()
+            / torch.linalg.vector_norm(context_hidden.float(), dim=-1).sum()
+        )
+
+    if memory_tokens > 0:
+        memory_hidden = hidden_states[:, context_tokens:, :]
+        memory_retrieved = retrieved_states[:, context_tokens:, :]
+        expected["armt/read/memory_retrieved_norm_mean"] = torch.linalg.vector_norm(
+            memory_retrieved.float(), dim=-1
+        ).mean()
+        expected["armt/read/retrieved_to_memory_hidden_ratio"] = (
+            torch.linalg.vector_norm(memory_retrieved.float(), dim=-1).sum()
+            / torch.linalg.vector_norm(memory_hidden.float(), dim=-1).sum()
+        )
+
+    return expected
+
+
+def _expected_position_read_metrics(
+    hidden_states: torch.Tensor,
+    retrieved_states: torch.Tensor,
+):
+    hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+    retrieved_norms = torch.linalg.vector_norm(retrieved_states.float(), dim=-1)
+    expected = {}
+
+    for position in range(hidden_states.shape[1]):
+        position_tag = f"pos_{position:04d}"
+        expected[f"armt/read/retrieved_norm_mean/{position_tag}"] = retrieved_norms[
+            :, position
+        ].mean()
+        expected[f"armt/read/retrieved_to_hidden_ratio/{position_tag}"] = (
+            retrieved_norms[:, position].sum() / hidden_norms[:, position].sum()
+        )
+
+    return expected
 
 
 class TestDPFP:
@@ -31,24 +126,10 @@ class TestDPFP:
 class TestAssociativeLayer:
     @pytest.fixture
     def layer(self):
-        return AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-        )
+        return _build_layer()
 
     def test_associative_layer_accepts_explicit_head_dim_without_hidden_size_match(self):
-        layer = AssociativeLayer(
-            d_model=70,
-            d_mem=64,
-            n_heads=4,
-            head_dim=6,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-        )
+        layer = _build_layer(d_model=70, d_mem=64, n_heads=4, head_dim=6)
         batch_size = 2
         layer.reset_memory(batch_size)
         layer.update_mem(
@@ -67,42 +148,33 @@ class TestAssociativeLayer:
         )
 
     def test_associative_layer_input_pre_norm_defaults_to_disabled(self):
-        layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-        )
+        layer = _build_layer()
 
         assert layer.use_input_pre_norm is False
         assert layer.input_pre_norm is None
 
     def test_associative_layer_qk_norm_defaults_to_disabled(self):
-        layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-        )
+        layer = _build_layer()
 
         assert layer.use_qk_norm is False
+
+    def test_associative_layer_native_init_matches_megatron_defaults(self):
+        torch.manual_seed(1234)
+        layer = _build_layer(d_model=128, d_mem=128, num_layers=8)
+
+        query_std = float(layer.W_mq.weight.float().std())
+        value_std = float(layer.W_mv.weight.float().std())
+        output_std = float(layer.W_mo.weight.float().std())
+
+        assert query_std == pytest.approx(0.02, rel=0.2)
+        assert value_std == pytest.approx(0.02, rel=0.2)
+        assert output_std == pytest.approx(0.005, rel=0.3)
+        assert torch.allclose(layer.W_mb.bias, torch.zeros_like(layer.W_mb.bias))
 
     def test_associative_layer_qk_norm_controls_normalize_calls(self):
         batch_size = 2
 
-        disabled_layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-            use_qk_norm=False,
-        )
+        disabled_layer = _build_layer(use_qk_norm=False)
         disabled_layer.reset_memory(batch_size)
         disabled_layer._first_chunk = False
 
@@ -121,15 +193,7 @@ class TestAssociativeLayer:
 
         assert normalize_mock.call_count == 0
 
-        enabled_layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-            use_qk_norm=True,
-        )
+        enabled_layer = _build_layer(use_qk_norm=True)
         enabled_layer.reset_memory(batch_size)
         enabled_layer._first_chunk = False
 
@@ -149,16 +213,7 @@ class TestAssociativeLayer:
         assert normalize_mock.call_count == 2
 
     def test_associative_layer_can_enable_input_pre_norm(self):
-        layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-            use_input_pre_norm=True,
-            normalization="RMSNorm",
-        )
+        layer = _build_layer(use_input_pre_norm=True, normalization="RMSNorm")
         batch_size = 2
         layer.reset_memory(batch_size)
         layer.update_mem(
@@ -183,15 +238,7 @@ class TestAssociativeLayer:
         assert layer.W_mem.shape[0] == batch_size
 
     def test_memory_state_breakdown_uses_pre_dpfp_memory_width(self):
-        layer = AssociativeLayer(
-            d_model=256,
-            d_mem=64,
-            n_heads=4,
-            head_dim=6,
-            nu=4,
-            tbptt_mode=True,
-            dtype=torch.float32,
-        )
+        layer = _build_layer(head_dim=6)
 
         assert layer.get_memory_state_breakdown(batch_size=1) == [
             ("W_mem", layer.n_heads * (layer.d_mem // layer.n_heads) * layer.head_dim)
@@ -216,8 +263,10 @@ class TestAssociativeLayer:
 
         metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
 
-        assert "armt/read/retrieved_norm_mean" not in metrics
-        assert "armt/read/retrieved_to_hidden_ratio" not in metrics
+        assert "armt/read/context_retrieved_norm_mean" not in metrics
+        assert "armt/read/memory_retrieved_norm_mean" not in metrics
+        assert "armt/read/retrieved_to_context_hidden_ratio" not in metrics
+        assert "armt/read/retrieved_to_memory_hidden_ratio" not in metrics
 
     def test_associative_layer_tbptt_detaches_inputs_but_trains_write_weights(self, layer):
         """验证 TBPTT 模式：
@@ -293,13 +342,7 @@ class TestAssociativeLayer:
 
     def test_reset_memory_detaches_recurrent_state_between_microbatches(self):
         """验证 reset_memory 会切断上一微批挂在 memory state 上的计算图。"""
-        layer = AssociativeLayer(
-            d_model=128,
-            d_mem=64,
-            n_heads=4,
-            nu=4,
-            tbptt_mode=False,
-        )
+        layer = _build_layer(d_model=128, tbptt_mode=False)
         batch_size = 2
         layer.reset_memory(batch_size)
 
@@ -334,41 +377,158 @@ class TestAssociativeLayer:
         second_retrieved = layer.associate(second_hidden_states, input_is_sbh=False)
 
         metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        expected_metrics = _expected_partitioned_read_metrics(
+            second_hidden_states,
+            second_retrieved,
+            layer.num_mem_tokens,
+        )
 
-        assert "armt/read/retrieved_norm_mean" in metrics
-        assert "armt/read/retrieved_to_hidden_ratio" in metrics
+        assert "armt/read/context_retrieved_norm_mean" in metrics
+        assert "armt/read/memory_retrieved_norm_mean" in metrics
+        assert "armt/read/retrieved_to_context_hidden_ratio" in metrics
+        assert "armt/read/retrieved_to_memory_hidden_ratio" in metrics
         assert "armt/write/delta_mem_norm" in metrics
         assert "armt/write/write_gate_mean" in metrics
         assert "armt/state/W_mem_norm" in metrics
         assert "armt/state/z_norm" in metrics
-        expected_retrieved_norm_mean = torch.linalg.vector_norm(
-            second_retrieved.float(), dim=-1
-        ).mean()
-        expected_retrieved_to_hidden_ratio = (
-            torch.linalg.vector_norm(second_retrieved.float(), dim=-1).sum()
-            / torch.linalg.vector_norm(second_hidden_states.float(), dim=-1).sum()
-        )
-        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(
-            float(expected_retrieved_norm_mean), rel=1e-5
-        )
-        assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(
-            float(expected_retrieved_to_hidden_ratio), rel=1e-4
-        )
+        for metric_name, expected_value in expected_metrics.items():
+            rel = 1e-4 if "ratio" in metric_name else 1e-5
+            assert float(metrics[metric_name]) == pytest.approx(float(expected_value), rel=rel)
+        assert "armt/read/retrieved_norm_mean" not in metrics
+        assert "armt/read/retrieved_to_hidden_ratio" not in metrics
+        assert "armt/read/retrieved_norm_mean/pos_0000" not in metrics
+        assert "armt/read/retrieved_to_hidden_ratio/pos_0000" not in metrics
         assert float(metrics["armt/write/delta_mem_norm"]) >= 0.0
         assert float(metrics["armt/state/W_mem_norm"]) >= 0.0
         assert layer.consume_monitoring_primitives() == {}
 
+    def test_associative_layer_position_monitoring_metrics(self):
+        layer = _build_layer(d_model=128, log_read_position_metrics_to_tensorboard=True)
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+
+        layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        hidden_states = torch.randn(batch_size, 12, layer.d_model)
+        retrieved = layer.associate(hidden_states, input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        expected_metrics = _expected_position_read_metrics(hidden_states, retrieved)
+
+        for metric_name, expected_value in expected_metrics.items():
+            rel = 1e-4 if "ratio" in metric_name else 1e-5
+            assert float(metrics[metric_name]) == pytest.approx(float(expected_value), rel=rel)
+
+    def test_associative_layer_monitoring_can_be_disabled_for_current_iteration(self):
+        layer = _build_layer(d_model=128, log_read_position_metrics_to_tensorboard=True)
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+        layer.set_collect_monitoring_for_current_iteration(False)
+
+        layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        layer.associate(torch.randn(batch_size, 12, layer.d_model), input_is_sbh=False)
+
+        assert finalize_metric_primitives(layer.consume_monitoring_primitives()) == {}
+
+    def test_associative_layer_monitoring_with_memory_only_read_emits_memory_metrics(self):
+        layer = _build_layer(d_model=128)
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+
+        layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        memory_only_hidden = torch.randn(batch_size, layer.num_mem_tokens, layer.d_model)
+        memory_only_retrieved = layer.associate(memory_only_hidden, input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        expected_metrics = _expected_partitioned_read_metrics(
+            memory_only_hidden,
+            memory_only_retrieved,
+            layer.num_mem_tokens,
+        )
+
+        assert "armt/read/context_retrieved_norm_mean" not in metrics
+        assert "armt/read/retrieved_to_context_hidden_ratio" not in metrics
+        assert float(metrics["armt/read/memory_retrieved_norm_mean"]) == pytest.approx(
+            float(expected_metrics["armt/read/memory_retrieved_norm_mean"]), rel=1e-5
+        )
+        assert float(metrics["armt/read/retrieved_to_memory_hidden_ratio"]) == pytest.approx(
+            float(expected_metrics["armt/read/retrieved_to_memory_hidden_ratio"]),
+            rel=1e-4,
+        )
+
+    def test_associative_layer_monitoring_with_zero_mem_tokens_emits_context_metrics_only(self):
+        layer = _build_layer(d_model=128, num_mem_tokens=0)
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+
+        layer.associate(torch.randn(batch_size, 8, layer.d_model), input_is_sbh=False)
+        layer.update_mem(torch.randn(batch_size, 0, layer.d_model), input_is_sbh=False)
+        hidden_states = torch.randn(batch_size, 8, layer.d_model)
+        retrieved = layer.associate(hidden_states, input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        expected_metrics = _expected_partitioned_read_metrics(
+            hidden_states,
+            retrieved,
+            layer.num_mem_tokens,
+        )
+
+        assert "armt/read/memory_retrieved_norm_mean" not in metrics
+        assert "armt/read/retrieved_to_memory_hidden_ratio" not in metrics
+        assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(
+            float(expected_metrics["armt/read/context_retrieved_norm_mean"]), rel=1e-5
+        )
+        assert float(metrics["armt/read/retrieved_to_context_hidden_ratio"]) == pytest.approx(
+            float(expected_metrics["armt/read/retrieved_to_context_hidden_ratio"]),
+            rel=1e-4,
+        )
+
+    def test_associative_layer_monitoring_uses_hidden_ratio_even_with_input_pre_norm(self):
+        layer = _build_layer(d_model=128, use_input_pre_norm=True)
+        layer.input_pre_norm = _ScaleNorm(2.0)
+        batch_size = 2
+        layer.reset_memory(batch_size)
+        layer.W_mv.weight.data.normal_()
+
+        layer.associate(torch.randn(batch_size, 24, layer.d_model), input_is_sbh=False)
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+        )
+        hidden_states = torch.randn(batch_size, 24, layer.d_model)
+        retrieved = layer.associate(hidden_states, input_is_sbh=False)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        expected_metrics = _expected_partitioned_read_metrics(
+            hidden_states,
+            retrieved,
+            layer.num_mem_tokens,
+        )
+
+        assert float(metrics["armt/read/retrieved_to_context_hidden_ratio"]) == pytest.approx(
+            float(expected_metrics["armt/read/retrieved_to_context_hidden_ratio"]),
+            rel=1e-4,
+        )
+        assert "armt/read/retrieved_to_context_memory_input_ratio" not in metrics
+
     def test_associative_layer_monitoring_skips_z_norm_without_denom(self):
         """验证 use_denom=False 时不会导出 z_norm。"""
-        layer = AssociativeLayer(
-            d_model=128,
-            d_mem=64,
-            n_heads=4,
-            head_dim=16,
-            nu=4,
-            use_denom=False,
-            tbptt_mode=True,
-        )
+        layer = _build_layer(d_model=128, head_dim=16, use_denom=False)
         batch_size = 2
         layer.reset_memory(batch_size)
         layer.update_mem(

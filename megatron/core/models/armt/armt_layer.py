@@ -43,12 +43,14 @@ class ARMTLayer(TransformerLayer):
         recurrent_gdn_value_head_dim: Optional[int] = None,
         recurrent_gdn_num_key_heads: Optional[int] = None,
         recurrent_gdn_num_value_heads: Optional[int] = None,
+        recurrent_gdn_read_mode: str = "normal",
         recurrent_slot_num_slots: Optional[int] = None,
         recurrent_slot_num_heads: Optional[int] = None,
         recurrent_slot_head_dim: Optional[int] = None,
         recurrent_slot_read_attn_backend: str = "flash",
         recurrent_mem_qk_norm: bool = False,
         recurrent_memory_input_pre_norm: bool = False,
+        log_read_position_metrics_to_tensorboard: bool = False,
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
@@ -63,15 +65,19 @@ class ARMTLayer(TransformerLayer):
         self.recurrent_memory_backend = recurrent_memory_backend
         self.associative_layer = None
         self.recurrent_memory_layer = None
+        params_dtype = getattr(config, "params_dtype", torch.bfloat16)
 
         common_kwargs = {
+            "config": config,
             "d_model": config.hidden_size,
             "num_mem_tokens": num_mem_tokens,
-            "dtype": getattr(config, "params_dtype", torch.bfloat16),
             "tbptt_mode": tbptt_mode,
             "normalization": getattr(config, "normalization", "LayerNorm"),
             "norm_epsilon": getattr(config, "layernorm_epsilon", 1e-5),
             "use_input_pre_norm": recurrent_memory_input_pre_norm,
+            "log_read_position_metrics_to_tensorboard": (
+                log_read_position_metrics_to_tensorboard
+            ),
         }
 
         if recurrent_memory_backend == "associative":
@@ -85,6 +91,7 @@ class ARMTLayer(TransformerLayer):
                 correction=correction,
                 nu=nu,
                 use_qk_norm=recurrent_mem_qk_norm,
+                dtype=params_dtype,
                 **common_kwargs,
             )
         elif recurrent_memory_backend == "cross_attn_slots":
@@ -95,6 +102,7 @@ class ARMTLayer(TransformerLayer):
                 head_dim=recurrent_slot_head_dim,
                 read_attn_backend=recurrent_slot_read_attn_backend,
                 use_qk_norm=recurrent_mem_qk_norm,
+                dtype=params_dtype,
                 **common_kwargs,
             )
         else:
@@ -105,6 +113,7 @@ class ARMTLayer(TransformerLayer):
                 value_head_dim=recurrent_gdn_value_head_dim,
                 num_key_heads=recurrent_gdn_num_key_heads,
                 num_value_heads=recurrent_gdn_num_value_heads,
+                read_mode=recurrent_gdn_read_mode,
                 use_fla_kernel=recurrent_gdn_use_fla_kernel,
                 use_causal_conv1d=recurrent_gdn_use_causal_conv1d,
                 use_qk_l2norm=recurrent_mem_qk_norm,
@@ -113,6 +122,7 @@ class ARMTLayer(TransformerLayer):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
         self._current_chunk_start_position = 0
+        self._collect_monitoring_for_current_iteration = True
         self.reset_monitoring_stats()
 
     def _get_memory_layer(self):
@@ -133,6 +143,13 @@ class ARMTLayer(TransformerLayer):
         self_attention = getattr(self, "self_attention", None)
         if hasattr(self_attention, "set_current_chunk_start_position"):
             self_attention.set_current_chunk_start_position(position)
+
+    def set_collect_monitoring_for_current_iteration(self, enabled: bool):
+        self._collect_monitoring_for_current_iteration = bool(enabled)
+        memory_layer = self._get_memory_layer()
+        setter = getattr(memory_layer, "set_collect_monitoring_for_current_iteration", None)
+        if callable(setter):
+            setter(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats = {}
@@ -213,6 +230,10 @@ class ARMTLayer(TransformerLayer):
         )
 
     def consume_monitoring_primitives(self):
+        if not self._collect_monitoring_for_current_iteration:
+            self.reset_monitoring_stats()
+            return {}
+
         primitives = {}
         stats = self._monitoring_stats
 
@@ -298,11 +319,12 @@ class ARMTLayer(TransformerLayer):
             context_part = monitoring_hidden_states[:, :-self.num_mem_tokens, :]
             mem_part = monitoring_hidden_states[:, -self.num_mem_tokens :, :]
 
-        self._update_token_monitoring_stats(
-            context_part,
-            mem_part,
-            input_is_sbh=input_is_sbh,
-        )
+        if self._collect_monitoring_for_current_iteration:
+            self._update_token_monitoring_stats(
+                context_part,
+                mem_part,
+                input_is_sbh=input_is_sbh,
+            )
         memory_layer.update_mem(mem_part, input_is_sbh=input_is_sbh)
 
         return hidden_states, context

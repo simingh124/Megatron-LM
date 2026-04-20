@@ -10,6 +10,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
+from .init_utils import init_parameter
 from .armt_layer import ARMTLayer
 from .monitoring import finalize_metric_primitives, merge_metric_primitives
 from .windowed_attention_utils import should_use_windowed_full_attention
@@ -48,6 +49,7 @@ class ARMTModel(GPTModel):
         )
         self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
         self.log_layer_metrics_to_tensorboard = bool(log_layer_metrics_to_tensorboard)
+        self._collect_monitoring_for_current_iteration = True
         self._use_windowed_full_attention = should_use_windowed_full_attention(
             recurrent_chunk_size=self.recurrent_chunk_size,
             full_attn_window_size=self.full_attn_window_size,
@@ -57,9 +59,22 @@ class ARMTModel(GPTModel):
         self._current_chunk_is_first = False
         self._current_chunk_start_position = 0
 
-        init_std = getattr(config, "init_method_std", 0.02)
+        memory_device = None
+        if not getattr(config, "use_cpu_initialization", False) and torch.cuda.is_available():
+            memory_device = torch.cuda.current_device()
+
         self.memory_embeddings = nn.Parameter(
-            torch.randn(num_mem_tokens, config.hidden_size) * init_std
+            torch.empty(
+                num_mem_tokens,
+                config.hidden_size,
+                dtype=config.params_dtype,
+                device=memory_device,
+            )
+        )
+        init_parameter(
+            self.memory_embeddings,
+            config.embedding_init_method,
+            perform_initialization=config.perform_initialization,
         )
 
     def _armt_layers(self):
@@ -73,6 +88,10 @@ class ARMTModel(GPTModel):
         if metric_name.startswith("armt/"):
             return f"{metric_name}/{layer_tag}"
         return f"armt/{metric_name}/{layer_tag}"
+
+    @staticmethod
+    def _should_expand_layer_metric(metric_name: str) -> bool:
+        return "/pos_" not in metric_name
 
     def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
         if self.num_mem_tokens == 0:
@@ -152,7 +171,18 @@ class ARMTModel(GPTModel):
         for module in self._armt_layers():
             module.reset_monitoring_stats()
 
+    def set_collect_monitoring_for_current_iteration(self, enabled: bool):
+        self._collect_monitoring_for_current_iteration = bool(enabled)
+        for module in self._armt_layers():
+            module.set_collect_monitoring_for_current_iteration(enabled)
+
+    def should_collect_monitoring_for_current_iteration(self) -> bool:
+        return self._collect_monitoring_for_current_iteration
+
     def consume_all_monitoring_primitives(self):
+        if not self._collect_monitoring_for_current_iteration:
+            return {}
+
         primitives = {}
         for fallback_layer_idx, module in enumerate(self._armt_layers(), start=1):
             layer_number = getattr(module, "layer_number", fallback_layer_idx)
@@ -160,6 +190,8 @@ class ARMTModel(GPTModel):
             merge_metric_primitives(primitives, layer_primitives)
             if self.log_layer_metrics_to_tensorboard:
                 for metric_name, primitive in layer_primitives.items():
+                    if not self._should_expand_layer_metric(metric_name):
+                        continue
                     primitives[
                         self._layer_monitoring_metric_name(metric_name, int(layer_number))
                     ] = primitive

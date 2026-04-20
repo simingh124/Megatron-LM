@@ -5,6 +5,8 @@ import re
 import subprocess
 from importlib.util import find_spec
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -16,6 +18,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.models.armt.armt_model import ARMTModel
 from megatron.core.models.armt.armt_layer_specs import get_armt_layer_spec
+from examples.armt import train as armt_train_entry
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -440,6 +443,85 @@ def test_format_loss_comparison_summary_includes_losses_and_relative_error():
     assert "iteration | flash_loss | sdpa_loss | relative_error" in summary
     assert "1 | 2.000000 | 2.002000 | 0.0009990010" in summary
     assert "2 | 1.000000 | 0.999000 | 0.0010010010" in summary
+
+
+def test_model_provider_threads_gdn_read_mode_to_layer_spec():
+    args = SimpleNamespace(
+        ckpt_format=None,
+        load=None,
+        dist_ckpt_strictness=None,
+        recurrent_tbptt_mode=False,
+        transformer_impl="local",
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=False,
+        multi_latent_attention=False,
+        fp8=None,
+        moe_use_legacy_grouped_gemm=False,
+        normalization="RMSNorm",
+        qk_l2_norm=False,
+        use_kitchen=False,
+        use_kitchen_attention=False,
+        kitchen_attention_backend="sdpa",
+        num_mem_tokens=4,
+        armt_d_mem=64,
+        armt_n_heads=1,
+        armt_head_dim=None,
+        armt_nu=3,
+        armt_use_denom=True,
+        armt_gating=False,
+        armt_correction=True,
+        recurrent_chunk_size=64,
+        full_attn_window_size=None,
+        armt_windowed_full_attn_backend="native",
+        armt_equal_window_full_attn_path="legacy",
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_use_fla_kernel=False,
+        recurrent_gdn_use_causal_conv1d=False,
+        recurrent_gdn_conv_kernel_size=2,
+        recurrent_gdn_key_head_dim=16,
+        recurrent_gdn_value_head_dim=16,
+        recurrent_gdn_num_key_heads=4,
+        recurrent_gdn_num_value_heads=4,
+        recurrent_gdn_read_mode="buggy",
+        recurrent_slot_num_slots=8,
+        recurrent_slot_num_heads=4,
+        recurrent_slot_head_dim=16,
+        recurrent_slot_read_attn_backend="sdpa",
+        recurrent_mem_qk_norm=False,
+        recurrent_memory_input_pre_norm=True,
+        armt_log_read_position_metrics_to_tensorboard=False,
+        max_position_embeddings=128,
+        seq_length=64,
+        padded_vocab_size=32000,
+        armt_log_layer_metrics_to_tensorboard=False,
+        fp16_lm_cross_entropy=False,
+        untie_embeddings_and_output_weights=False,
+        position_embedding_type="rope",
+        rotary_percent=1.0,
+        rotary_base=10000,
+        use_rope_scaling=False,
+    )
+    fake_config = object()
+    fake_model = object()
+
+    with patch.object(armt_train_entry, "get_args", return_value=args), patch.object(
+        armt_train_entry, "validate_armt_constraints"
+    ), patch.object(
+        armt_train_entry,
+        "_disable_incompatible_fusions_for_no_tbptt",
+        side_effect=lambda args, config=None: config,
+    ), patch.object(
+        armt_train_entry, "core_transformer_config_from_args", return_value=fake_config
+    ), patch.object(
+        armt_train_entry, "get_armt_layer_spec", return_value="layer_spec"
+    ) as layer_spec_mock, patch.object(
+        armt_train_entry, "ARMTModel", return_value=fake_model
+    ):
+        model = armt_train_entry.model_provider()
+
+    assert model is fake_model
+    assert layer_spec_mock.call_args.kwargs["recurrent_gdn_read_mode"] == "buggy"
 
 
 class TestARMTTraining:

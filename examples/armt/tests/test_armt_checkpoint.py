@@ -1,6 +1,8 @@
+import math
 import os
 import tempfile
 
+import pytest
 import torch
 
 from examples.armt.tools.convert_baseline_to_armt import (
@@ -64,7 +66,7 @@ def test_W_mem_z_not_saved():
 
 
 def test_baseline_to_armt_conversion():
-    """验证转换工具会补齐 associative_layer 权重，并保证 W_mv 为全零初始化（residual-friendly）。"""
+    """验证转换工具会按 Megatron 默认方案补齐 associative_layer 权重初始化。"""
     with tempfile.TemporaryDirectory() as tmpdir:
         hidden_size = 32
         baseline = _write_baseline(tmpdir, hidden_size)
@@ -83,9 +85,18 @@ def test_baseline_to_armt_conversion():
         armt_state = torch.load(armt_path, map_location="cpu")
         assert "decoder.layers.0.associative_layer.W_mq.weight" in armt_state
         assert "decoder.layers.0.associative_layer.W_mv.weight" in armt_state
+        assert float(
+            armt_state["decoder.layers.0.associative_layer.W_mq.weight"].float().std()
+        ) == pytest.approx(config.init_method_std, rel=0.3)
+        assert float(
+            armt_state["decoder.layers.0.associative_layer.W_mv.weight"].float().std()
+        ) == pytest.approx(config.init_method_std, rel=0.3)
+        assert float(
+            armt_state["decoder.layers.0.associative_layer.W_mo.weight"].float().std()
+        ) == pytest.approx(config.init_method_std / math.sqrt(2 * config.num_layers), rel=0.3)
         assert torch.allclose(
-            armt_state["decoder.layers.0.associative_layer.W_mv.weight"],
-            torch.zeros(hidden_size, hidden_size),
+            armt_state["decoder.layers.0.associative_layer.W_mb.bias"],
+            torch.zeros(hidden_size),
         )
 
 

@@ -1,6 +1,7 @@
 """Convert baseline GPT checkpoint to ARMT checkpoint format."""
 
 import argparse
+import math
 from dataclasses import dataclass
 from typing import Dict, Optional
 
@@ -16,12 +17,18 @@ class ARMTCheckpointConfig:
     armt_n_heads: int
     gating: bool
     armt_head_dim: Optional[int] = None
+    init_method_std: float = 0.02
+    embedding_init_method_std: Optional[float] = None
 
 
-def _get_emb_std(state: Dict) -> float:
-    if "embedding.word_embeddings.weight" in state:
-        return float(state["embedding.word_embeddings.weight"].std().item())
-    return 0.02
+def _get_embedding_init_std(config: ARMTCheckpointConfig) -> float:
+    if config.embedding_init_method_std is not None:
+        return config.embedding_init_method_std
+    return config.init_method_std
+
+
+def _get_output_init_std(config: ARMTCheckpointConfig) -> float:
+    return config.init_method_std / math.sqrt(2.0 * config.num_layers)
 
 
 def _get_armt_value_dim(config: ARMTCheckpointConfig) -> int:
@@ -49,11 +56,13 @@ def convert_baseline_to_armt(baseline_ckpt_path: str, armt_ckpt_path: str, confi
 
     armt_state = dict(baseline_state)
 
-    emb_std = _get_emb_std(baseline_state)
     value_dim = _get_armt_value_dim(config)
-    armt_state["memory_embeddings"] = torch.randn(
-        config.num_mem_tokens, config.hidden_size
-    ) * emb_std
+    armt_state["memory_embeddings"] = torch.empty(config.num_mem_tokens, config.hidden_size)
+    torch.nn.init.normal_(
+        armt_state["memory_embeddings"],
+        mean=0.0,
+        std=_get_embedding_init_std(config),
+    )
 
     for layer_idx in range(config.num_layers):
         prefix = f"decoder.layers.{layer_idx}.associative_layer."
@@ -61,16 +70,21 @@ def convert_baseline_to_armt(baseline_ckpt_path: str, armt_ckpt_path: str, confi
         armt_state[prefix + "W_mq.weight"] = torch.empty(
             config.d_mem, config.hidden_size
         )
-        torch.nn.init.trunc_normal_(armt_state[prefix + "W_mq.weight"], std=0.02)
+        torch.nn.init.normal_(armt_state[prefix + "W_mq.weight"], mean=0.0, std=config.init_method_std)
 
         armt_state[prefix + "W_mk.weight"] = torch.empty(
             config.d_mem, config.hidden_size
         )
-        torch.nn.init.trunc_normal_(armt_state[prefix + "W_mk.weight"], std=0.02)
+        torch.nn.init.normal_(armt_state[prefix + "W_mk.weight"], mean=0.0, std=config.init_method_std)
 
-        armt_state[prefix + "W_mv.weight"] = torch.zeros(value_dim, config.hidden_size)
+        armt_state[prefix + "W_mv.weight"] = torch.empty(value_dim, config.hidden_size)
+        torch.nn.init.normal_(armt_state[prefix + "W_mv.weight"], mean=0.0, std=config.init_method_std)
         armt_state[prefix + "W_mo.weight"] = torch.empty(config.hidden_size, value_dim)
-        torch.nn.init.trunc_normal_(armt_state[prefix + "W_mo.weight"], std=0.02)
+        torch.nn.init.normal_(
+            armt_state[prefix + "W_mo.weight"],
+            mean=0.0,
+            std=_get_output_init_std(config),
+        )
 
         if config.gating:
             out_dim = value_dim
@@ -78,7 +92,7 @@ def convert_baseline_to_armt(baseline_ckpt_path: str, armt_ckpt_path: str, confi
             out_dim = config.armt_n_heads
 
         armt_state[prefix + "W_mb.weight"] = torch.empty(out_dim, config.hidden_size)
-        torch.nn.init.trunc_normal_(armt_state[prefix + "W_mb.weight"], std=0.02)
+        torch.nn.init.normal_(armt_state[prefix + "W_mb.weight"], mean=0.0, std=config.init_method_std)
         armt_state[prefix + "W_mb.bias"] = torch.zeros(out_dim)
 
     if wrapper:
@@ -98,6 +112,8 @@ def _parse_args():
     parser.add_argument("--armt-n-heads", type=int, default=1)
     parser.add_argument("--armt-head-dim", type=int, default=None)
     parser.add_argument("--armt-gating", action="store_true", default=False)
+    parser.add_argument("--init-method-std", type=float, default=0.02)
+    parser.add_argument("--embedding-init-method-std", type=float, default=None)
     return parser.parse_args()
 
 
@@ -111,5 +127,7 @@ if __name__ == "__main__":
         armt_n_heads=args.armt_n_heads,
         armt_head_dim=args.armt_head_dim,
         gating=args.armt_gating,
+        init_method_std=args.init_method_std,
+        embedding_init_method_std=args.embedding_init_method_std,
     )
     convert_baseline_to_armt(args.baseline_ckpt, args.armt_ckpt, config)
