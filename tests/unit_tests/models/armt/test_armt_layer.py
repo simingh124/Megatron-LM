@@ -2,13 +2,14 @@ import torch
 import pytest
 from unittest.mock import MagicMock, patch
 
+from megatron.core.models.armt.associative_layer import AssociativeLayer
 from megatron.core.models.armt.armt_layer import ARMTLayer
 from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
 from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
 
-class _DummyAssociativeLayer(torch.nn.Module):
+class _DummyMemoryLayer(torch.nn.Module):
     def __init__(self, associate_return):
         super().__init__()
         self.associate = MagicMock(return_value=associate_return)
@@ -41,7 +42,7 @@ class TestARMTLayer:
             new=_minimal_init,
         ):
             layer = ARMTLayer(config=mock_config, submodules=MagicMock(), layer_number=1)
-            layer.associative_layer = _DummyAssociativeLayer(torch.zeros_like(hidden_states))
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(hidden_states))
 
         with patch(
             "megatron.core.models.armt.armt_layer.TransformerLayer.forward",
@@ -67,7 +68,7 @@ class TestARMTLayer:
             new=_minimal_init,
         ):
             layer = ARMTLayer(config=mock_config, submodules=MagicMock(), layer_number=1)
-            layer.associative_layer = _DummyAssociativeLayer(torch.zeros_like(hidden_states))
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(hidden_states))
             layer.num_mem_tokens = num_mem_tokens
 
         with patch(
@@ -76,9 +77,9 @@ class TestARMTLayer:
         ):
             layer.forward(hidden_states, attention_mask=None)
 
-        layer.associative_layer.associate.assert_called_once()
-        layer.associative_layer.update_mem.assert_called_once()
-        mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
+        layer.recurrent_memory_layer.associate.assert_called_once()
+        layer.recurrent_memory_layer.update_mem.assert_called_once()
+        mem_hidden = layer.recurrent_memory_layer.update_mem.call_args[0][0]
         assert mem_hidden.shape == (num_mem_tokens, B, H)
 
     def test_armt_layer_skip_read_memory_skips_associate_but_still_updates_memory(
@@ -104,7 +105,7 @@ class TestARMTLayer:
                 layer_number=1,
                 num_mem_tokens=num_mem_tokens,
             )
-            layer.associative_layer = _DummyAssociativeLayer(retrieved)
+            layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
 
         forwarded_inputs = []
 
@@ -122,8 +123,8 @@ class TestARMTLayer:
         ):
             out, _ = layer.forward(hidden_states, attention_mask=None)
 
-        layer.associative_layer.associate.assert_not_called()
-        layer.associative_layer.update_mem.assert_called_once()
+        layer.recurrent_memory_layer.associate.assert_not_called()
+        layer.recurrent_memory_layer.update_mem.assert_called_once()
         assert torch.equal(forwarded_inputs[0], hidden_states)
         assert torch.equal(out, hidden_states)
 
@@ -157,7 +158,7 @@ class TestARMTLayer:
                 layer_number=1,
                 num_mem_tokens=num_mem_tokens,
             )
-            layer.associative_layer = _DummyAssociativeLayer(torch.zeros_like(hidden_states))
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(hidden_states))
 
         with patch(
             "megatron.core.models.armt.armt_layer.TransformerLayer.forward",
@@ -176,7 +177,7 @@ class TestARMTLayer:
         assert float(metrics["armt/token/mem_token_cosine_gt_0p8_ratio_mean"]) == pytest.approx(
             1.0 / 6.0
         )
-        mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
+        mem_hidden = layer.recurrent_memory_layer.update_mem.call_args[0][0]
         assert torch.equal(mem_hidden, monitored_hidden[-num_mem_tokens:])
 
     def test_armt_layer_monitoring_skips_cosine_for_single_mem_token(self, mock_config):
@@ -204,7 +205,9 @@ class TestARMTLayer:
                 layer_number=1,
                 num_mem_tokens=1,
             )
-            layer.associative_layer = _DummyAssociativeLayer(torch.zeros_like(monitored_hidden))
+            layer.recurrent_memory_layer = _DummyMemoryLayer(
+                torch.zeros_like(monitored_hidden)
+            )
 
         with patch(
             "megatron.core.models.armt.armt_layer.TransformerLayer.forward",
@@ -249,7 +252,7 @@ class TestARMTLayer:
                 layer_number=1,
                 num_mem_tokens=2,
             )
-            layer.associative_layer = _DummyAssociativeLayer(torch.zeros_like(sharded_hidden))
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(sharded_hidden))
 
         with (
             patch(
@@ -279,7 +282,7 @@ class TestARMTLayer:
         ):
             layer.forward(sharded_hidden, attention_mask=None)
 
-        mem_hidden = layer.associative_layer.update_mem.call_args[0][0]
+        mem_hidden = layer.recurrent_memory_layer.update_mem.call_args[0][0]
         assert torch.equal(mem_hidden, full_hidden[-2:])
 
     def test_armt_layer_can_build_gated_deltanet_backend(self, mock_config):
@@ -306,7 +309,6 @@ class TestARMTLayer:
                 recurrent_gdn_num_value_heads=4,
             )
 
-        assert layer.associative_layer is None
         assert isinstance(layer.recurrent_memory_layer, GatedDeltaNetMemory)
 
     def test_armt_layer_can_build_associative_backend_with_explicit_head_dim(self, mock_config):
@@ -330,9 +332,9 @@ class TestARMTLayer:
                 armt_head_dim=6,
             )
 
-        assert layer.recurrent_memory_layer is None
-        assert layer.associative_layer.head_dim == 6
-        assert layer.associative_layer.W_mv.out_features == 24
+        assert isinstance(layer.recurrent_memory_layer, AssociativeLayer)
+        assert layer.recurrent_memory_layer.head_dim == 6
+        assert layer.recurrent_memory_layer.W_mv.out_features == 24
 
     def test_armt_layer_can_build_cross_attention_slot_backend(self, mock_config):
         mock_config.hidden_size = 70
@@ -357,7 +359,6 @@ class TestARMTLayer:
                 recurrent_slot_read_attn_backend="sdpa",
             )
 
-        assert layer.associative_layer is None
         assert isinstance(layer.recurrent_memory_layer, CrossAttentionSlotMemory)
         assert layer.recurrent_memory_layer.read_attn_backend == "sdpa"
         assert layer.recurrent_memory_layer.W_read_q.out_features == 15
@@ -418,8 +419,8 @@ class TestARMTLayer:
                 armt_head_dim=6,
             )
 
-        assert layer.associative_layer.use_qk_norm is True
-        assert layer.associative_layer.use_input_pre_norm is True
+        assert layer.recurrent_memory_layer.use_qk_norm is True
+        assert layer.recurrent_memory_layer.use_input_pre_norm is True
 
     def test_armt_layer_passes_qk_norm_to_gdn_backend(self, mock_config):
         mock_config.hidden_size = 64

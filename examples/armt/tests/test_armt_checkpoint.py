@@ -64,7 +64,7 @@ def test_W_mem_z_not_saved():
 
 
 def test_baseline_to_armt_conversion():
-    """验证转换工具会补齐 associative_layer 权重，并保证 W_mv 为全零初始化（residual-friendly）。"""
+    """验证转换工具会补齐 recurrent_memory_layer 权重，并保证 W_mv 为全零初始化。"""
     with tempfile.TemporaryDirectory() as tmpdir:
         hidden_size = 32
         baseline = _write_baseline(tmpdir, hidden_size)
@@ -81,10 +81,10 @@ def test_baseline_to_armt_conversion():
         convert_baseline_to_armt(baseline, armt_path, config)
 
         armt_state = torch.load(armt_path, map_location="cpu")
-        assert "decoder.layers.0.associative_layer.W_mq.weight" in armt_state
-        assert "decoder.layers.0.associative_layer.W_mv.weight" in armt_state
+        assert "decoder.layers.0.recurrent_memory_layer.W_mq.weight" in armt_state
+        assert "decoder.layers.0.recurrent_memory_layer.W_mv.weight" in armt_state
         assert torch.allclose(
-            armt_state["decoder.layers.0.associative_layer.W_mv.weight"],
+            armt_state["decoder.layers.0.recurrent_memory_layer.W_mv.weight"],
             torch.zeros(hidden_size, hidden_size),
         )
 
@@ -107,6 +107,15 @@ def test_baseline_to_armt_conversion_supports_explicit_head_dim():
         convert_baseline_to_armt(baseline, armt_path, config)
 
         armt_state = torch.load(armt_path, map_location="cpu")
-        assert armt_state["decoder.layers.0.associative_layer.W_mv.weight"].shape == (15, hidden_size)
-        assert armt_state["decoder.layers.0.associative_layer.W_mo.weight"].shape == (hidden_size, 15)
-        assert armt_state["decoder.layers.0.associative_layer.W_mb.weight"].shape == (15, hidden_size)
+        assert armt_state["decoder.layers.0.recurrent_memory_layer.W_mv.weight"].shape == (
+            15,
+            hidden_size,
+        )
+        assert armt_state["decoder.layers.0.recurrent_memory_layer.W_mo.weight"].shape == (
+            hidden_size,
+            15,
+        )
+        assert armt_state["decoder.layers.0.recurrent_memory_layer.W_mb.weight"].shape == (
+            15,
+            hidden_size,
+        )

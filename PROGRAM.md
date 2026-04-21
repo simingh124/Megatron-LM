@@ -19,14 +19,15 @@
 - For intentionally disposable sibling worktrees, `git worktree remove --force <path>` is acceptable when the only remaining local files are scratch artifacts under `codex_assets/`.
 
 ## ARMT Test-Double Invariants
-- Since commit `5e491de47`, `ARMTLayer` no longer assumes a single associative backend. It exposes two backend slots, `associative_layer` and `recurrent_memory_layer`, and resolves them through `_get_memory_layer()`.
-- Any test that monkeypatches `ARMTLayer.__init__` must initialize both backend slots to `None` before injecting mocks. Otherwise `_get_memory_layer()` can raise `AttributeError` from the test double even when production code is correct.
+- `ARMTLayer` now exposes a single backend slot, `recurrent_memory_layer`, for associative, gated-deltanet, and cross-attention-slot memory backends.
+- Any test that monkeypatches `ARMTLayer.__init__` must initialize `recurrent_memory_layer` to `None` before injecting mocks. Otherwise `_get_memory_layer()` can raise `AttributeError` from the test double even when production code is correct.
 - For chunk-control tests, initialize `_skip_read_memory_for_current_chunk` and `_current_chunk_is_first` in the test double as well, so `reset_memory()` and first-chunk propagation tests match real-layer invariants.
 - For ARMT/RMT-scoped changes, default to targeted verification on the affected ARMT/RMT tests and the directly related training/plumbing tests. Do not routinely rerun unrelated baseline Megatron tests that are outside the ARMT/RMT change surface unless the edit clearly crosses those boundaries.
 
 ## ARMT Memory Parameter Reporting
 - `megatron/training/training.py` does not know backend-specific memory modules. The printed memory-parameter summary is driven entirely by `model.get_memory_parameter_breakdown()`.
 - For ARMT, new recurrent memory backends automatically show up in the training-side memory summary if they are attached on each layer as `recurrent_memory_layer` and expose their trainable tensors through standard `nn.Module.parameters()`. No training-side special-case hook is needed.
+- `--recurrent-memory-lr` groups parameters purely by the `*.recurrent_memory_layer.*` state-dict prefix and intentionally leaves top-level `memory_embeddings` on the base LR schedule.
 - ARMT now keeps the `modules:` table coarse-grained and prints runtime memory-state summaries separately before that table: `initial_slots` totals come from `CrossAttentionSlotMemory.initial_slots`; `W_mem` totals are single-sample (`batch=1`) logical memory-store sizes. For `AssociativeLayer`, use pre-DPFP width (`d_mem * head_dim` per head), not the expanded `d_key = 2 * nu * d_mem`, so the report stays comparable with other backends' memory storage.
 - ARMT recurrent backend head-dim decoupling is now projection-based: external hidden/state width stays `hidden_size`, while backend multi-head projection width may use explicit `head_dim`. If associative parameter shapes change, keep `examples/armt/tools/convert_baseline_to_armt.py` in sync with runtime shapes, especially `W_mv`, `W_mo`, and gated `W_mb`.
 

@@ -35,6 +35,7 @@ RECURRENT_DEFAULTS = {
     "recurrent_slot_read_attn_backend": "flash",
     "recurrent_mem_qk_norm": False,
     "recurrent_memory_input_pre_norm": False,
+    "recurrent_memory_lr": None,
 }
 
 
@@ -235,6 +236,12 @@ def add_recurrent_args(parser):
         default=RECURRENT_DEFAULTS["recurrent_memory_input_pre_norm"],
         help="Apply input pre-norm before recurrent memory associate()/update_mem() projections.",
     )
+    group.add_argument(
+        "--recurrent-memory-lr",
+        type=float,
+        default=RECURRENT_DEFAULTS["recurrent_memory_lr"],
+        help="Override max learning rate for recurrent memory backend parameters only.",
+    )
     return parser
 
 
@@ -280,6 +287,13 @@ def validate_recurrent_constraints(
     divisibility_expr: str,
 ) -> Namespace:
     args = normalize_recurrent_args(args)
+
+    if args.recurrent_memory_lr is not None:
+        if args.recurrent_memory_lr <= 0:
+            raise ValueError("recurrent_memory_lr must be > 0")
+        min_lr = getattr(args, "min_lr", None)
+        if min_lr is not None and args.recurrent_memory_lr < min_lr:
+            raise ValueError("recurrent_memory_lr must be greater than or equal to min_lr")
 
     if args.full_attn_window_size is None:
         args.full_attn_window_size = args.recurrent_chunk_size

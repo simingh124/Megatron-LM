@@ -29,6 +29,8 @@ def _make_args(**overrides):
         sequence_parallel=False,
         armt_windowed_full_attn_backend="native",
         armt_equal_window_full_attn_path="legacy",
+        recurrent_memory_lr=None,
+        min_lr=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -447,6 +449,36 @@ def test_cross_attn_slots_read_backend_defaults_to_flash():
     args = parser.parse_args([])
 
     assert args.recurrent_slot_read_attn_backend == "flash"
+
+
+def test_recurrent_memory_lr_defaults_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.recurrent_memory_lr is None
+
+
+def test_recurrent_memory_lr_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--recurrent-memory-lr", "0.0025"])
+
+    assert args.recurrent_memory_lr == pytest.approx(0.0025)
+
+
+def test_recurrent_memory_lr_must_be_positive():
+    args = _make_args(recurrent_memory_lr=0.0)
+
+    with pytest.raises(ValueError, match="recurrent_memory_lr"):
+        validate_armt_constraints(args)
+
+
+def test_recurrent_memory_lr_must_not_be_below_min_lr():
+    args = _make_args(recurrent_memory_lr=1.0e-4, min_lr=2.0e-4)
+
+    with pytest.raises(ValueError, match="min_lr"):
+        validate_armt_constraints(args)
 
 
 def test_recurrent_memory_norm_switches_default_to_disabled():

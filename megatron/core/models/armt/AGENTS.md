@@ -19,9 +19,9 @@
   4. `self.decoder(...)` 执行 ARMT layers
   5. 输出隐藏态剥离 memory token 部分（S+M -> S），再走 `_postprocess`（LM head/loss）
 - `ARMTLayer.forward(...)`
-  1. `associative_layer.associate()` 检索记忆并残差相加
+  1. `recurrent_memory_layer.associate()` 检索记忆并残差相加
   2. `TransformerLayer.forward()`（注意力 + FFN）
-  3. 取尾部 `M` 个 memory token hidden 做 `associative_layer.update_mem()` 写入
+  3. 取尾部 `M` 个 memory token hidden 做 `recurrent_memory_layer.update_mem()` 写入
 - `AssociativeLayer`
   - 状态：`W_mem`（memory matrix）与可选 `z`（denom）；按 batch 动态 reshape/zero
   - TBPTT：`tbptt_mode=True` 时 update 使用 `detach()`，避免跨 chunk 梯度与 in-place 版本冲突
@@ -34,6 +34,5 @@
   - 开启 `sequence_parallel` 时会对序列维 gather/scatter（memory token 拼接与写入都依赖）。
 - checkpoint 命名约定：
   - 顶层：`memory_embeddings`
-  - 每层：`decoder.layers.{i}.associative_layer.*`
+  - 每层：`decoder.layers.{i}.recurrent_memory_layer.*`
   - 变更命名/shape 时同步更新转换工具与测试。
-
