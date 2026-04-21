@@ -326,14 +326,19 @@ class AssociativeLayer(nn.Module):
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)
 
-    def update_mem(self, mem_tokens: torch.Tensor, input_is_sbh: bool):
+    def update_mem(
+        self,
+        mem_tokens: torch.Tensor,
+        input_is_sbh: bool,
+        input_already_pre_normed: bool = False,
+    ):
         mem_tokens, input_is_sbh = self._to_batch_first(
             mem_tokens, input_is_sbh=input_is_sbh
         )
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_mq.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_mq.weight.dtype)
-        if self.input_pre_norm is not None:
+        if self.input_pre_norm is not None and not input_already_pre_normed:
             mem_tokens = self.input_pre_norm(mem_tokens)
 
         self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)

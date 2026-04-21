@@ -67,6 +67,21 @@ def test_gdn_memory_can_enable_input_pre_norm():
     assert torch.isfinite(retrieved).all()
 
 
+def test_gdn_memory_can_skip_redundant_input_pre_norm_on_update():
+    layer = _build_layer(use_input_pre_norm=True, normalization="RMSNorm")
+    batch_size = 2
+    layer.reset_memory(batch_size=batch_size)
+
+    with patch.object(layer.input_pre_norm, "forward", side_effect=lambda x: x) as forward_mock:
+        layer.update_mem(
+            torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+            input_is_sbh=False,
+            input_already_pre_normed=True,
+        )
+
+    forward_mock.assert_not_called()
+
+
 def test_gdn_memory_tbptt_detaches_inputs_but_trains_backend_params():
     layer = _build_layer()
     batch_size = 2

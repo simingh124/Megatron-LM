@@ -31,6 +31,11 @@
 - ARMT now keeps the `modules:` table coarse-grained and prints runtime memory-state summaries separately before that table: `initial_slots` totals come from `CrossAttentionSlotMemory.initial_slots`; `W_mem` totals are single-sample (`batch=1`) logical memory-store sizes. For `AssociativeLayer`, use pre-DPFP width (`d_mem * head_dim` per head), not the expanded `d_key = 2 * nu * d_mem`, so the report stays comparable with other backends' memory storage.
 - ARMT recurrent backend head-dim decoupling is now projection-based: external hidden/state width stays `hidden_size`, while backend multi-head projection width may use explicit `head_dim`. If associative parameter shapes change, keep `examples/armt/tools/convert_baseline_to_armt.py` in sync with runtime shapes, especially `W_mv`, `W_mo`, and gated `W_mb`.
 
+## ARMT Memory Write Sources
+- `--armt-memory-write-source` is the source of truth for ARMT recurrent writes. `mem_tokens` keeps the original behavior; `post_mlp_context`, `post_attn_context`, and `pre_attn_context` all force `num_mem_tokens=0` during validation and therefore must also disable memory-token concat/slicing/monitoring paths at runtime.
+- When `num_mem_tokens=0`, do not keep a zero-sized `ARMTModel.memory_embeddings` parameter around. DistOpt checkpoint save can then build a padding-only bucket and fail with `AssertionError: empty bucket encountered` in `sharded_param_state_dp_reshardable`.
+- `pre_attn_context` is defined as the hidden state after memory read injection and immediately before attention. When `--recurrent-memory-input-pre-norm` is enabled in that mode, reuse `TransformerLayer.input_layernorm` output instead of instantiating or reapplying a backend-local recurrent pre-norm; otherwise the write path silently diverges from the real attention input and adds dead recurrent-norm parameters.
+
 ## Recurrent CLI Source of Truth
 - The canonical recurrent CLI flags live in `examples/recurrent/recurrent_args.py`, not in older ARMT scripts or memory.
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.

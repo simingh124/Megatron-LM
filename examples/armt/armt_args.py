@@ -62,6 +62,15 @@ def add_armt_args(parser):
         default=True,
         help="Apply correction term in delta updates",
     )
+    group.add_argument(
+        "--armt-memory-write-source",
+        choices=("mem_tokens", "post_mlp_context", "post_attn_context", "pre_attn_context"),
+        default="mem_tokens",
+        help=(
+            "Select the recurrent-memory write source. Non-mem_tokens modes disable ARMT "
+            "memory-token concatenation and write context states instead."
+        ),
+    )
 
     return parser
 
@@ -85,6 +94,9 @@ def validate_armt_constraints(args):
 
     if armt_head_dim is None and hidden_size is not None and hidden_size % armt_n_heads != 0:
         raise ValueError("hidden_size must be divisible by armt_n_heads when armt_head_dim is omitted")
+
+    if getattr(args, "armt_memory_write_source", "mem_tokens") != "mem_tokens":
+        args.num_mem_tokens = 0
 
     return validate_recurrent_constraints(
         args,

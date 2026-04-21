@@ -1,5 +1,5 @@
-import torch
 import pytest
+import torch
 from unittest.mock import patch
 
 from megatron.core.models.armt.associative_layer import DPFP, AssociativeLayer
@@ -170,6 +170,29 @@ class TestAssociativeLayer:
         assert isinstance(layer.input_pre_norm, torch.nn.RMSNorm)
         assert retrieved.shape == (batch_size, 8, layer.d_model)
         assert torch.isfinite(retrieved).all()
+
+    def test_associative_layer_can_skip_redundant_input_pre_norm_on_update(self):
+        layer = AssociativeLayer(
+            d_model=256,
+            d_mem=64,
+            n_heads=4,
+            nu=4,
+            tbptt_mode=True,
+            dtype=torch.float32,
+            use_input_pre_norm=True,
+            normalization="RMSNorm",
+        )
+        batch_size = 2
+        layer.reset_memory(batch_size)
+
+        with patch.object(layer.input_pre_norm, "forward", side_effect=lambda x: x) as forward_mock:
+            layer.update_mem(
+                torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+                input_is_sbh=False,
+                input_already_pre_normed=True,
+            )
+
+        forward_mock.assert_not_called()
 
     def test_associative_layer_reset(self, layer):
         """验证 reset_memory 会按 batch 维度初始化/清零 W_mem 与 z。"""
