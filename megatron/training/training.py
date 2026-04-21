@@ -1615,6 +1615,13 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    recurrent_memory_lr = getattr(args, "recurrent_memory_lr", None)
+    if recurrent_memory_lr is not None:
+        memory_override = {"max_lr": recurrent_memory_lr}
+        min_lr = getattr(args, "min_lr", None)
+        if min_lr is not None:
+            memory_override["min_lr"] = min_lr
+        config_overrides[ParamKey(name="*.recurrent_memory_layer.*")] = memory_override
 
     return config, config_overrides
 

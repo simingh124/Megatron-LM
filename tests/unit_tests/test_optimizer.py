@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -67,6 +68,17 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class NetWithRecurrentMemory(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.memory_embeddings = nn.Parameter(torch.randn(4, 4))
+        self.decoder = nn.Module()
+        self.decoder.layers = nn.ModuleList([nn.Module()])
+        layer = self.decoder.layers[0]
+        layer.recurrent_memory_layer = nn.Linear(4, 4, bias=False)
+        layer.mlp = nn.Linear(4, 4, bias=False)
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
@@ -209,6 +221,45 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
     assert param_groups[1]['max_lr'] == 20
     assert param_groups[2]['min_lr'] is None
     assert param_groups[2]['max_lr'] == 0.01
+
+
+@patch('torch.distributed.get_world_size', return_value=1)
+@patch(
+    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+)
+def test_recurrent_memory_lr_override_creates_dedicated_param_group(mock_get_world_size):
+    from megatron.training.training import get_megatron_optimizer_config
+
+    net = NetWithRecurrentMemory()
+    args = SimpleNamespace(
+        optimizer='adam',
+        lr=5.0e-4,
+        min_lr=5.0e-5,
+        recurrent_memory_lr=2.5e-3,
+    )
+    config, config_overrides = get_megatron_optimizer_config(args)
+    param_groups = _get_param_groups([net], config, config_overrides)
+    name_by_param = {param: name for name, param in net.named_parameters()}
+
+    group_names = [{name_by_param[param] for param in group['params']} for group in param_groups]
+    memory_group, memory_group_names = next(
+        (group, names)
+        for group, names in zip(param_groups, group_names)
+        if any("recurrent_memory_layer" in name for name in names)
+    )
+    default_group, default_group_names = next(
+        (group, names) for group, names in zip(param_groups, group_names) if "memory_embeddings" in names
+    )
+
+    assert memory_group_names == {"decoder.layers.0.recurrent_memory_layer.weight"}
+    assert memory_group['max_lr'] == pytest.approx(2.5e-3)
+    assert memory_group['min_lr'] == pytest.approx(5.0e-5)
+    assert default_group['max_lr'] == pytest.approx(5.0e-4)
+    assert default_group['min_lr'] == pytest.approx(5.0e-5)
+    assert default_group_names == {
+        "memory_embeddings",
+        "decoder.layers.0.mlp.weight",
+    }
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

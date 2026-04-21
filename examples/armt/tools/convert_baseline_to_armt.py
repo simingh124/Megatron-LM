@@ -38,7 +38,9 @@ def _get_armt_value_dim(config: ARMTCheckpointConfig) -> int:
     return config.armt_n_heads * config.armt_head_dim
 
 
-def convert_baseline_to_armt(baseline_ckpt_path: str, armt_ckpt_path: str, config: ARMTCheckpointConfig):
+def convert_baseline_to_armt(
+    baseline_ckpt_path: str, armt_ckpt_path: str, config: ARMTCheckpointConfig
+):
     baseline = torch.load(baseline_ckpt_path, map_location="cpu")
     if isinstance(baseline, dict) and "model" in baseline:
         baseline_state = baseline["model"]
@@ -56,7 +58,7 @@ def convert_baseline_to_armt(baseline_ckpt_path: str, armt_ckpt_path: str, confi
     ) * emb_std
 
     for layer_idx in range(config.num_layers):
-        prefix = f"decoder.layers.{layer_idx}.associative_layer."
+        prefix = f"decoder.layers.{layer_idx}.recurrent_memory_layer."
 
         armt_state[prefix + "W_mq.weight"] = torch.empty(
             config.d_mem, config.hidden_size

@@ -15,7 +15,7 @@ _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
 
 
 class ARMTLayer(TransformerLayer):
-    """TransformerLayer with associative memory retrieval and update."""
+    """TransformerLayer with recurrent memory retrieval and update."""
 
     def __init__(
         self,
@@ -61,7 +61,6 @@ class ARMTLayer(TransformerLayer):
         self.armt_windowed_full_attn_backend = armt_windowed_full_attn_backend
         self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
         self.recurrent_memory_backend = recurrent_memory_backend
-        self.associative_layer = None
         self.recurrent_memory_layer = None
 
         common_kwargs = {
@@ -75,7 +74,7 @@ class ARMTLayer(TransformerLayer):
         }
 
         if recurrent_memory_backend == "associative":
-            self.associative_layer = build_recurrent_memory_backend(
+            self.recurrent_memory_layer = build_recurrent_memory_backend(
                 recurrent_memory_backend,
                 d_mem=d_mem or config.hidden_size,
                 n_heads=armt_n_heads,
@@ -118,8 +117,6 @@ class ARMTLayer(TransformerLayer):
     def _get_memory_layer(self):
         if self.recurrent_memory_layer is not None:
             return self.recurrent_memory_layer
-        if self.associative_layer is not None:
-            return self.associative_layer
         raise RuntimeError("ARMTLayer has no recurrent memory layer configured.")
 
     def set_skip_read_memory_for_current_chunk(self, enabled: bool):

@@ -15,7 +15,7 @@
 2. 拷贝 baseline 权重 -> `armt_state`
 3. 新增/补齐 ARMT 参数：
    - `memory_embeddings`: `[num_mem_tokens, hidden_size]`（std 参考词嵌入）
-   - 每层 `decoder.layers.{i}.associative_layer.*`：
+   - 每层 `decoder.layers.{i}.recurrent_memory_layer.*`：
      - `W_mq/W_mk`: `trunc_normal_`
      - `W_mv`: 全零初始化（residual-friendly）
      - `W_mb`: `gating` 决定输出维（`hidden_size` vs `armt_n_heads`）
@@ -27,4 +27,3 @@
 - 若修改 ARMT 参数命名/层级，请同步更新：
   - `megatron/core/models/armt/`（state_dict key）
   - `examples/armt/tests/test_armt_checkpoint.py`
-

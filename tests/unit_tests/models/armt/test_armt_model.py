@@ -21,7 +21,6 @@ def _minimal_gpt_init(self, config, transformer_layer_spec, vocab_size, max_sequ
 def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs):
     torch.nn.Module.__init__(self)
     self.config = config
-    self.associative_layer = None
     self.recurrent_memory_layer = None
     self._skip_read_memory_for_current_chunk = False
     self._current_chunk_is_first = False
@@ -29,8 +28,7 @@ def _minimal_armt_layer_init(self, config, submodules, layer_number=1, **kwargs)
 
 
 class TestARMTModel:
-    @pytest.mark.parametrize("backend_attr", ["associative_layer", "recurrent_memory_layer"])
-    def test_armt_model_memory_parameter_breakdown(self, backend_attr):
+    def test_armt_model_memory_parameter_breakdown(self):
         config = MagicMock()
         config.hidden_size = 8
         config.sequence_parallel = False
@@ -60,14 +58,17 @@ class TestARMTModel:
             torch.nn.Linear(8, 4, bias=False),
             torch.nn.Linear(4, 2, bias=True),
         )
-        setattr(layer, backend_attr, memory_module)
+        layer.recurrent_memory_layer = memory_module
         model.add_module("armt_layer", layer)
 
         breakdown = model.get_memory_parameter_breakdown()
 
         assert breakdown == [
             ("memory_embeddings", 32),
-            (f"armt_layer.{backend_attr}", sum(p.numel() for p in memory_module.parameters())),
+            (
+                "armt_layer.recurrent_memory_layer",
+                sum(p.numel() for p in memory_module.parameters()),
+            ),
         ]
 
     def test_armt_model_memory_parameter_breakdown_is_empty_when_num_mem_tokens_is_zero(self):
@@ -183,7 +184,7 @@ class TestARMTModel:
             head_dim=4,
             dtype=torch.float32,
         )
-        assoc_layer.associative_layer = AssociativeLayer(
+        assoc_layer.recurrent_memory_layer = AssociativeLayer(
             d_model=16,
             num_mem_tokens=4,
             d_mem=16,
@@ -210,9 +211,12 @@ class TestARMTModel:
             ("initial_slots", slot_layer.recurrent_memory_layer.initial_slots.numel()),
             (
                 "W_mem",
-                assoc_layer.associative_layer.n_heads
-                * (assoc_layer.associative_layer.d_mem // assoc_layer.associative_layer.n_heads)
-                * assoc_layer.associative_layer.head_dim
+                assoc_layer.recurrent_memory_layer.n_heads
+                * (
+                    assoc_layer.recurrent_memory_layer.d_mem
+                    // assoc_layer.recurrent_memory_layer.n_heads
+                )
+                * assoc_layer.recurrent_memory_layer.head_dim
                 + gdn_layer.recurrent_memory_layer.num_value_heads
                 * gdn_layer.recurrent_memory_layer.key_head_dim
                 * gdn_layer.recurrent_memory_layer.value_head_dim,
@@ -306,7 +310,7 @@ class TestARMTModel:
         ):
             layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
 
-        layer.associative_layer = MagicMock()
+        layer.recurrent_memory_layer = MagicMock()
         model.add_module("armt_layer", layer)
 
         model.set_current_chunk_is_first(True)
@@ -328,7 +332,7 @@ class TestARMTModel:
         assert layer._current_chunk_is_first is False
         assert layer._skip_read_memory_for_current_chunk is False
         assert layer._current_chunk_start_position == 0
-        layer.associative_layer.reset_memory.assert_called_once()
+        layer.recurrent_memory_layer.reset_memory.assert_called_once()
 
     def test_armt_model_monitoring_helpers(self):
         """验证模型级 monitoring reset/consume 会跨 ARMT 层聚合。"""

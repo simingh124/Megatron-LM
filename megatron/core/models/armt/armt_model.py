@@ -74,17 +74,16 @@ class ARMTModel(GPTModel):
             if not isinstance(module, ARMTLayer):
                 continue
 
-            for backend_attr in ("associative_layer", "recurrent_memory_layer"):
-                backend_module = getattr(module, backend_attr, None)
-                if backend_module is None:
-                    continue
+            backend_module = getattr(module, "recurrent_memory_layer", None)
+            if backend_module is None:
+                continue
 
-                breakdown.append(
-                    (
-                        f"{module_name}.{backend_attr}",
-                        sum(param.numel() for param in backend_module.parameters()),
-                    )
+            breakdown.append(
+                (
+                    f"{module_name}.recurrent_memory_layer",
+                    sum(param.numel() for param in backend_module.parameters()),
                 )
+            )
 
         return breakdown
 
@@ -98,17 +97,16 @@ class ARMTModel(GPTModel):
             if not isinstance(module_instance, ARMTLayer):
                 continue
 
-            for backend_attr in ("associative_layer", "recurrent_memory_layer"):
-                backend_module = getattr(module_instance, backend_attr, None)
-                if backend_module is None:
-                    continue
+            backend_module = getattr(module_instance, "recurrent_memory_layer", None)
+            if backend_module is None:
+                continue
 
-                state_breakdown_getter = getattr(backend_module, "get_memory_state_breakdown", None)
-                if not callable(state_breakdown_getter):
-                    continue
+            state_breakdown_getter = getattr(backend_module, "get_memory_state_breakdown", None)
+            if not callable(state_breakdown_getter):
+                continue
 
-                for name, count in state_breakdown_getter(batch_size=batch_size):
-                    state_sizes[name] = state_sizes.get(name, 0) + count
+            for name, count in state_breakdown_getter(batch_size=batch_size):
+                state_sizes[name] = state_sizes.get(name, 0) + count
 
         ordered_names = ("initial_slots", "W_mem")
         breakdown = [(name, state_sizes[name]) for name in ordered_names if name in state_sizes]
