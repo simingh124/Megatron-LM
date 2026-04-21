@@ -63,6 +63,24 @@ def add_armt_args(parser):
         help="Apply correction term in delta updates",
     )
     group.add_argument(
+        "--armt-log-layer-metrics-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit per-layer ARMT TensorBoard metrics under armt/.../layer_XX in addition to "
+            "the existing aggregated armt/* metrics. Requires TensorBoard logging to be enabled."
+        ),
+    )
+    group.add_argument(
+        "--armt-log-read-position-metrics-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit aggregated per-position ARMT read metrics under "
+            "armt/read/*/pos_XXXX. Requires TensorBoard logging to be enabled."
+        ),
+    )
+    group.add_argument(
         "--armt-memory-write-source",
         choices=("mem_tokens", "post_mlp_context", "post_attn_context", "pre_attn_context"),
         default="mem_tokens",

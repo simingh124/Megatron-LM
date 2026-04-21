@@ -97,13 +97,17 @@ def model_provider(
         recurrent_gdn_value_head_dim=args.recurrent_gdn_value_head_dim,
         recurrent_gdn_num_key_heads=args.recurrent_gdn_num_key_heads,
         recurrent_gdn_num_value_heads=args.recurrent_gdn_num_value_heads,
+        recurrent_gdn_read_mode=getattr(args, "recurrent_gdn_read_mode", "normal"),
         recurrent_slot_num_slots=args.recurrent_slot_num_slots,
         recurrent_slot_num_heads=args.recurrent_slot_num_heads,
         recurrent_slot_head_dim=args.recurrent_slot_head_dim,
         recurrent_slot_read_attn_backend=args.recurrent_slot_read_attn_backend,
         recurrent_mem_qk_norm=args.recurrent_mem_qk_norm,
         recurrent_memory_input_pre_norm=args.recurrent_memory_input_pre_norm,
-        armt_memory_write_source=args.armt_memory_write_source,
+        armt_memory_write_source=getattr(args, "armt_memory_write_source", "mem_tokens"),
+        log_read_position_metrics_to_tensorboard=(
+            getattr(args, "armt_log_read_position_metrics_to_tensorboard", False)
+        ),
     )
 
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)
@@ -117,6 +121,9 @@ def model_provider(
         recurrent_chunk_size=args.recurrent_chunk_size,
         full_attn_window_size=args.full_attn_window_size,
         armt_equal_window_full_attn_path=args.armt_equal_window_full_attn_path,
+        log_layer_metrics_to_tensorboard=getattr(
+            args, "armt_log_layer_metrics_to_tensorboard", False
+        ),
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),

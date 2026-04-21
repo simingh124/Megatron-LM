@@ -7,9 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.transformer.transformer_config import TransformerConfig
 
+from .init_utils import init_linear_weight_and_bias
 from .monitoring import build_mean_metric, build_ratio_metric, build_rms_metric
 from .norm_utils import build_recurrent_norm
+
+_READ_POSITION_MONITORING_PREFIX = "read_position"
 
 
 class DPFP(nn.Module):
@@ -41,21 +45,29 @@ class AssociativeLayer(nn.Module):
         gating: bool = False,
         correction: bool = True,
         nu: int = 3,
-        dtype: torch.dtype = torch.bfloat16,
         tbptt_mode: bool = True,
         use_qk_norm: bool = False,
         use_input_pre_norm: bool = False,
+        log_read_position_metrics_to_tensorboard: bool = False,
         normalization: str = "LayerNorm",
         norm_epsilon: float = 1e-5,
+        config: Optional[TransformerConfig] = None,
+        dtype: Optional[torch.dtype] = None,
         *,
         hidden_size: Optional[int] = None,
     ):
         super().__init__()
 
+        if config is None:
+            raise ValueError("config must be provided for AssociativeLayer")
+        self.config = config
+
         if d_model is None:
             d_model = hidden_size
         if d_model is None:
-            raise ValueError("d_model (or hidden_size) must be provided for AssociativeLayer")
+            d_model = self.config.hidden_size
+        elif d_model != self.config.hidden_size:
+            raise ValueError("d_model must match config.hidden_size for AssociativeLayer")
 
         if d_mem is None:
             d_mem = d_model
@@ -71,6 +83,11 @@ class AssociativeLayer(nn.Module):
         if head_dim <= 0:
             raise ValueError("head_dim must be > 0")
 
+        if dtype is None:
+            dtype = self.config.params_dtype
+        elif dtype != self.config.params_dtype:
+            raise ValueError("dtype must match config.params_dtype for AssociativeLayer")
+
         self.d_model = d_model
         self.num_mem_tokens = num_mem_tokens
         self.d_mem = d_mem
@@ -83,6 +100,10 @@ class AssociativeLayer(nn.Module):
         self.tbptt_mode = tbptt_mode
         self.use_qk_norm = use_qk_norm
         self.use_input_pre_norm = use_input_pre_norm
+        self.log_read_position_metrics_to_tensorboard = bool(
+            log_read_position_metrics_to_tensorboard
+        )
+        self._collect_monitoring_for_current_iteration = True
 
         self.d_key = 2 * nu * d_mem
         self.value_dim = self.n_heads * self.head_dim
@@ -102,16 +123,12 @@ class AssociativeLayer(nn.Module):
         self.W_mv = nn.Linear(d_model, self.value_dim, bias=False, dtype=dtype)
         self.W_mo = nn.Linear(self.value_dim, d_model, bias=False, dtype=dtype)
 
-        # NOTE: Do not init to exact zeros. `W_mv` participates only through the
-        # chunk-to-chunk memory state; if it's initialized to zeros, the memory update
-        # becomes identically zero -> retrieval is identically zero -> gradients to
-        # memory-write parameters are also identically zero.
-        nn.init.normal_(self.W_mv.weight, mean=0.0, std=1e-3)
-
         if gating:
             self.W_mb = nn.Linear(d_model, self.value_dim, dtype=dtype)
         else:
             self.W_mb = nn.Linear(d_model, n_heads, dtype=dtype)
+
+        self.reset_parameters()
 
         self.register_buffer("W_mem", torch.empty(0), persistent=False)
         if use_denom:
@@ -121,8 +138,38 @@ class AssociativeLayer(nn.Module):
         self._pending_reset = True
         self.reset_monitoring_stats()
 
+    def reset_parameters(self):
+        init_linear_weight_and_bias(
+            self.W_mq,
+            self.config.init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
+        init_linear_weight_and_bias(
+            self.W_mk,
+            self.config.init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
+        init_linear_weight_and_bias(
+            self.W_mv,
+            self.config.init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
+        init_linear_weight_and_bias(
+            self.W_mo,
+            self.config.output_layer_init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
+        init_linear_weight_and_bias(
+            self.W_mb,
+            self.config.init_method,
+            perform_initialization=self.config.perform_initialization,
+        )
+
     def set_tbptt_mode(self, enabled: bool):
         self.tbptt_mode = enabled
+
+    def set_collect_monitoring_for_current_iteration(self, enabled: bool):
+        self._collect_monitoring_for_current_iteration = bool(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats: Dict[str, torch.Tensor] = {}
@@ -144,23 +191,151 @@ class AssociativeLayer(nn.Module):
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
 
+    @staticmethod
+    def _position_metric_tag(position: int) -> str:
+        return f"pos_{position:04d}"
+
+    def _accumulate_read_position_monitoring_stats(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> None:
+        if hidden_states.shape != retrieved_states.shape:
+            raise ValueError(
+                "AssociativeLayer read position monitoring expects hidden/retrieved tensors "
+                f"with matching shapes, got {tuple(hidden_states.shape)} and "
+                f"{tuple(retrieved_states.shape)}"
+            )
+
+        hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+        retrieved_norms = torch.linalg.vector_norm(retrieved_states.float(), dim=-1)
+        token_count = self._count_tensor(hidden_states.shape[0], hidden_states.device)
+
+        for position in range(hidden_states.shape[1]):
+            position_tag = self._position_metric_tag(position)
+            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
+            self._accumulate_monitoring_stat(
+                f"{stats_prefix}/hidden_norm_sum",
+                hidden_norms[:, position].sum(),
+            )
+            self._accumulate_monitoring_stat(
+                f"{stats_prefix}/retrieved_norm_sum",
+                retrieved_norms[:, position].sum(),
+            )
+            self._accumulate_monitoring_stat(f"{stats_prefix}/count", token_count)
+
+    def _iter_read_monitoring_parts(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> Tuple[Tuple[str, torch.Tensor, torch.Tensor], ...]:
+        if hidden_states.shape != retrieved_states.shape:
+            raise ValueError(
+                "AssociativeLayer read monitoring expects hidden/retrieved tensors "
+                f"with matching shapes, got {tuple(hidden_states.shape)} and "
+                f"{tuple(retrieved_states.shape)}"
+            )
+
+        memory_tokens = min(self.num_mem_tokens, hidden_states.shape[1])
+        context_tokens = hidden_states.shape[1] - memory_tokens
+        partitions = []
+        if context_tokens > 0:
+            partitions.append(
+                (
+                    "context",
+                    hidden_states[:, :context_tokens, :],
+                    retrieved_states[:, :context_tokens, :],
+                )
+            )
+        if memory_tokens > 0:
+            partitions.append(
+                (
+                    "memory",
+                    hidden_states[:, context_tokens:, :],
+                    retrieved_states[:, context_tokens:, :],
+                )
+            )
+        return tuple(partitions)
+
+    def _accumulate_read_monitoring_stats(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved_states: torch.Tensor,
+    ) -> None:
+        if self.log_read_position_metrics_to_tensorboard:
+            self._accumulate_read_position_monitoring_stats(hidden_states, retrieved_states)
+
+        for (
+            partition_name,
+            hidden_part,
+            retrieved_part,
+        ) in self._iter_read_monitoring_parts(
+            hidden_states,
+            retrieved_states,
+        ):
+            hidden_norms = torch.linalg.vector_norm(hidden_part.float(), dim=-1)
+            retrieved_norms = torch.linalg.vector_norm(retrieved_part.float(), dim=-1)
+            token_count = self._count_tensor(hidden_norms.numel(), hidden_part.device)
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_hidden_norm_sum", hidden_norms.sum()
+            )
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_retrieved_norm_sum", retrieved_norms.sum()
+            )
+            self._accumulate_monitoring_stat(
+                f"{partition_name}_retrieved_norm_count", token_count
+            )
+
+    def _prepare_memory_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.input_pre_norm is not None:
+            return self.input_pre_norm(hidden_states)
+        return hidden_states
+
     def get_memory_state_breakdown(self, batch_size: int = 1) -> list[tuple[str, int]]:
         # Report the logical single-sample memory store size before DPFP expansion.
         w_mem_numel = batch_size * self.n_heads * (self.d_mem // self.n_heads) * self.head_dim
         return [("W_mem", w_mem_numel)]
 
     def consume_monitoring_primitives(self):
+        if not self._collect_monitoring_for_current_iteration:
+            self.reset_monitoring_stats()
+            return {}
+
         stats = self._monitoring_stats
         primitives = {}
 
-        if "retrieved_norm_count" in stats:
-            primitives["armt/read/retrieved_norm_mean"] = build_mean_metric(
-                stats["retrieved_norm_sum"],
-                stats["retrieved_norm_count"],
+        for partition_name in ("context", "memory"):
+            retrieved_count_key = f"{partition_name}_retrieved_norm_count"
+            if retrieved_count_key not in stats:
+                continue
+            primitives[f"armt/read/{partition_name}_retrieved_norm_mean"] = build_mean_metric(
+                stats[f"{partition_name}_retrieved_norm_sum"],
+                stats[retrieved_count_key],
             )
-            primitives["armt/read/retrieved_to_hidden_ratio"] = build_ratio_metric(
-                stats["retrieved_norm_sum"],
-                stats["hidden_norm_sum"],
+            primitives[
+                f"armt/read/retrieved_to_{partition_name}_hidden_ratio"
+            ] = build_ratio_metric(
+                stats[f"{partition_name}_retrieved_norm_sum"],
+                stats[f"{partition_name}_hidden_norm_sum"],
+            )
+
+        position_count_keys = sorted(
+            key
+            for key in stats
+            if key.startswith(f"{_READ_POSITION_MONITORING_PREFIX}/") and key.endswith("/count")
+        )
+        for count_key in position_count_keys:
+            position_tag = count_key.split("/")[1]
+            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
+            primitives[f"armt/read/retrieved_norm_mean/{position_tag}"] = build_mean_metric(
+                stats[f"{stats_prefix}/retrieved_norm_sum"],
+                stats[count_key],
+            )
+            primitives[f"armt/read/retrieved_to_hidden_ratio/{position_tag}"] = (
+                build_ratio_metric(
+                    stats[f"{stats_prefix}/retrieved_norm_sum"],
+                    stats[f"{stats_prefix}/hidden_norm_sum"],
+                )
             )
 
         if "delta_mem_elem_count" in stats:
@@ -290,8 +465,7 @@ class AssociativeLayer(nn.Module):
         hidden_states = self._gather_if_tp(hidden_states)
         if hidden_states.dtype != self.W_mq.weight.dtype:
             hidden_states = hidden_states.to(dtype=self.W_mq.weight.dtype)
-        if self.input_pre_norm is not None:
-            hidden_states = self.input_pre_norm(hidden_states)
+        memory_input_states = self._prepare_memory_input(hidden_states)
 
         self._maybe_initialize_memory(
             batch_size=hidden_states.shape[0], device=hidden_states.device
@@ -301,7 +475,7 @@ class AssociativeLayer(nn.Module):
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)
         else:
-            q = self._to_heads(self.W_mq(hidden_states))
+            q = self._to_heads(self.W_mq(memory_input_states))
             mq = self.phi(q)
             if self.use_qk_norm:
                 mq = F.normalize(mq, dim=-1, p=2.0)
@@ -315,13 +489,11 @@ class AssociativeLayer(nn.Module):
 
             result = self.W_mo(self._from_heads(result))
 
-        if should_track_read_metrics:
-            hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
-            retrieved_norms = torch.linalg.vector_norm(result.float(), dim=-1)
-            token_count = self._count_tensor(hidden_norms.numel(), hidden_states.device)
-            self._accumulate_monitoring_stat("hidden_norm_sum", hidden_norms.sum())
-            self._accumulate_monitoring_stat("retrieved_norm_sum", retrieved_norms.sum())
-            self._accumulate_monitoring_stat("retrieved_norm_count", token_count)
+        if should_track_read_metrics and self._collect_monitoring_for_current_iteration:
+            self._accumulate_read_monitoring_stats(
+                hidden_states,
+                result,
+            )
 
         result = self._scatter_if_tp(result)
         return self._from_batch_first(result, input_is_sbh)
@@ -338,23 +510,27 @@ class AssociativeLayer(nn.Module):
         mem_tokens = self._gather_if_tp(mem_tokens)
         if mem_tokens.dtype != self.W_mq.weight.dtype:
             mem_tokens = mem_tokens.to(dtype=self.W_mq.weight.dtype)
-        if self.input_pre_norm is not None and not input_already_pre_normed:
-            mem_tokens = self.input_pre_norm(mem_tokens)
+        if input_already_pre_normed:
+            prepared_mem_tokens = mem_tokens
+        else:
+            prepared_mem_tokens = self._prepare_memory_input(mem_tokens)
 
-        self._maybe_initialize_memory(batch_size=mem_tokens.shape[0], device=mem_tokens.device)
+        self._maybe_initialize_memory(
+            batch_size=prepared_mem_tokens.shape[0], device=prepared_mem_tokens.device
+        )
 
         # TBPTT: keep cross-chunk credit assignment to memory-write parameters while
         # preventing gradients from flowing into previous-chunk transformer activations.
         # This also avoids requiring `retain_graph=True` across chunk-wise backward.
         if self.tbptt_mode:
-            mem_tokens = mem_tokens.detach()
+            prepared_mem_tokens = prepared_mem_tokens.detach()
 
-        k = self._to_heads(self.W_mk(mem_tokens))
+        k = self._to_heads(self.W_mk(prepared_mem_tokens))
         mk = self.phi(k)
         if self.use_qk_norm:
             mk = F.normalize(mk, dim=-1, p=2.0)
 
-        new_mv = self._to_heads(self.W_mv(mem_tokens))
+        new_mv = self._to_heads(self.W_mv(prepared_mem_tokens))
 
         if not self._first_chunk:
             prev_W_mem = self.W_mem.detach() if self.tbptt_mode else self.W_mem
@@ -378,22 +554,23 @@ class AssociativeLayer(nn.Module):
 
         mv = new_mv - prev_mv
 
-        mb = self._to_heads(torch.sigmoid(self.W_mb(mem_tokens)))
+        mb = self._to_heads(torch.sigmoid(self.W_mb(prepared_mem_tokens)))
         if self.gating:
             associations = torch.einsum("bhsk,bhsd,bhsd->bhkd", mk, mv, mb)
         else:
             associations = torch.einsum("bhsk,bhsd,bhsx->bhkd", mk, mv, mb)
 
-        self._accumulate_monitoring_stat("delta_mem_sq_sum", associations.float().square().sum())
-        self._accumulate_monitoring_stat(
-            "delta_mem_elem_count",
-            self._count_tensor(associations.numel(), associations.device),
-        )
-        self._accumulate_monitoring_stat("write_gate_sum", mb.float().sum())
-        self._accumulate_monitoring_stat(
-            "write_gate_elem_count",
-            self._count_tensor(mb.numel(), mb.device),
-        )
+        if self._collect_monitoring_for_current_iteration:
+            self._accumulate_monitoring_stat("delta_mem_sq_sum", associations.float().square().sum())
+            self._accumulate_monitoring_stat(
+                "delta_mem_elem_count",
+                self._count_tensor(associations.numel(), associations.device),
+            )
+            self._accumulate_monitoring_stat("write_gate_sum", mb.float().sum())
+            self._accumulate_monitoring_stat(
+                "write_gate_elem_count",
+                self._count_tensor(mb.numel(), mb.device),
+            )
 
         if self.tbptt_mode:
             # Avoid in-place updates on buffers that were used earlier in the forward,
@@ -406,16 +583,17 @@ class AssociativeLayer(nn.Module):
             if self.use_denom:
                 self.z = self.z + (new_info_coef * mk).sum(dim=-2)
 
-        self._accumulate_monitoring_stat("W_mem_sq_sum", self.W_mem.float().square().sum())
-        self._accumulate_monitoring_stat(
-            "W_mem_elem_count",
-            self._count_tensor(self.W_mem.numel(), self.W_mem.device),
-        )
-        if self.use_denom:
-            self._accumulate_monitoring_stat("z_sq_sum", self.z.float().square().sum())
+        if self._collect_monitoring_for_current_iteration:
+            self._accumulate_monitoring_stat("W_mem_sq_sum", self.W_mem.float().square().sum())
             self._accumulate_monitoring_stat(
-                "z_elem_count",
-                self._count_tensor(self.z.numel(), self.z.device),
+                "W_mem_elem_count",
+                self._count_tensor(self.W_mem.numel(), self.W_mem.device),
             )
+            if self.use_denom:
+                self._accumulate_monitoring_stat("z_sq_sum", self.z.float().square().sum())
+                self._accumulate_monitoring_stat(
+                    "z_elem_count",
+                    self._count_tensor(self.z.numel(), self.z.device),
+                )
 
         self._first_chunk = False

@@ -9,16 +9,49 @@ from megatron.core.models.armt.monitoring import (
     build_ratio_of_means_metric,
     publish_armt_tensorboard_metrics,
 )
-from megatron.training.training import training_log
+from megatron.training.training import (
+    _should_collect_armt_monitoring_for_iteration,
+    training_log,
+)
+
+
+def test_armt_monitoring_collection_follows_tensorboard_interval():
+    args = SimpleNamespace(
+        tensorboard_dir="/tmp/tensorboard",
+        disable_tensorboard_writer=False,
+        tensorboard_log_interval=10,
+    )
+
+    assert _should_collect_armt_monitoring_for_iteration(args, 8) is False
+    assert _should_collect_armt_monitoring_for_iteration(args, 9) is True
+
+    args.disable_tensorboard_writer = True
+    assert _should_collect_armt_monitoring_for_iteration(args, 9) is False
 
 
 def test_training_log_writes_armt_metrics_only_to_tensorboard():
     """验证 training_log 只把 tracker 指标写入 TensorBoard，不写入 WandB。"""
     publish_armt_tensorboard_metrics(
         {
-            "armt/read/retrieved_norm_mean": build_mean_metric(
+            "armt/read/context_retrieved_norm_mean": build_mean_metric(
                 torch.tensor(4.0),
                 torch.tensor(2.0),
+            ),
+            "armt/read/context_retrieved_norm_mean/layer_01": build_mean_metric(
+                torch.tensor(9.0),
+                torch.tensor(3.0),
+            ),
+            "armt/read/retrieved_to_memory_hidden_ratio": build_ratio_metric(
+                torch.tensor(6.0),
+                torch.tensor(12.0),
+            ),
+            "armt/read/retrieved_norm_mean/pos_0000": build_mean_metric(
+                torch.tensor(12.0),
+                torch.tensor(3.0),
+            ),
+            "armt/read/retrieved_to_hidden_ratio/pos_0000": build_ratio_metric(
+                torch.tensor(12.0),
+                torch.tensor(24.0),
             ),
             "train/chunk_00_loss": build_ratio_metric(
                 torch.tensor(9.0),
@@ -88,13 +121,20 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
         )
 
     tb_metric_names = [call.args[0] for call in writer.add_scalar.call_args_list]
-    assert "armt/read/retrieved_norm_mean" in tb_metric_names
+    assert "armt/read/context_retrieved_norm_mean" in tb_metric_names
+    assert "armt/read/context_retrieved_norm_mean/layer_01" in tb_metric_names
+    assert "armt/read/retrieved_to_memory_hidden_ratio" in tb_metric_names
+    assert "armt/read/retrieved_norm_mean/pos_0000" in tb_metric_names
+    assert "armt/read/retrieved_to_hidden_ratio/pos_0000" in tb_metric_names
     assert "armt/token/mem_ctx_norm_ratio" in tb_metric_names
     assert "train/chunk_00_loss" in tb_metric_names
     assert "batch-size-tokens" in tb_metric_names
     assert "batch-size-tokens vs samples" in tb_metric_names
 
     tb_metrics = {call.args[0]: call.args[1:] for call in writer.add_scalar.call_args_list}
+    assert tb_metrics["armt/read/retrieved_to_memory_hidden_ratio"] == (0.5, 1)
+    assert tb_metrics["armt/read/retrieved_norm_mean/pos_0000"] == (4.0, 1)
+    assert tb_metrics["armt/read/retrieved_to_hidden_ratio/pos_0000"] == (0.5, 1)
     assert tb_metrics["armt/token/mem_ctx_norm_ratio"] == (0.2, 1)
     assert tb_metrics["batch-size-tokens"] == (8, 1)
     assert tb_metrics["batch-size-tokens vs samples"] == (8, 0)
@@ -102,6 +142,10 @@ def test_training_log_writes_armt_metrics_only_to_tensorboard():
     wandb_metric_names = []
     for call in wandb_writer.log.call_args_list:
         wandb_metric_names.extend(call.args[0].keys())
-    assert "armt/read/retrieved_norm_mean" not in wandb_metric_names
+    assert "armt/read/context_retrieved_norm_mean" not in wandb_metric_names
+    assert "armt/read/context_retrieved_norm_mean/layer_01" not in wandb_metric_names
+    assert "armt/read/retrieved_to_memory_hidden_ratio" not in wandb_metric_names
+    assert "armt/read/retrieved_norm_mean/pos_0000" not in wandb_metric_names
+    assert "armt/read/retrieved_to_hidden_ratio/pos_0000" not in wandb_metric_names
     assert "armt/token/mem_ctx_norm_ratio" not in wandb_metric_names
     assert "train/chunk_00_loss" not in wandb_metric_names

@@ -249,6 +249,38 @@ def test_armt_correction_can_be_disabled():
     assert args.armt_correction is False
 
 
+def test_armt_layer_metrics_tensorboard_switch_defaults_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_log_layer_metrics_to_tensorboard is False
+
+
+def test_armt_layer_metrics_tensorboard_switch_can_be_enabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-log-layer-metrics-to-tensorboard"])
+
+    assert args.armt_log_layer_metrics_to_tensorboard is True
+
+
+def test_armt_read_position_metrics_tensorboard_switch_defaults_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_log_read_position_metrics_to_tensorboard is False
+
+
+def test_armt_read_position_metrics_tensorboard_switch_can_be_enabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-log-read-position-metrics-to-tensorboard"])
+
+    assert args.armt_log_read_position_metrics_to_tensorboard is True
+
+
 def test_armt_head_dim_arg_is_registered():
     parser = argparse.ArgumentParser()
     add_armt_args(parser)
@@ -507,6 +539,15 @@ def test_recurrent_memory_norm_switches_default_to_disabled():
 
     assert args.recurrent_mem_qk_norm is False
     assert args.recurrent_memory_input_pre_norm is False
+    assert args.recurrent_gdn_read_mode == "normal"
+
+
+def test_recurrent_gdn_read_mode_flag_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--recurrent-gdn-read-mode", "buggy"])
+
+    assert args.recurrent_gdn_read_mode == "buggy"
 
 
 def test_recurrent_memory_norm_switches_are_registered():
@@ -537,6 +578,20 @@ def test_recurrent_memory_norm_switches_can_be_disabled_explicitly():
 
     assert args.recurrent_mem_qk_norm is False
     assert args.recurrent_memory_input_pre_norm is False
+
+
+def test_gated_deltanet_read_mode_must_be_known():
+    args = _make_args(
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_key_head_dim=64,
+        recurrent_gdn_value_head_dim=64,
+        recurrent_gdn_num_key_heads=2,
+        recurrent_gdn_num_value_heads=2,
+        recurrent_gdn_read_mode="unknown",
+    )
+
+    with pytest.raises(ValueError, match="recurrent_gdn_read_mode"):
+        validate_armt_constraints(args)
 
 
 def test_recurrent_slot_qk_norm_legacy_flag_is_rejected():

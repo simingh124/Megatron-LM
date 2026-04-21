@@ -235,6 +235,14 @@ def recurrent_forward_backward_no_pipelining(
     unwrapped_model = unwrap_model(model)
     if hasattr(unwrapped_model, "reset_all_monitoring_stats"):
         unwrapped_model.reset_all_monitoring_stats()
+    should_collect_monitoring = True
+    monitoring_gate = getattr(
+        unwrapped_model,
+        "should_collect_monitoring_for_current_iteration",
+        None,
+    )
+    if callable(monitoring_gate):
+        should_collect_monitoring = bool(monitoring_gate())
 
     from megatron.training import global_vars as training_global_vars
 
@@ -398,7 +406,7 @@ def recurrent_forward_backward_no_pipelining(
         )
 
     monitoring_primitives = {}
-    if hasattr(unwrapped_model, "consume_all_monitoring_primitives"):
+    if should_collect_monitoring and hasattr(unwrapped_model, "consume_all_monitoring_primitives"):
         model_primitives = unwrapped_model.consume_all_monitoring_primitives()
         if isinstance(model_primitives, dict):
             merge_metric_primitives(
@@ -406,7 +414,7 @@ def recurrent_forward_backward_no_pipelining(
                 model_primitives,
             )
 
-    if not forward_only:
+    if not forward_only and should_collect_monitoring:
         for chunk_idx, loss_sum in per_chunk_loss_sums.items():
             metric_name = f"train/chunk_{chunk_idx:02d}_loss"
             monitoring_primitives[metric_name] = build_ratio_metric(

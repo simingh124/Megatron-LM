@@ -1795,12 +1795,38 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+def _should_collect_armt_monitoring_for_iteration(args, iteration: int | None) -> bool:
+    if iteration is None:
+        return True
+
+    return (
+        bool(args.tensorboard_dir)
+        and not getattr(args, "disable_tensorboard_writer", False)
+        and (iteration + 1) % args.tensorboard_log_interval == 0
+    )
+
+
+def _set_collect_armt_monitoring_for_current_iteration(model, enabled: bool) -> None:
+    model_chunks = model if isinstance(model, list) else [model]
+    for model_chunk in model_chunks:
+        unwrapped_model_chunk = unwrap_model(model_chunk)
+        setter = getattr(
+            unwrapped_model_chunk,
+            "set_collect_monitoring_for_current_iteration",
+            None,
+        )
+        if callable(setter):
+            setter(bool(enabled))
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
     timers = get_timers()
 
     rerun_state_machine = get_rerun_state_machine()
+    collect_armt_monitoring = _should_collect_armt_monitoring_for_iteration(args, iteration)
+    _set_collect_armt_monitoring_for_current_iteration(model, collect_armt_monitoring)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and

@@ -7,6 +7,17 @@ from megatron.core.models.armt.armt_layer import ARMTLayer
 from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
 from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
 from megatron.core.models.armt.monitoring import finalize_metric_primitives
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+def _build_config(hidden_size: int, *, dtype: torch.dtype = torch.float32, num_layers: int = 2):
+    return TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=4 if hidden_size % 4 == 0 else 1,
+        ffn_hidden_size=hidden_size * 4,
+        params_dtype=dtype,
+    )
 
 
 class _DummyMemoryLayer(torch.nn.Module):
@@ -17,16 +28,13 @@ class _DummyMemoryLayer(torch.nn.Module):
         self.reset_monitoring_stats = MagicMock()
         self.consume_monitoring_primitives = MagicMock(return_value={})
         self.input_pre_norm = input_pre_norm
+        self.set_collect_monitoring_for_current_iteration = MagicMock()
 
 
 class TestARMTLayer:
     @pytest.fixture
     def mock_config(self):
-        config = MagicMock()
-        config.hidden_size = 256
-        config.sequence_parallel = False
-        config.params_dtype = torch.bfloat16
-        return config
+        return _build_config(hidden_size=256, dtype=torch.bfloat16)
 
     def test_armt_layer_forward_shape(self, mock_config):
         """验证 ARMTLayer.forward 的输出 shape 与输入一致（只做插入，不改主干维度）。"""
@@ -304,6 +312,47 @@ class TestARMTLayer:
         assert "armt/token/mem_token_cosine_min_mean" not in metrics
         assert "armt/token/mem_token_cosine_gt_0p8_ratio_mean" not in metrics
 
+    def test_armt_layer_monitoring_can_be_disabled_for_current_iteration(self, mock_config):
+        monitored_hidden = torch.tensor(
+            [
+                [[3.0, 4.0]],
+                [[0.0, 5.0]],
+                [[1.0, 0.0]],
+                [[-1.0, 0.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=2,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(monitored_hidden))
+            layer._forward_attention = MagicMock(return_value=(monitored_hidden, None))
+            layer._forward_mlp = MagicMock(return_value=monitored_hidden)
+
+        layer.set_collect_monitoring_for_current_iteration(False)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            layer.forward(monitored_hidden, attention_mask=None)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert metrics == {}
+        layer.recurrent_memory_layer.set_collect_monitoring_for_current_iteration.assert_called_once_with(
+            False
+        )
+
     def test_armt_layer_sequence_parallel_monitoring_gathers_full_hidden_states(
         self, mock_config
     ):
@@ -366,6 +415,8 @@ class TestARMTLayer:
         assert torch.equal(mem_hidden, full_hidden[-2:])
 
     def test_armt_layer_can_build_gated_deltanet_backend(self, mock_config):
+        mock_config.perform_initialization = False
+
         def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
             torch.nn.Module.__init__(self)
             self.config = config
@@ -390,6 +441,9 @@ class TestARMTLayer:
             )
 
         assert isinstance(layer.recurrent_memory_layer, GatedDeltaNetMemory)
+        assert layer.recurrent_memory_layer.config.perform_initialization is False
+        assert layer.recurrent_memory_layer.config.params_dtype == torch.bfloat16
+        assert layer.recurrent_memory_layer.read_mode == "normal"
 
     def test_armt_layer_can_build_associative_backend_with_explicit_head_dim(self, mock_config):
         mock_config.hidden_size = 70
@@ -502,6 +556,30 @@ class TestARMTLayer:
         assert layer.recurrent_memory_layer.use_qk_norm is True
         assert layer.recurrent_memory_layer.use_input_pre_norm is True
 
+    def test_armt_layer_passes_read_position_metrics_flag_to_backend(self, mock_config):
+        mock_config.hidden_size = 70
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                log_read_position_metrics_to_tensorboard=True,
+                d_mem=64,
+                armt_n_heads=4,
+                armt_head_dim=6,
+            )
+
+        assert layer.recurrent_memory_layer.log_read_position_metrics_to_tensorboard is True
+
     def test_armt_layer_passes_qk_norm_to_gdn_backend(self, mock_config):
         mock_config.hidden_size = 64
         mock_config.normalization = "RMSNorm"
@@ -534,6 +612,36 @@ class TestARMTLayer:
 
         assert layer.recurrent_memory_layer.use_qk_l2norm is False
         assert layer.recurrent_memory_layer.use_input_pre_norm is True
+        assert layer.recurrent_memory_layer.read_mode == "normal"
+
+    def test_armt_layer_passes_gdn_read_mode_to_backend(self, mock_config):
+        mock_config.hidden_size = 64
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                recurrent_memory_backend="gated_deltanet",
+                recurrent_gdn_read_mode="buggy",
+                recurrent_gdn_use_fla_kernel=False,
+                recurrent_gdn_use_causal_conv1d=False,
+                recurrent_gdn_conv_kernel_size=2,
+                recurrent_gdn_key_head_dim=16,
+                recurrent_gdn_value_head_dim=16,
+                recurrent_gdn_num_key_heads=4,
+                recurrent_gdn_num_value_heads=4,
+            )
+
+        assert layer.recurrent_memory_layer.read_mode == "buggy"
 
     @pytest.mark.parametrize(
         ("write_source", "expected_tensor"),
