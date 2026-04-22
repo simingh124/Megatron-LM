@@ -187,6 +187,19 @@ class AssociativeLayer(nn.Module):
         else:
             self._monitoring_stats[name] = current + value
 
+    def _accumulate_monitoring_vector(self, name: str, value: torch.Tensor):
+        value = value.detach().to(dtype=torch.float32)
+        current = self._monitoring_stats.get(name)
+        if current is None:
+            self._monitoring_stats[name] = value
+        else:
+            if current.shape != value.shape:
+                raise ValueError(
+                    "AssociativeLayer monitoring expects stable vector shapes for "
+                    f"{name}, got {tuple(current.shape)} vs {tuple(value.shape)}"
+                )
+            self._monitoring_stats[name] = current + value
+
     @staticmethod
     def _count_tensor(count: int, device: torch.device) -> torch.Tensor:
         return torch.tensor(float(count), device=device, dtype=torch.float32)
@@ -209,20 +222,24 @@ class AssociativeLayer(nn.Module):
 
         hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
         retrieved_norms = torch.linalg.vector_norm(retrieved_states.float(), dim=-1)
-        token_count = self._count_tensor(hidden_states.shape[0], hidden_states.device)
-
-        for position in range(hidden_states.shape[1]):
-            position_tag = self._position_metric_tag(position)
-            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
-            self._accumulate_monitoring_stat(
-                f"{stats_prefix}/hidden_norm_sum",
-                hidden_norms[:, position].sum(),
-            )
-            self._accumulate_monitoring_stat(
-                f"{stats_prefix}/retrieved_norm_sum",
-                retrieved_norms[:, position].sum(),
-            )
-            self._accumulate_monitoring_stat(f"{stats_prefix}/count", token_count)
+        position_count = torch.full(
+            (hidden_states.shape[1],),
+            float(hidden_states.shape[0]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        self._accumulate_monitoring_vector(
+            f"{_READ_POSITION_MONITORING_PREFIX}/hidden_norm_sum",
+            hidden_norms.sum(dim=0),
+        )
+        self._accumulate_monitoring_vector(
+            f"{_READ_POSITION_MONITORING_PREFIX}/retrieved_norm_sum",
+            retrieved_norms.sum(dim=0),
+        )
+        self._accumulate_monitoring_vector(
+            f"{_READ_POSITION_MONITORING_PREFIX}/count",
+            position_count,
+        )
 
     def _iter_read_monitoring_parts(
         self,
@@ -304,39 +321,62 @@ class AssociativeLayer(nn.Module):
         stats = self._monitoring_stats
         primitives = {}
 
+        total_retrieved_norm_sum = None
+        total_retrieved_norm_count = None
+        total_hidden_norm_sum = None
+
         for partition_name in ("context", "memory"):
             retrieved_count_key = f"{partition_name}_retrieved_norm_count"
             if retrieved_count_key not in stats:
                 continue
+            retrieved_norm_sum = stats[f"{partition_name}_retrieved_norm_sum"]
+            hidden_norm_sum = stats[f"{partition_name}_hidden_norm_sum"]
+            retrieved_norm_count = stats[retrieved_count_key]
             primitives[f"armt/read/{partition_name}_retrieved_norm_mean"] = build_mean_metric(
-                stats[f"{partition_name}_retrieved_norm_sum"],
-                stats[retrieved_count_key],
+                retrieved_norm_sum,
+                retrieved_norm_count,
             )
             primitives[
                 f"armt/read/retrieved_to_{partition_name}_hidden_ratio"
             ] = build_ratio_metric(
-                stats[f"{partition_name}_retrieved_norm_sum"],
-                stats[f"{partition_name}_hidden_norm_sum"],
+                retrieved_norm_sum,
+                hidden_norm_sum,
+            )
+            if total_retrieved_norm_sum is None:
+                total_retrieved_norm_sum = retrieved_norm_sum
+                total_retrieved_norm_count = retrieved_norm_count
+                total_hidden_norm_sum = hidden_norm_sum
+            else:
+                total_retrieved_norm_sum = total_retrieved_norm_sum + retrieved_norm_sum
+                total_retrieved_norm_count = total_retrieved_norm_count + retrieved_norm_count
+                total_hidden_norm_sum = total_hidden_norm_sum + hidden_norm_sum
+
+        if total_retrieved_norm_count is not None:
+            primitives["armt/read/retrieved_norm_mean"] = build_mean_metric(
+                total_retrieved_norm_sum,
+                total_retrieved_norm_count,
+            )
+            primitives["armt/read/retrieved_to_hidden_ratio"] = build_ratio_metric(
+                total_retrieved_norm_sum,
+                total_hidden_norm_sum,
             )
 
-        position_count_keys = sorted(
-            key
-            for key in stats
-            if key.startswith(f"{_READ_POSITION_MONITORING_PREFIX}/") and key.endswith("/count")
-        )
-        for count_key in position_count_keys:
-            position_tag = count_key.split("/")[1]
-            stats_prefix = f"{_READ_POSITION_MONITORING_PREFIX}/{position_tag}"
-            primitives[f"armt/read/retrieved_norm_mean/{position_tag}"] = build_mean_metric(
-                stats[f"{stats_prefix}/retrieved_norm_sum"],
-                stats[count_key],
-            )
-            primitives[f"armt/read/retrieved_to_hidden_ratio/{position_tag}"] = (
-                build_ratio_metric(
-                    stats[f"{stats_prefix}/retrieved_norm_sum"],
-                    stats[f"{stats_prefix}/hidden_norm_sum"],
+        position_counts = stats.get(f"{_READ_POSITION_MONITORING_PREFIX}/count")
+        if position_counts is not None:
+            hidden_norm_sums = stats[f"{_READ_POSITION_MONITORING_PREFIX}/hidden_norm_sum"]
+            retrieved_norm_sums = stats[f"{_READ_POSITION_MONITORING_PREFIX}/retrieved_norm_sum"]
+            for position in range(position_counts.numel()):
+                position_tag = self._position_metric_tag(position)
+                primitives[f"armt/read/retrieved_norm_mean/{position_tag}"] = build_mean_metric(
+                    retrieved_norm_sums[position],
+                    position_counts[position],
                 )
-            )
+                primitives[f"armt/read/retrieved_to_hidden_ratio/{position_tag}"] = (
+                    build_ratio_metric(
+                        retrieved_norm_sums[position],
+                        hidden_norm_sums[position],
+                    )
+                )
 
         if "delta_mem_elem_count" in stats:
             primitives["armt/write/delta_mem_norm"] = build_rms_metric(

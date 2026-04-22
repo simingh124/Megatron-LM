@@ -398,6 +398,14 @@ class TestARMTModel:
                     torch.tensor(8.0),
                     torch.tensor(4.0),
                 ),
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(14.0),
+                    torch.tensor(7.0),
+                ),
+                "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                    torch.tensor(14.0),
+                    torch.tensor(22.0),
+                ),
                 "armt/read/retrieved_norm_mean/pos_0000": build_mean_metric(
                     torch.tensor(8.0),
                     torch.tensor(2.0),
@@ -432,6 +440,14 @@ class TestARMTModel:
                     torch.tensor(6.0),
                     torch.tensor(12.0),
                 ),
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(21.0),
+                    torch.tensor(7.0),
+                ),
+                "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                    torch.tensor(21.0),
+                    torch.tensor(15.0),
+                ),
                 "armt/read/retrieved_norm_mean/pos_0000": build_mean_metric(
                     torch.tensor(6.0),
                     torch.tensor(3.0),
@@ -459,12 +475,14 @@ class TestARMTModel:
 
         assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(13.0 / 5.0)
         assert float(metrics["armt/read/memory_retrieved_norm_mean"]) == pytest.approx(22.0 / 9.0)
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(35.0 / 14.0)
         assert float(metrics["armt/read/retrieved_to_context_hidden_ratio"]) == pytest.approx(
             15.0 / 21.0
         )
         assert float(metrics["armt/read/retrieved_to_memory_hidden_ratio"]) == pytest.approx(
             14.0 / 16.0
         )
+        assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(35.0 / 37.0)
         assert float(metrics["armt/read/retrieved_norm_mean/pos_0000"]) == pytest.approx(14.0 / 5.0)
         assert float(metrics["armt/read/retrieved_to_hidden_ratio/pos_0000"]) == pytest.approx(
             14.0 / 22.0
@@ -517,6 +535,14 @@ class TestARMTModel:
                     torch.tensor(8.0),
                     torch.tensor(4.0),
                 ),
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(14.0),
+                    torch.tensor(7.0),
+                ),
+                "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                    torch.tensor(14.0),
+                    torch.tensor(22.0),
+                ),
                 "armt/read/retrieved_norm_mean/pos_0000": build_mean_metric(
                     torch.tensor(8.0),
                     torch.tensor(2.0),
@@ -551,6 +577,14 @@ class TestARMTModel:
                     torch.tensor(6.0),
                     torch.tensor(12.0),
                 ),
+                "armt/read/retrieved_norm_mean": build_mean_metric(
+                    torch.tensor(21.0),
+                    torch.tensor(7.0),
+                ),
+                "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                    torch.tensor(21.0),
+                    torch.tensor(15.0),
+                ),
                 "armt/read/retrieved_norm_mean/pos_0000": build_mean_metric(
                     torch.tensor(6.0),
                     torch.tensor(3.0),
@@ -574,12 +608,14 @@ class TestARMTModel:
 
         assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(13.0 / 5.0)
         assert float(metrics["armt/read/memory_retrieved_norm_mean"]) == pytest.approx(22.0 / 9.0)
+        assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(35.0 / 14.0)
         assert float(metrics["armt/read/retrieved_to_context_hidden_ratio"]) == pytest.approx(
             15.0 / 21.0
         )
         assert float(metrics["armt/read/retrieved_to_memory_hidden_ratio"]) == pytest.approx(
             14.0 / 16.0
         )
+        assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(35.0 / 37.0)
         assert float(metrics["armt/read/retrieved_norm_mean/pos_0000"]) == pytest.approx(14.0 / 5.0)
         assert float(metrics["armt/read/retrieved_to_hidden_ratio/pos_0000"]) == pytest.approx(
             14.0 / 22.0
@@ -613,6 +649,10 @@ class TestARMTModel:
             2.0 / 9.0
         )
         assert float(metrics["armt/token/mem_ctx_norm_ratio/layer_02"]) == pytest.approx(4.5)
+        assert "armt/read/retrieved_norm_mean/layer_01" not in metrics
+        assert "armt/read/retrieved_norm_mean/layer_02" not in metrics
+        assert "armt/read/retrieved_to_hidden_ratio/layer_01" not in metrics
+        assert "armt/read/retrieved_to_hidden_ratio/layer_02" not in metrics
         assert "armt/read/retrieved_norm_mean/pos_0000/layer_01" not in metrics
         assert "armt/read/retrieved_norm_mean/pos_0000/layer_02" not in metrics
         assert "armt/read/retrieved_to_hidden_ratio/pos_0000/layer_01" not in metrics

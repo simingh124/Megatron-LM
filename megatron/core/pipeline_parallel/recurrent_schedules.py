@@ -7,6 +7,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.armt.monitoring import (
+    build_mean_metric,
     build_ratio_metric,
     clear_armt_tensorboard_metrics,
     merge_metric_primitives,
@@ -18,6 +19,10 @@ from megatron.core.utils import get_model_config, get_model_type, unwrap_model
 from .schedules import backward_step
 
 _PRIMARY_LOSS_KEY = "lm loss"
+_CHUNK_SCOPED_ARMT_READ_METRIC_NAMES = (
+    "armt/read/retrieved_norm_mean",
+    "armt/read/retrieved_to_hidden_ratio",
+)
 
 
 def _get_recurrent_chunk_size(args) -> Optional[int]:
@@ -75,6 +80,62 @@ def _get_num_tokens(chunk: Dict) -> float:
     if "tokens" in chunk and isinstance(chunk["tokens"], torch.Tensor):
         return float(chunk["tokens"].numel())
     return 0.0
+
+
+def _chunk_scoped_metric_name(metric_name: str, chunk_idx: int) -> str:
+    return f"{metric_name}/chunk_{chunk_idx:02d}"
+
+
+def _infer_chunk_metric_device(model_primitives: Dict[str, object]) -> torch.device:
+    for primitive in model_primitives.values():
+        numerator = getattr(primitive, "numerator", None)
+        if isinstance(numerator, torch.Tensor):
+            return numerator.device
+        denominator = getattr(primitive, "denominator", None)
+        if isinstance(denominator, torch.Tensor):
+            return denominator.device
+
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _build_chunk_scoped_armt_read_metrics(
+    model_primitives: Dict[str, object],
+    *,
+    chunk_idx: int,
+    emit_zero_when_missing: bool,
+) -> Dict[str, object]:
+    chunk_primitives = {}
+    found_metric = False
+    for metric_name in _CHUNK_SCOPED_ARMT_READ_METRIC_NAMES:
+        primitive = model_primitives.get(metric_name)
+        if primitive is None:
+            continue
+        chunk_primitives[_chunk_scoped_metric_name(metric_name, chunk_idx)] = primitive
+        found_metric = True
+
+    if found_metric or not emit_zero_when_missing:
+        return chunk_primitives
+
+    zero = torch.zeros(
+        (),
+        dtype=torch.float32,
+        device=_infer_chunk_metric_device(model_primitives),
+    )
+    chunk_primitives[_chunk_scoped_metric_name("armt/read/retrieved_norm_mean", chunk_idx)] = (
+        build_mean_metric(zero, zero)
+    )
+    chunk_primitives[_chunk_scoped_metric_name("armt/read/retrieved_to_hidden_ratio", chunk_idx)] = (
+        build_ratio_metric(zero, zero)
+    )
+    return chunk_primitives
+
+
+def _should_publish_chunk_scoped_armt_read_metrics(args) -> bool:
+    return bool(
+        args is not None and getattr(args, "armt_log_read_chunk_metrics_to_tensorboard", False)
+    )
 
 
 def _accumulate_chunk_reports(
@@ -232,6 +293,8 @@ def recurrent_forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int)
     per_chunk_loss_sums: Dict[int, torch.Tensor] = {}
     per_chunk_token_sums: Dict[int, torch.Tensor] = {}
+    monitoring_primitives = {}
+    chunk_scoped_read_primitives = {}
     unwrapped_model = unwrap_model(model)
     if hasattr(unwrapped_model, "reset_all_monitoring_stats"):
         unwrapped_model.reset_all_monitoring_stats()
@@ -243,6 +306,7 @@ def recurrent_forward_backward_no_pipelining(
     )
     if callable(monitoring_gate):
         should_collect_monitoring = bool(monitoring_gate())
+    should_publish_monitoring = should_collect_monitoring and not forward_only
 
     from megatron.training import global_vars as training_global_vars
 
@@ -272,6 +336,9 @@ def recurrent_forward_backward_no_pipelining(
                 "recurrent_tbptt_mode",
                 getattr(args, "armt_tbptt_mode", True),
             )
+        should_publish_chunk_scoped_read_metrics = (
+            should_publish_monitoring and _should_publish_chunk_scoped_armt_read_metrics(args)
+        )
         if args is not None and getattr(args, "no_loss_from_first_chunk", False) and num_chunks > 0:
             if "loss_mask" not in chunks[0] or not isinstance(chunks[0]["loss_mask"], torch.Tensor):
                 raise ValueError(
@@ -377,6 +444,21 @@ def recurrent_forward_backward_no_pipelining(
                     chunk_tokens = run_chunk_with_model_state(chunk_idx, chunk)
 
                 total_num_tokens += int(chunk_tokens)
+                if should_publish_monitoring and hasattr(
+                    unwrapped_model, "consume_all_monitoring_primitives"
+                ):
+                    model_primitives = unwrapped_model.consume_all_monitoring_primitives()
+                    if isinstance(model_primitives, dict):
+                        merge_metric_primitives(monitoring_primitives, model_primitives)
+                        if should_publish_chunk_scoped_read_metrics:
+                            merge_metric_primitives(
+                                chunk_scoped_read_primitives,
+                                _build_chunk_scoped_armt_read_metrics(
+                                    model_primitives,
+                                    chunk_idx=chunk_idx,
+                                    emit_zero_when_missing=chunk_idx == 0,
+                                ),
+                            )
         else:
             microbatch_context = (
                 no_sync_func() if not forward_only and not is_last_microbatch else contextlib.nullcontext()
@@ -385,6 +467,21 @@ def recurrent_forward_backward_no_pipelining(
                 for chunk_idx, chunk in enumerate(chunks):
                     chunk_tokens = run_chunk_with_model_state(chunk_idx, chunk)
                     total_num_tokens += int(chunk_tokens)
+                    if should_publish_monitoring and hasattr(
+                        unwrapped_model, "consume_all_monitoring_primitives"
+                    ):
+                        model_primitives = unwrapped_model.consume_all_monitoring_primitives()
+                        if isinstance(model_primitives, dict):
+                            merge_metric_primitives(monitoring_primitives, model_primitives)
+                            if should_publish_chunk_scoped_read_metrics:
+                                merge_metric_primitives(
+                                    chunk_scoped_read_primitives,
+                                    _build_chunk_scoped_armt_read_metrics(
+                                        model_primitives,
+                                        chunk_idx=chunk_idx,
+                                        emit_zero_when_missing=chunk_idx == 0,
+                                    ),
+                                )
 
                 if not forward_only and microbatch_total_loss is not None:
                     _backward_full_microbatch_loss(microbatch_total_loss, config)
@@ -405,16 +502,8 @@ def recurrent_forward_backward_no_pipelining(
             force_all_reduce=force_all_reduce,
         )
 
-    monitoring_primitives = {}
-    if should_collect_monitoring and hasattr(unwrapped_model, "consume_all_monitoring_primitives"):
-        model_primitives = unwrapped_model.consume_all_monitoring_primitives()
-        if isinstance(model_primitives, dict):
-            merge_metric_primitives(
-                monitoring_primitives,
-                model_primitives,
-            )
-
-    if not forward_only and should_collect_monitoring:
+    if should_publish_monitoring:
+        merge_metric_primitives(monitoring_primitives, chunk_scoped_read_primitives)
         for chunk_idx, loss_sum in per_chunk_loss_sums.items():
             metric_name = f"train/chunk_{chunk_idx:02d}_loss"
             monitoring_primitives[metric_name] = build_ratio_metric(

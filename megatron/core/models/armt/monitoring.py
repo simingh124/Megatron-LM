@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, MutableMapping, Optional
+from typing import Dict, Mapping, MutableMapping, Optional, Tuple
 
 import torch
 
@@ -135,8 +135,70 @@ def publish_armt_tensorboard_metrics(primitives: Mapping[str, MetricPrimitive]) 
     accumulate_armt_tensorboard_metrics(primitives)
 
 
+def _get_metric_primitive_device(primitive: MetricPrimitive) -> torch.device:
+    numerator_device = primitive.numerator.device
+    denominator_device = primitive.denominator.device
+    if numerator_device != denominator_device:
+        raise ValueError(
+            "ARMT metric primitives require numerator and denominator on the same device, "
+            f"got {numerator_device} vs {denominator_device}."
+        )
+    return numerator_device
+
+
+def _flatten_metric_primitives(
+    primitives: Mapping[str, MetricPrimitive],
+) -> Dict[torch.device, Tuple[torch.Tensor, list[tuple[str, str, tuple[int, ...], int, tuple[int, ...], int]]]]:
+    grouped_buffers: Dict[torch.device, torch.Tensor] = {}
+    grouped_metadata: Dict[
+        torch.device,
+        list[tuple[str, str, tuple[int, ...], int, tuple[int, ...], int]],
+    ] = {}
+    grouped_total_numel: Dict[torch.device, int] = {}
+
+    for name, primitive in primitives.items():
+        device = _get_metric_primitive_device(primitive)
+        grouped_metadata.setdefault(device, [])
+        grouped_total_numel[device] = grouped_total_numel.get(device, 0) + primitive.numerator.numel()
+        grouped_total_numel[device] += primitive.denominator.numel()
+        grouped_metadata[device].append(
+            (
+                name,
+                primitive.kind,
+                tuple(primitive.numerator.shape),
+                primitive.numerator.numel(),
+                tuple(primitive.denominator.shape),
+                primitive.denominator.numel(),
+            )
+        )
+
+    for device, total_numel in grouped_total_numel.items():
+        grouped_buffers[device] = torch.empty(total_numel, device=device, dtype=torch.float32)
+
+    grouped_offsets = {device: 0 for device in grouped_buffers}
+    for device, metadata in grouped_metadata.items():
+        flat_buffer = grouped_buffers[device]
+        cursor = grouped_offsets[device]
+        for name, _kind, _numerator_shape, numerator_numel, _denominator_shape, denominator_numel in metadata:
+            primitive = primitives[name]
+            flat_buffer[cursor : cursor + numerator_numel].copy_(
+                primitive.numerator.to(dtype=torch.float32).reshape(-1)
+            )
+            cursor += numerator_numel
+            flat_buffer[cursor : cursor + denominator_numel].copy_(
+                primitive.denominator.to(dtype=torch.float32).reshape(-1)
+            )
+            cursor += denominator_numel
+        grouped_offsets[device] = cursor
+
+    return {
+        device: (grouped_buffers[device], grouped_metadata[device]) for device in grouped_buffers
+    }
+
+
 def consume_armt_tensorboard_metrics(
     reduce_group: Optional[torch.distributed.ProcessGroup] = None,
+    finalize_on_this_rank: bool = True,
 ) -> Dict[str, torch.Tensor]:
     if not _ARMT_TENSORBOARD_TRACKER:
         return {}
@@ -144,26 +206,41 @@ def consume_armt_tensorboard_metrics(
     primitives = dict(_ARMT_TENSORBOARD_TRACKER)
     clear_armt_tensorboard_metrics()
 
-    reduced_primitives: Dict[str, MetricPrimitive] = {}
     should_reduce = (
         reduce_group is not None
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
     )
+    if not finalize_on_this_rank:
+        for flat_buffer, _metadata in _flatten_metric_primitives(primitives).values():
+            if should_reduce:
+                torch.distributed.all_reduce(flat_buffer, group=reduce_group)
+        return {}
 
-    for name, primitive in primitives.items():
-        reduced_values = torch.stack(
-            (
-                primitive.numerator.to(dtype=torch.float32),
-                primitive.denominator.to(dtype=torch.float32),
-            )
-        )
+    finalized_metrics: Dict[str, torch.Tensor] = {}
+    for flat_buffer, metadata in _flatten_metric_primitives(primitives).values():
         if should_reduce:
-            torch.distributed.all_reduce(reduced_values, group=reduce_group)
-        reduced_primitives[name] = MetricPrimitive(
-            kind=primitive.kind,
-            numerator=reduced_values[0],
-            denominator=reduced_values[1],
-        )
+            torch.distributed.all_reduce(flat_buffer, group=reduce_group)
 
-    return finalize_metric_primitives(reduced_primitives)
+        cursor = 0
+        for (
+            name,
+            kind,
+            numerator_shape,
+            numerator_numel,
+            denominator_shape,
+            denominator_numel,
+        ) in metadata:
+            numerator = flat_buffer[cursor : cursor + numerator_numel]
+            cursor += numerator_numel
+            denominator = flat_buffer[cursor : cursor + denominator_numel]
+            cursor += denominator_numel
+            finalized_metrics[name] = finalize_metric_primitive(
+                MetricPrimitive(
+                    kind=kind,
+                    numerator=numerator.reshape(numerator_shape),
+                    denominator=denominator.reshape(denominator_shape),
+                )
+            )
+
+    return finalized_metrics

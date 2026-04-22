@@ -281,6 +281,22 @@ def test_armt_read_position_metrics_tensorboard_switch_can_be_enabled():
     assert args.armt_log_read_position_metrics_to_tensorboard is True
 
 
+def test_armt_read_chunk_metrics_tensorboard_switch_defaults_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_log_read_chunk_metrics_to_tensorboard is False
+
+
+def test_armt_read_chunk_metrics_tensorboard_switch_can_be_enabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-log-read-chunk-metrics-to-tensorboard"])
+
+    assert args.armt_log_read_chunk_metrics_to_tensorboard is True
+
+
 def test_armt_head_dim_arg_is_registered():
     parser = argparse.ArgumentParser()
     add_armt_args(parser)

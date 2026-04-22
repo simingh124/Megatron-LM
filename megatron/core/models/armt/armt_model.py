@@ -19,6 +19,13 @@ from .windowed_attention_utils import should_use_windowed_full_attention
 class ARMTModel(GPTModel):
     """GPTModel with associative memory tokens and ARMT layers."""
 
+    _LAYER_METRICS_TO_KEEP_AGGREGATED_ONLY = frozenset(
+        {
+            "armt/read/retrieved_norm_mean",
+            "armt/read/retrieved_to_hidden_ratio",
+        }
+    )
+
     def __init__(
         self,
         config,
@@ -96,7 +103,10 @@ class ARMTModel(GPTModel):
 
     @staticmethod
     def _should_expand_layer_metric(metric_name: str) -> bool:
-        return "/pos_" not in metric_name
+        return (
+            "/pos_" not in metric_name
+            and metric_name not in ARMTModel._LAYER_METRICS_TO_KEEP_AGGREGATED_ONLY
+        )
 
     def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
         breakdown = []

@@ -57,6 +57,12 @@ from .theoretical_memory_usage import report_theoretical_memory
 _LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
 
 import torch
+try:
+    from torch.utils.tensorboard import SummaryWriter as TorchSummaryWriter
+    from tensorboard.compat.proto.summary_pb2 import Summary
+except ModuleNotFoundError:
+    TorchSummaryWriter = None
+    Summary = None
 
 try:
     from megatron.rl import rl_utils
@@ -1806,6 +1812,27 @@ def _should_collect_armt_monitoring_for_iteration(args, iteration: int | None) -
     )
 
 
+_ARMT_READ_CHUNK_METRIC_PREFIXES = (
+    "armt/read/retrieved_norm_mean/chunk_",
+    "armt/read/retrieved_to_hidden_ratio/chunk_",
+)
+
+
+def _should_log_armt_read_chunk_metrics_to_tensorboard(args) -> bool:
+    return bool(getattr(args, "armt_log_read_chunk_metrics_to_tensorboard", False))
+
+
+def _filter_armt_metrics_for_tensorboard_logging(args, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    if not metrics or _should_log_armt_read_chunk_metrics_to_tensorboard(args):
+        return metrics
+
+    return {
+        metric_name: metric_value
+        for metric_name, metric_value in metrics.items()
+        if not metric_name.startswith(_ARMT_READ_CHUNK_METRIC_PREFIXES)
+    }
+
+
 def _set_collect_armt_monitoring_for_current_iteration(model, enabled: bool) -> None:
     model_chunks = model if isinstance(model, list) else [model]
     for model_chunk in model_chunks:
@@ -1817,6 +1844,44 @@ def _set_collect_armt_monitoring_for_current_iteration(model, enabled: bool) -> 
         )
         if callable(setter):
             setter(bool(enabled))
+
+
+def _write_scalar_metrics_to_tensorboard(
+    writer,
+    metrics: Dict[str, Any],
+    iteration: int,
+) -> None:
+    if not metrics:
+        return
+
+    if (
+        TorchSummaryWriter is not None
+        and Summary is not None
+        and isinstance(writer, TorchSummaryWriter)
+    ):
+        summary_values = []
+        for metric_name, metric_value in metrics.items():
+            if isinstance(metric_value, torch.Tensor):
+                if metric_value.numel() != 1:
+                    raise ValueError(
+                        "TensorBoard scalar logging expects scalar tensors, "
+                        f"got {metric_name} with shape {tuple(metric_value.shape)}"
+                    )
+                scalar_value = float(metric_value.detach().reshape(()).item())
+            else:
+                scalar_value = float(metric_value)
+            summary_values.append(
+                Summary.Value(tag=metric_name, simple_value=scalar_value)
+            )
+
+        writer._get_file_writer().add_summary(
+            Summary(value=summary_values),
+            global_step=iteration,
+        )
+        return
+
+    for metric_name, metric_value in metrics.items():
+        writer.add_scalar(metric_name, metric_value, iteration)
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -2109,7 +2174,12 @@ def training_log(
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             armt_reduce_group = mpu.get_data_parallel_group(with_context_parallel=True)
         armt_tensorboard_metrics = consume_armt_tensorboard_metrics(
-            reduce_group=armt_reduce_group
+            reduce_group=armt_reduce_group,
+            finalize_on_this_rank=writer is not None,
+        )
+        armt_tensorboard_metrics = _filter_armt_metrics_for_tensorboard_logging(
+            args,
+            armt_tensorboard_metrics,
         )
     else:
         armt_tensorboard_metrics = {}
@@ -2195,8 +2265,7 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-        for metric_name, metric_value in armt_tensorboard_metrics.items():
-            writer.add_scalar(metric_name, metric_value, iteration)
+        _write_scalar_metrics_to_tensorboard(writer, armt_tensorboard_metrics, iteration)
 
     # Log MoE metrics.
     if args.num_experts is not None:

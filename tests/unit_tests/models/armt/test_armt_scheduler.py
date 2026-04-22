@@ -12,6 +12,7 @@ from megatron.core.pipeline_parallel.recurrent_schedules import (
 )
 from megatron.core.models.armt.monitoring import (
     build_mean_metric,
+    build_ratio_metric,
     clear_armt_tensorboard_metrics,
     consume_armt_tensorboard_metrics,
 )
@@ -552,57 +553,75 @@ def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
     config.timers = None
 
     unwrapped_model = MagicMock()
-    unwrapped_model.consume_all_monitoring_primitives.return_value = {
-        "armt/read/context_retrieved_norm_mean": build_mean_metric(
-            torch.tensor(6.0),
-            torch.tensor(3.0),
-        ),
-    }
+    unwrapped_model.consume_all_monitoring_primitives.side_effect = [
+        {},
+        {
+            "armt/read/context_retrieved_norm_mean": build_mean_metric(
+                torch.tensor(6.0),
+                torch.tensor(3.0),
+            ),
+            "armt/read/retrieved_norm_mean": build_mean_metric(
+                torch.tensor(12.0),
+                torch.tensor(6.0),
+            ),
+            "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                torch.tensor(12.0),
+                torch.tensor(24.0),
+            ),
+        },
+    ]
 
-    with (
-        patch(f"{SCHEDULE_MODULE}.get_model_config", return_value=config),
-        patch(f"{SCHEDULE_MODULE}.get_model_type", return_value=MagicMock()),
-        patch(f"{SCHEDULE_MODULE}.unwrap_model", return_value=unwrapped_model),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_tensor_model_parallel_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_context_parallel_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_embedding_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_pipeline_model_parallel_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_position_embedding_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            f"{SCHEDULE_MODULE}.parallel_state.get_data_parallel_group",
-            return_value=MagicMock(),
-        ),
-        patch(
-            "megatron.training.utils.get_batch_on_this_tp_rank",
-            side_effect=lambda it: raw_batch,
-        ),
-        patch(f"{SCHEDULE_MODULE}.backward_step"),
-    ):
-        losses = recurrent_forward_backward_no_pipelining(
-            forward_step_func=forward_step_func,
-            data_iterator=iter([raw_batch]),
-            model=MagicMock(),
-            num_microbatches=1,
-            chunk_size=chunk_size,
-            seq_length=seq_length,
-            micro_batch_size=batch_size,
-            forward_only=False,
+    old_global_args = training_global_vars._GLOBAL_ARGS
+    try:
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(
+            armt_log_read_chunk_metrics_to_tensorboard=True,
         )
+        with (
+            patch(f"{SCHEDULE_MODULE}.get_model_config", return_value=config),
+            patch(f"{SCHEDULE_MODULE}.get_model_type", return_value=MagicMock()),
+            patch(f"{SCHEDULE_MODULE}.unwrap_model", return_value=unwrapped_model),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_tensor_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_context_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_embedding_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_pipeline_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_position_embedding_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_data_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "megatron.training.utils.get_batch_on_this_tp_rank",
+                side_effect=lambda it: raw_batch,
+            ),
+            patch(f"{SCHEDULE_MODULE}.backward_step"),
+        ):
+            losses = recurrent_forward_backward_no_pipelining(
+                forward_step_func=forward_step_func,
+                data_iterator=iter([raw_batch]),
+                model=MagicMock(),
+                num_microbatches=1,
+                chunk_size=chunk_size,
+                seq_length=seq_length,
+                micro_batch_size=batch_size,
+                forward_only=False,
+            )
+    finally:
+        training_global_vars._GLOBAL_ARGS = old_global_args
 
     assert len(losses) == 1
     metrics = consume_armt_tensorboard_metrics()
@@ -610,8 +629,129 @@ def test_scheduler_publishes_chunk_and_armt_monitoring_metrics():
     assert float(metrics["train/chunk_00_loss"]) == pytest.approx(1.0)
     assert float(metrics["train/chunk_01_loss"]) == pytest.approx(2.0)
     assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(0.5)
+    assert float(metrics["armt/read/retrieved_norm_mean/chunk_00"]) == pytest.approx(0.0)
+    assert float(metrics["armt/read/retrieved_to_hidden_ratio/chunk_00"]) == pytest.approx(0.0)
+    assert float(metrics["armt/read/retrieved_norm_mean/chunk_01"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_to_hidden_ratio/chunk_01"]) == pytest.approx(0.5)
     unwrapped_model.reset_all_monitoring_stats.assert_called_once()
     unwrapped_model.reset_all_memory.assert_called_once()
+    assert unwrapped_model.consume_all_monitoring_primitives.call_count == 2
+
+
+def test_scheduler_skips_chunk_read_metrics_when_chunk_logging_is_disabled():
+    clear_armt_tensorboard_metrics()
+    raw_batch = {
+        "tokens": torch.randint(0, 100, (1, 8)),
+        "labels": torch.randint(0, 100, (1, 8)),
+        "loss_mask": torch.ones(1, 8),
+    }
+
+    forward_calls = {"n": 0}
+
+    def forward_step_func(data_it, model):
+        batch = next(data_it)
+        forward_calls["n"] += 1
+        output_tensor = torch.zeros([], requires_grad=True)
+
+        def _loss_func(_output_tensor):
+            num_tokens = batch["loss_mask"].float().sum().to(torch.int)
+            loss_scale = float(forward_calls["n"])
+            loss_sum = num_tokens.float() * loss_scale
+            loss_reduced = {
+                "lm loss": torch.cat([loss_sum.view(1), num_tokens.view(1)]),
+            }
+            return _output_tensor * 0.0 + loss_sum, num_tokens, loss_reduced
+
+        return output_tensor, _loss_func
+
+    config = MagicMock()
+    config.no_sync_func = None
+    config.calculate_per_token_loss = False
+    config.finalize_model_grads_func = None
+    config.grad_scale_func = None
+    config.timers = None
+
+    unwrapped_model = MagicMock()
+    unwrapped_model.consume_all_monitoring_primitives.side_effect = [
+        {},
+        {
+            "armt/read/context_retrieved_norm_mean": build_mean_metric(
+                torch.tensor(6.0),
+                torch.tensor(3.0),
+            ),
+            "armt/read/retrieved_norm_mean": build_mean_metric(
+                torch.tensor(12.0),
+                torch.tensor(6.0),
+            ),
+            "armt/read/retrieved_to_hidden_ratio": build_ratio_metric(
+                torch.tensor(12.0),
+                torch.tensor(24.0),
+            ),
+        },
+    ]
+
+    old_global_args = training_global_vars._GLOBAL_ARGS
+    try:
+        training_global_vars._GLOBAL_ARGS = SimpleNamespace(
+            armt_log_read_chunk_metrics_to_tensorboard=False,
+        )
+        with (
+            patch(f"{SCHEDULE_MODULE}.get_model_config", return_value=config),
+            patch(f"{SCHEDULE_MODULE}.get_model_type", return_value=MagicMock()),
+            patch(f"{SCHEDULE_MODULE}.unwrap_model", return_value=unwrapped_model),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_tensor_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_context_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_embedding_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_pipeline_model_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_position_embedding_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                f"{SCHEDULE_MODULE}.parallel_state.get_data_parallel_group",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "megatron.training.utils.get_batch_on_this_tp_rank",
+                side_effect=lambda it: raw_batch,
+            ),
+            patch(f"{SCHEDULE_MODULE}.backward_step"),
+        ):
+            recurrent_forward_backward_no_pipelining(
+                forward_step_func=forward_step_func,
+                data_iterator=iter([raw_batch]),
+                model=MagicMock(),
+                num_microbatches=1,
+                chunk_size=4,
+                seq_length=8,
+                micro_batch_size=1,
+                forward_only=False,
+            )
+    finally:
+        training_global_vars._GLOBAL_ARGS = old_global_args
+
+    metrics = consume_armt_tensorboard_metrics()
+    assert float(metrics["armt/read/context_retrieved_norm_mean"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(0.5)
+    assert "armt/read/retrieved_norm_mean/chunk_00" not in metrics
+    assert "armt/read/retrieved_to_hidden_ratio/chunk_00" not in metrics
+    assert "armt/read/retrieved_norm_mean/chunk_01" not in metrics
+    assert "armt/read/retrieved_to_hidden_ratio/chunk_01" not in metrics
 
 
 def test_scheduler_forward_only_does_not_publish_monitoring_metrics():

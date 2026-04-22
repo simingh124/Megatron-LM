@@ -27,7 +27,14 @@ def _expected_partitioned_read_metrics(
 ):
     memory_tokens = min(num_mem_tokens, hidden_states.shape[1])
     context_tokens = hidden_states.shape[1] - memory_tokens
+    hidden_norms = torch.linalg.vector_norm(hidden_states.float(), dim=-1)
+    retrieved_norms = torch.linalg.vector_norm(retrieved_states.float(), dim=-1)
     expected = {}
+
+    expected["armt/read/retrieved_norm_mean"] = retrieved_norms.mean()
+    expected["armt/read/retrieved_to_hidden_ratio"] = (
+        retrieved_norms.sum() / hidden_norms.sum()
+    )
 
     if context_tokens > 0:
         context_hidden = hidden_states[:, :context_tokens, :]
@@ -404,8 +411,6 @@ def test_gdn_memory_monitoring_metrics_present():
     for metric_name, expected_value in expected_metrics.items():
         rel = 1e-4 if "ratio" in metric_name else 1e-5
         assert float(metrics[metric_name]) == pytest.approx(float(expected_value), rel=rel)
-    assert "armt/read/retrieved_norm_mean" not in metrics
-    assert "armt/read/retrieved_to_hidden_ratio" not in metrics
     assert "armt/read/retrieved_norm_mean/pos_0000" not in metrics
     assert "armt/read/retrieved_to_hidden_ratio/pos_0000" not in metrics
 

@@ -81,6 +81,17 @@ def add_armt_args(parser):
         ),
     )
     group.add_argument(
+        "--armt-log-read-chunk-metrics-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit chunk-scoped aggregated ARMT read metrics under "
+            "armt/read/retrieved_norm_mean/chunk_XX and "
+            "armt/read/retrieved_to_hidden_ratio/chunk_XX. "
+            "Requires TensorBoard logging to be enabled."
+        ),
+    )
+    group.add_argument(
         "--armt-memory-write-source",
         choices=("mem_tokens", "post_mlp_context", "post_attn_context", "pre_attn_context"),
         default="mem_tokens",
