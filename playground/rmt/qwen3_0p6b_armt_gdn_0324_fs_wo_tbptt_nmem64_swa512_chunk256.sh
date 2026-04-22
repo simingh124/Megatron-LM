@@ -168,7 +168,6 @@ NORM_EPS=1e-6
 NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-64}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-256}
 FULL_ATTN_WINDOW_SIZE=${FULL_ATTN_WINDOW_SIZE:-512}
-ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
 
@@ -275,7 +274,6 @@ ARMT_ARGS=(
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
   --full-attn-window-size ${FULL_ATTN_WINDOW_SIZE}
-  --armt-n-heads ${ARMT_N_HEADS}
   --recurrent-memory-backend gated_deltanet
   --recurrent-gdn-conv-kernel-size ${RECURRENT_GDN_CONV_KERNEL_SIZE}
   --recurrent-gdn-key-head-dim ${RECURRENT_GDN_KEY_HEAD_DIM}

@@ -4,11 +4,21 @@ set -ex
 # Qwen3-0.6B ARMT training from scratch with GDN recurrent memory backend.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt_nmem64_w_norm_fix_init.sh
+# - playground/rmt/qwen3_0p6b_armt_0324_fs_wo_tbptt.sh
 #
 # Difference from the reference:
-# - Keep the fix-init GDN setup and default the read path to `normal`.
-# - Expose RECURRENT_GDN_READ_MODE to override the default if needed.
+# - Replace associative memory backend with GDN.
+# - Switch ARMT recurrent-memory writes from mem tokens to post-MLP context states.
+# - Disable memory-token concatenation by default (NUM_MEM_TOKENS=0).
+# - Expose independent launcher switches for:
+#   - RECURRENT_GDN_USE_FLA_KERNEL=0|1
+#   - RECURRENT_GDN_USE_CAUSAL_CONV1D=0|1
+#   - RECURRENT_GDN_READ_MODE=normal|buggy
+#   - RECURRENT_MEM_QK_NORM=0|1
+#   - RECURRENT_MEMORY_INPUT_PRE_NORM=0|1
+#   - ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=0|1
+#   - ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=0|1
+#   - TENSORBOARD_LOG_INTERVAL=<int>
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -143,9 +153,9 @@ ROTARY_PERCENT=1.0
 NORM_EPS=1e-6
 
 # ========== ARMT mechanism parameters ==========
-NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-64}
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-0}
+ARMT_MEMORY_WRITE_SOURCE=${ARMT_MEMORY_WRITE_SOURCE:-post_mlp_context}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
-ARMT_N_HEADS=${ARMT_N_HEADS:-16}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
 
@@ -234,7 +244,6 @@ ARMT_ARGS=(
   --use-recurrent-model-schedule
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
-  --armt-n-heads ${ARMT_N_HEADS}
   --recurrent-memory-backend gated_deltanet
   --recurrent-gdn-conv-kernel-size ${RECURRENT_GDN_CONV_KERNEL_SIZE}
   --recurrent-gdn-key-head-dim ${RECURRENT_GDN_KEY_HEAD_DIM}
@@ -242,6 +251,7 @@ ARMT_ARGS=(
   --recurrent-gdn-num-key-heads ${RECURRENT_GDN_NUM_KEY_HEADS}
   --recurrent-gdn-num-value-heads ${RECURRENT_GDN_NUM_VALUE_HEADS}
   --recurrent-gdn-read-mode ${RECURRENT_GDN_READ_MODE}
+  --armt-memory-write-source ${ARMT_MEMORY_WRITE_SOURCE}
 )
 if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
   ARMT_ARGS+=(--no-read-memory-from-first-chunk)
@@ -359,6 +369,7 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
+echo "ARMT_MEMORY_WRITE_SOURCE=${ARMT_MEMORY_WRITE_SOURCE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL}"

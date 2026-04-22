@@ -339,6 +339,22 @@ def test_gdn_requires_explicit_hyperparameters():
         validate_armt_constraints(args)
 
 
+def test_gdn_ignores_associative_head_constraints():
+    args = _make_args(
+        hidden_size=70,
+        armt_n_heads=4,
+        recurrent_memory_backend="gated_deltanet",
+        recurrent_gdn_key_head_dim=64,
+        recurrent_gdn_value_head_dim=64,
+        recurrent_gdn_num_key_heads=2,
+        recurrent_gdn_num_value_heads=2,
+        recurrent_gdn_use_fla_kernel=False,
+        recurrent_gdn_use_causal_conv1d=False,
+    )
+
+    validate_armt_constraints(args)
+
+
 def test_gdn_head_counts_must_match_tp_and_ratio():
     args = _make_args(
         recurrent_memory_backend="gated_deltanet",
@@ -478,6 +494,19 @@ def test_cross_attn_slots_requires_explicit_hyperparameters():
     )
     with pytest.raises(ValueError, match="explicit recurrent slot hyperparameters"):
         validate_armt_constraints(args)
+
+
+def test_cross_attn_slots_ignores_associative_head_constraints():
+    args = _make_args(
+        hidden_size=70,
+        armt_n_heads=4,
+        recurrent_memory_backend="cross_attn_slots",
+        recurrent_slot_num_slots=8,
+        recurrent_slot_num_heads=4,
+        recurrent_slot_head_dim=32,
+    )
+
+    validate_armt_constraints(args)
 
 
 def test_cross_attn_slots_rejects_non_positive_hyperparameters():
@@ -652,3 +681,14 @@ def test_associative_allows_explicit_head_dim_without_hidden_size_match():
     )
 
     validate_armt_constraints(args)
+
+
+def test_associative_still_requires_head_divisibility():
+    args = _make_args(
+        hidden_size=70,
+        armt_n_heads=4,
+        recurrent_memory_backend="associative",
+    )
+
+    with pytest.raises(ValueError, match="divisible by armt_n_heads"):
+        validate_armt_constraints(args)

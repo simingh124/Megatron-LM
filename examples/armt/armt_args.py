@@ -15,20 +15,20 @@ def add_armt_args(parser):
         dest="armt_d_mem",
         type=int,
         default=None,
-        help="Memory key dimension (defaults to hidden_size)",
+        help="Associative backend only: memory key dimension (defaults to hidden_size).",
     )
     group.add_argument(
         "--armt-n-heads",
         type=int,
         default=1,
-        help="Number of heads for memory operations",
+        help="Associative backend only: number of heads for memory operations.",
     )
     group.add_argument(
         "--armt-head-dim",
         type=int,
         default=None,
         help=(
-            "Optional per-head value/read dimension for associative memory. "
+            "Associative backend only: optional per-head value/read dimension. "
             "Defaults to hidden_size // armt_n_heads when omitted."
         ),
     )
@@ -36,13 +36,13 @@ def add_armt_args(parser):
         "--armt-nu",
         type=int,
         default=3,
-        help="DPFP expansion factor (output dim = 2 * nu * d_mem)",
+        help="Associative backend only: DPFP expansion factor (output dim = 2 * nu * d_mem).",
     )
     group.add_argument(
         "--armt-use-denom",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use denominator normalization in retrieval",
+        help="Associative backend only: use denominator normalization in retrieval.",
     )
     group.add_argument(
         "--armt-no-denom",
@@ -54,13 +54,13 @@ def add_armt_args(parser):
         "--armt-gating",
         action="store_true",
         default=False,
-        help="Use gated memory updates",
+        help="Associative backend only: use gated memory updates.",
     )
     group.add_argument(
         "--armt-correction",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Apply correction term in delta updates",
+        help="Associative backend only: apply correction term in delta updates.",
     )
     group.add_argument(
         "--armt-log-layer-metrics-to-tensorboard",
@@ -104,9 +104,7 @@ def add_armt_args(parser):
     return parser
 
 
-def validate_armt_constraints(args):
-    if not hasattr(args, "no_read_memory_from_first_chunk"):
-        args.no_read_memory_from_first_chunk = True
+def _validate_associative_args(args):
     armt_n_heads = getattr(args, "armt_n_heads", 1)
     if armt_n_heads <= 0:
         raise ValueError("armt_n_heads must be > 0")
@@ -123,6 +121,15 @@ def validate_armt_constraints(args):
 
     if armt_head_dim is None and hidden_size is not None and hidden_size % armt_n_heads != 0:
         raise ValueError("hidden_size must be divisible by armt_n_heads when armt_head_dim is omitted")
+
+
+def validate_armt_constraints(args):
+    if not hasattr(args, "no_read_memory_from_first_chunk"):
+        args.no_read_memory_from_first_chunk = True
+
+    recurrent_memory_backend = getattr(args, "recurrent_memory_backend", "associative")
+    if recurrent_memory_backend == "associative":
+        _validate_associative_args(args)
 
     if getattr(args, "armt_memory_write_source", "mem_tokens") != "mem_tokens":
         args.num_mem_tokens = 0
