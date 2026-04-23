@@ -27,6 +27,7 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
@@ -101,6 +102,13 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
+fi
+
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${DATASET_PATH:-}" ]]; then
@@ -344,6 +352,10 @@ echo "RECURRENT_MEM_QK_NORM=${RECURRENT_MEM_QK_NORM}"
 echo "RECURRENT_MEMORY_INPUT_PRE_NORM=${RECURRENT_MEMORY_INPUT_PRE_NORM}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+fi
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"

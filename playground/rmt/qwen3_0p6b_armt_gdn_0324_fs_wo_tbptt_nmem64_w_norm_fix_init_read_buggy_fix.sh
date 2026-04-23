@@ -19,6 +19,7 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 #   ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=0  fall back to aggregated-only ARMT TensorBoard metrics
 #   ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=1  emit armt/read/*/pos_XXXX metrics
 #   TENSORBOARD_LOG_INTERVAL=10 override TensorBoard logging cadence
@@ -29,6 +30,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
+ENABLE_RESUME=${ENABLE_RESUME:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
@@ -99,6 +101,13 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
+fi
+
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${DATASET_PATH:-}" ]]; then
@@ -317,6 +326,9 @@ CKPT_AND_LOG_ARGS=(
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")
+fi
 
 EXTRA_ARGS=()
 if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
@@ -372,6 +384,10 @@ echo "ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=${ARMT_LOG_READ_POSITION_MET
 echo "TENSORBOARD_LOG_INTERVAL=${TENSORBOARD_LOG_INTERVAL}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+fi
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"

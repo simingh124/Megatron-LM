@@ -18,12 +18,14 @@ set -ex
 #
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 
 # Environment variables for performance tuning
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+ENABLE_RESUME=${ENABLE_RESUME:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
@@ -96,7 +98,12 @@ if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
 fi
-if [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
+elif [[ ! -d "${LOAD_CHECKPOINT_PATH}" ]]; then
   echo "ERROR: ckpt root dir not found: ${LOAD_CHECKPOINT_PATH}" >&2
   exit 1
 fi
@@ -248,10 +255,7 @@ CKPT_AND_LOG_ARGS=(
   # Options: assume_ok_unexpected | log_unexpected | log_all | raise_unexpected | raise_all | return_unexpected | return_all | ignore_all
   # Recommendation: start with log_all, switch to raise_all when debugging.
   --dist-ckpt-strictness log_all
-  --load "${LOAD_CHECKPOINT_PATH}"
   --save "${CHECKPOINT_PATH}"
-  --no-load-optim
-  --no-load-rng
   # --no-save-optim
   # --no-save-rng
   --log-interval 1
@@ -261,6 +265,13 @@ CKPT_AND_LOG_ARGS=(
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")
+else
+  CKPT_AND_LOG_ARGS+=(--load "${LOAD_CHECKPOINT_PATH}")
+  CKPT_AND_LOG_ARGS+=(--no-load-optim)
+  CKPT_AND_LOG_ARGS+=(--no-load-rng)
+fi
 
 EXTRA_ARGS=()
 if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
@@ -290,7 +301,11 @@ fi
 echo "ROOT=${ROOT}"
 echo "MEGATRON_ROOT=${MEGATRON_ROOT}"
 echo "VENV_PYTHON=${VENV_PYTHON}"
-echo "LOAD_CHECKPOINT_PATH=${LOAD_CHECKPOINT_PATH}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+else
+  echo "LOAD_CHECKPOINT_PATH=${LOAD_CHECKPOINT_PATH}"
+fi
 echo "CHECKPOINT_PATH=${CHECKPOINT_PATH}"
 echo "TENSORBOARD_LOGS_PATH=${TENSORBOARD_LOGS_PATH}"
 echo "TOKENIZER_DIR=${TOKENIZER_DIR}"
@@ -300,6 +315,7 @@ echo "MASTER_PORT=${MASTER_PORT}"
 echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_ITERS=${TRAIN_ITERS} (TRAIN_TOKENS=${TRAIN_TOKENS})"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
 
 echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"

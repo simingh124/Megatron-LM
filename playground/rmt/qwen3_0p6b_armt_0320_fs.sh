@@ -18,11 +18,13 @@ set -ex
 #
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
+ENABLE_RESUME=${ENABLE_RESUME:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
@@ -85,6 +87,13 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
+fi
+
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${DATASET_PATH:-}" ]]; then
@@ -246,6 +255,9 @@ CKPT_AND_LOG_ARGS=(
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")
+fi
 
 EXTRA_ARGS=()
 if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
@@ -286,6 +298,10 @@ echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+fi
 
 echo "NUM_WORKERS=${NUM_WORKERS}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
