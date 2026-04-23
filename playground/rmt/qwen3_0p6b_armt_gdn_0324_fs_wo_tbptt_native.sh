@@ -20,11 +20,13 @@ set -ex
 #
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
+ENABLE_RESUME=${ENABLE_RESUME:-0}
 
 USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
 OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
@@ -90,6 +92,13 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
+fi
+
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${DATASET_PATH:-}" ]]; then
@@ -283,6 +292,9 @@ CKPT_AND_LOG_ARGS=(
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")
+fi
 
 EXTRA_ARGS=()
 if [[ "${USE_DISTRIBUTED_OPTIMIZER}" == "1" ]]; then
@@ -328,6 +340,10 @@ echo "RECURRENT_GDN_CONV_KERNEL_SIZE=${RECURRENT_GDN_CONV_KERNEL_SIZE}"
 echo "RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM} RECURRENT_GDN_NUM_KEY_HEADS=${RECURRENT_GDN_NUM_KEY_HEADS}"
 echo "RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM} RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+fi
 echo "NUM_WORKERS=${NUM_WORKERS} LOG_INTERVAL=${LOG_INTERVAL}"
 echo "USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER} OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE} OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER}"
 echo "USE_NCCL_UB=${USE_NCCL_UB} LOG_THROUGHPUT=${LOG_THROUGHPUT}"

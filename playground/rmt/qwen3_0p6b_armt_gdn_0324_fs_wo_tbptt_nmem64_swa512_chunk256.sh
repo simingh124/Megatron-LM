@@ -26,6 +26,7 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
+#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
 #   TRAIN_ITERS / LR_DECAY_ITERS / LR_WARMUP_ITERS override token-derived schedule values
 #   ENABLE_PYTORCH_PROFILER=1  enable PyTorch profiler; default exports a Perfetto trace under TENSORBOARD_LOGS_PATH
 #   PYTORCH_PROFILER_TRACE_FORMAT=perfetto  write a direct Perfetto/Chrome trace instead of TensorBoard-style naming
@@ -42,6 +43,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 # ========== Communication / runtime control ==========
 ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-1}
 ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
+ENABLE_RESUME=${ENABLE_RESUME:-0}
 ENABLE_PYTORCH_PROFILER=${ENABLE_PYTORCH_PROFILER:-1}
 PYTORCH_PROFILER_TRACE_FORMAT=${PYTORCH_PROFILER_TRACE_FORMAT:-perfetto}
 PYTORCH_PROFILER_RECORD_SHAPES=${PYTORCH_PROFILER_RECORD_SHAPES:-0}
@@ -121,6 +123,13 @@ fi
 if [[ ! -d "${TOKENIZER_DIR}" ]]; then
   echo "ERROR: tokenizer dir not found: ${TOKENIZER_DIR}" >&2
   exit 1
+fi
+
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
+    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
+    exit 1
+  fi
 fi
 
 if [[ -z "${DATASET_PATH:-}" ]]; then
@@ -336,6 +345,9 @@ CKPT_AND_LOG_ARGS=(
   --tensorboard-dir "${TENSORBOARD_LOGS_PATH}"
   --distributed-timeout-minutes 60
 )
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")
+fi
 
 EXTRA_ARGS=()
 PROFILE_RANKS_ARGS=()
@@ -409,6 +421,10 @@ echo "RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM} RECURRENT_GDN_NUM
 echo "RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM} RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
+echo "ENABLE_RESUME=${ENABLE_RESUME}"
+if [[ "${ENABLE_RESUME}" == "1" ]]; then
+  echo "LOAD_CHECKPOINT_PATH=${CHECKPOINT_PATH}"
+fi
 echo "ENABLE_PYTORCH_PROFILER=${ENABLE_PYTORCH_PROFILER}"
 echo "PYTORCH_PROFILER_TRACE_FORMAT=${PYTORCH_PROFILER_TRACE_FORMAT}"
 echo "PYTORCH_PROFILER_RECORD_SHAPES=${PYTORCH_PROFILER_RECORD_SHAPES} PYTORCH_PROFILER_WITH_STACK=${PYTORCH_PROFILER_WITH_STACK} PYTORCH_PROFILER_GZIP_TRACES=${PYTORCH_PROFILER_GZIP_TRACES}"

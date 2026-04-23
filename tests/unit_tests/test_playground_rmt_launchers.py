@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 
@@ -34,3 +35,22 @@ def test_cross_attn_w_norm_launcher_has_norm_defaults_and_resume_switch():
     assert "--recurrent-memory-input-pre-norm" in script
     assert 'if [[ "${ENABLE_RESUME}" == "1" ]]; then' in script
     assert 'CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")' in script
+
+
+def test_all_playground_launchers_expose_resume_switch():
+    launcher_paths = sorted((REPO_ROOT / "playground").rglob("*.sh"))
+
+    assert launcher_paths
+
+    for path in launcher_paths:
+        script = path.read_text()
+
+        assert "ENABLE_RESUME=${ENABLE_RESUME:-0}" in script, path
+        assert "latest_checkpointed_iteration.txt" in script, path
+        assert 'CKPT_AND_LOG_ARGS+=(--load "${CHECKPOINT_PATH}")' in script, path
+        assert 'elif [[ "${ENABLE_RESUME}" == "1" ]]; then' not in script, path
+
+        if re.search(r"^\\s*LOAD_CHECKPOINT_PATH=", script, re.M):
+            assert 'CKPT_AND_LOG_ARGS+=(--load "${LOAD_CHECKPOINT_PATH}")' in script, path
+            assert "CKPT_AND_LOG_ARGS+=(--no-load-optim)" in script, path
+            assert "CKPT_AND_LOG_ARGS+=(--no-load-rng)" in script, path

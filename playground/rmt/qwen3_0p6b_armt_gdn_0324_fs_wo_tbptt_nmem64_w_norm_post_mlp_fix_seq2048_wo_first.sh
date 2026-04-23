@@ -1,22 +1,25 @@
 #!/bin/bash
 set -ex
 
-# Qwen3-0.6B ARMT training from scratch with cross-attention slot recurrent memory backend.
+# Qwen3-0.6B ARMT training from scratch with GDN recurrent memory backend, without first-chunk LM loss.
 #
 # Reference launcher:
-# - playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt.sh
+# - playground/rmt/qwen3_0p6b_armt_gdn_0324_fs_wo_tbptt_nmem64_w_norm_post_mlp_fix.sh
 #
 # Difference from the reference:
-# - Replace the GDN recurrent memory backend with cross-attention slots.
-# - This launcher is scoped to the cross-attention memory backend only and does
-#   not expose associative-memory-only ARMT hyperparameters.
-# - Expose launcher switches for:
-#   - RECURRENT_SLOT_NUM_SLOTS
-#   - RECURRENT_SLOT_NUM_HEADS
-#   - RECURRENT_SLOT_HEAD_DIM
-#   - RECURRENT_SLOT_READ_ATTN_BACKEND
-#   - RECURRENT_MEM_QK_NORM
-#   - RECURRENT_MEMORY_INPUT_PRE_NORM
+# - Exclude first-chunk LM loss from gradient updates by default.
+# - Keep the rest of the training logic and defaults aligned with the reference launcher.
+# - Expose independent launcher switches for:
+#   - RECURRENT_GDN_USE_FLA_KERNEL=0|1
+#   - RECURRENT_GDN_USE_CAUSAL_CONV1D=0|1
+#   - RECURRENT_GDN_READ_MODE=normal|buggy
+#   - RECURRENT_MEM_QK_NORM=0|1
+#   - RECURRENT_MEMORY_INPUT_PRE_NORM=0|1
+#   - ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=0|1
+#   - ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=0|1
+#   - ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD=0|1
+#   - NO_LOSS_FROM_FIRST_CHUNK=0|1
+#   - TENSORBOARD_LOG_INTERVAL=<int>
 #
 # Distributed settings are configurable via env vars:
 #   GPUS_PER_NODE, NUM_NODES, NODE_RANK, MASTER_ADDR, MASTER_PORT
@@ -28,6 +31,11 @@ set -ex
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
 #   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
+#   ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=0  fall back to aggregated-only ARMT TensorBoard metrics
+#   ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=1  emit armt/read/*/pos_XXXX metrics
+#   TENSORBOARD_LOG_INTERVAL=10 override TensorBoard logging cadence
+#   RECURRENT_GDN_READ_MODE=normal|buggy override the GDN read path
+#   NO_LOSS_FROM_FIRST_CHUNK=1  keep the first chunk forward-only (no LM loss / no gradient update)
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
@@ -36,12 +44,16 @@ ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN:-0}
 ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY:-0}
 ENABLE_RESUME=${ENABLE_RESUME:-0}
 
-USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}
-OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}
-OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}
-USE_NCCL_UB=${USE_NCCL_UB:-0}
+USE_DISTRIBUTED_OPTIMIZER=${USE_DISTRIBUTED_OPTIMIZER:-1}  # shard optimizer state across DP ranks
+OVERLAP_GRAD_REDUCE=${OVERLAP_GRAD_REDUCE:-1}  # overlap gradient reduction with backward
+OVERLAP_PARAM_GATHER=${OVERLAP_PARAM_GATHER:-1}  # overlap parameter gather with forward
+USE_NCCL_UB=${USE_NCCL_UB:-0}  # enable NCCL user buffers for comm
 
-LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}
+LOG_THROUGHPUT=${LOG_THROUGHPUT:-1}  # print throughput metrics in logs
+ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=${ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD:-1}
+ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=${ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD:-1}
+ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD=${ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD:-1}
+TENSORBOARD_LOG_INTERVAL=${TENSORBOARD_LOG_INTERVAL:-20}
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-${PROC_PER_NODE:-8}}
 NUM_NODES=${NODE_COUNT:-1}
@@ -141,7 +153,7 @@ NUM_ATTN_HEADS=16
 NUM_QUERY_GROUPS=8
 KV_CHANNELS=128
 
-SEQ_LENGTH=1024
+SEQ_LENGTH=2048
 MAX_POSITION_EMBEDDINGS=32768
 
 VOCAB_SIZE=151936
@@ -153,21 +165,28 @@ ROTARY_PERCENT=1.0
 NORM_EPS=1e-6
 
 # ========== ARMT mechanism parameters ==========
-NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-64}
+NUM_MEM_TOKENS=${NUM_MEM_TOKENS:-0}
+ARMT_MEMORY_WRITE_SOURCE=${ARMT_MEMORY_WRITE_SOURCE:-post_mlp_context}
 ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE:-512}
 ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE:-1}
 NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK:-1}
+NO_LOSS_FROM_FIRST_CHUNK=${NO_LOSS_FROM_FIRST_CHUNK:-1}
 
-RECURRENT_SLOT_NUM_SLOTS=${RECURRENT_SLOT_NUM_SLOTS:-64}
-RECURRENT_SLOT_NUM_HEADS=${RECURRENT_SLOT_NUM_HEADS:-8}
-RECURRENT_SLOT_HEAD_DIM=${RECURRENT_SLOT_HEAD_DIM:-64}
-RECURRENT_SLOT_READ_ATTN_BACKEND=${RECURRENT_SLOT_READ_ATTN_BACKEND:-flash}
+RECURRENT_GDN_CONV_KERNEL_SIZE=${RECURRENT_GDN_CONV_KERNEL_SIZE:-4}
+RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM:-64}
+RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM:-64}
+RECURRENT_GDN_NUM_KEY_HEADS=${RECURRENT_GDN_NUM_KEY_HEADS:-16}
+RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS:-16}
+RECURRENT_GDN_READ_MODE=${RECURRENT_GDN_READ_MODE:-normal}
+
+RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL:-1}
+RECURRENT_GDN_USE_CAUSAL_CONV1D=${RECURRENT_GDN_USE_CAUSAL_CONV1D:-1}
 RECURRENT_MEM_QK_NORM=${RECURRENT_MEM_QK_NORM:-1}
 RECURRENT_MEMORY_INPUT_PRE_NORM=${RECURRENT_MEMORY_INPUT_PRE_NORM:-1}
 
 # ========== Training parameters ==========
-MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-20}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-480}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-5}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-240}
 NUM_WORKERS=${NUM_WORKERS:-32}
 
 TRAIN_TOKENS=${TRAIN_TOKENS:-100000000000}
@@ -238,12 +257,36 @@ ARMT_ARGS=(
   --use-recurrent-model-schedule
   --num-mem-tokens ${NUM_MEM_TOKENS}
   --armt-chunk-size ${ARMT_CHUNK_SIZE}
-  --recurrent-memory-backend cross_attn_slots
-  --recurrent-slot-num-slots ${RECURRENT_SLOT_NUM_SLOTS}
-  --recurrent-slot-num-heads ${RECURRENT_SLOT_NUM_HEADS}
-  --recurrent-slot-head-dim ${RECURRENT_SLOT_HEAD_DIM}
-  --recurrent-slot-read-attn-backend ${RECURRENT_SLOT_READ_ATTN_BACKEND}
+  --recurrent-memory-backend gated_deltanet
+  --recurrent-gdn-conv-kernel-size ${RECURRENT_GDN_CONV_KERNEL_SIZE}
+  --recurrent-gdn-key-head-dim ${RECURRENT_GDN_KEY_HEAD_DIM}
+  --recurrent-gdn-value-head-dim ${RECURRENT_GDN_VALUE_HEAD_DIM}
+  --recurrent-gdn-num-key-heads ${RECURRENT_GDN_NUM_KEY_HEADS}
+  --recurrent-gdn-num-value-heads ${RECURRENT_GDN_NUM_VALUE_HEADS}
+  --recurrent-gdn-read-mode ${RECURRENT_GDN_READ_MODE}
+  --armt-memory-write-source ${ARMT_MEMORY_WRITE_SOURCE}
 )
+if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
+  ARMT_ARGS+=(--no-read-memory-from-first-chunk)
+else
+  ARMT_ARGS+=(--read-memory-from-first-chunk)
+fi
+if [[ "${NO_LOSS_FROM_FIRST_CHUNK}" == "1" ]]; then
+  ARMT_ARGS+=(--no-loss-from-first-chunk)
+fi
+if [[ "${ADD_NO_RECURRENT_TBPTT_MODE}" == "1" ]]; then
+  ARMT_ARGS+=(--no-recurrent-tbptt-mode)
+fi
+if [[ "${RECURRENT_GDN_USE_FLA_KERNEL}" == "1" ]]; then
+  ARMT_ARGS+=(--recurrent-gdn-use-fla-kernel)
+else
+  ARMT_ARGS+=(--no-recurrent-gdn-use-fla-kernel)
+fi
+if [[ "${RECURRENT_GDN_USE_CAUSAL_CONV1D}" == "1" ]]; then
+  ARMT_ARGS+=(--recurrent-gdn-use-causal-conv1d)
+else
+  ARMT_ARGS+=(--no-recurrent-gdn-use-causal-conv1d)
+fi
 if [[ "${RECURRENT_MEM_QK_NORM}" == "1" ]]; then
   ARMT_ARGS+=(--recurrent-mem-qk-norm)
 else
@@ -254,13 +297,20 @@ if [[ "${RECURRENT_MEMORY_INPUT_PRE_NORM}" == "1" ]]; then
 else
   ARMT_ARGS+=(--no-recurrent-memory-input-pre-norm)
 fi
-if [[ "${NO_READ_MEMORY_FROM_FIRST_CHUNK}" == "1" ]]; then
-  ARMT_ARGS+=(--no-read-memory-from-first-chunk)
+if [[ "${ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD}" == "1" ]]; then
+  ARMT_ARGS+=(--armt-log-layer-metrics-to-tensorboard)
 else
-  ARMT_ARGS+=(--read-memory-from-first-chunk)
+  ARMT_ARGS+=(--no-armt-log-layer-metrics-to-tensorboard)
 fi
-if [[ "${ADD_NO_RECURRENT_TBPTT_MODE}" == "1" ]]; then
-  ARMT_ARGS+=(--no-recurrent-tbptt-mode)
+if [[ "${ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD}" == "1" ]]; then
+  ARMT_ARGS+=(--armt-log-read-position-metrics-to-tensorboard)
+else
+  ARMT_ARGS+=(--no-armt-log-read-position-metrics-to-tensorboard)
+fi
+if [[ "${ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD}" == "1" ]]; then
+  ARMT_ARGS+=(--armt-log-read-chunk-metrics-to-tensorboard)
+else
+  ARMT_ARGS+=(--no-armt-log-read-chunk-metrics-to-tensorboard)
 fi
 
 TRAINING_ARGS=(
@@ -293,6 +343,7 @@ CKPT_AND_LOG_ARGS=(
   --ckpt-format torch_dist
   --save "${CHECKPOINT_PATH}"
   --log-interval ${LOG_INTERVAL}
+  --tensorboard-log-interval ${TENSORBOARD_LOG_INTERVAL}
   --eval-interval 1000000000
   --eval-iters 0
   --save-interval 2000
@@ -342,14 +393,22 @@ echo "NODE_RANK=${NODE_RANK}"
 echo "TRAIN_TOKENS=${TRAIN_TOKENS} TRAIN_ITERS=${TRAIN_ITERS}"
 echo "MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE} GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE}"
 echo "NUM_MEM_TOKENS=${NUM_MEM_TOKENS} ARMT_CHUNK_SIZE=${ARMT_CHUNK_SIZE}"
+echo "ARMT_MEMORY_WRITE_SOURCE=${ARMT_MEMORY_WRITE_SOURCE}"
 echo "ADD_NO_RECURRENT_TBPTT_MODE=${ADD_NO_RECURRENT_TBPTT_MODE}"
 echo "NO_READ_MEMORY_FROM_FIRST_CHUNK=${NO_READ_MEMORY_FROM_FIRST_CHUNK}"
-echo "RECURRENT_SLOT_NUM_SLOTS=${RECURRENT_SLOT_NUM_SLOTS}"
-echo "RECURRENT_SLOT_NUM_HEADS=${RECURRENT_SLOT_NUM_HEADS}"
-echo "RECURRENT_SLOT_HEAD_DIM=${RECURRENT_SLOT_HEAD_DIM}"
-echo "RECURRENT_SLOT_READ_ATTN_BACKEND=${RECURRENT_SLOT_READ_ATTN_BACKEND}"
+echo "NO_LOSS_FROM_FIRST_CHUNK=${NO_LOSS_FROM_FIRST_CHUNK}"
+echo "RECURRENT_GDN_USE_FLA_KERNEL=${RECURRENT_GDN_USE_FLA_KERNEL}"
+echo "RECURRENT_GDN_USE_CAUSAL_CONV1D=${RECURRENT_GDN_USE_CAUSAL_CONV1D}"
+echo "RECURRENT_GDN_CONV_KERNEL_SIZE=${RECURRENT_GDN_CONV_KERNEL_SIZE}"
+echo "RECURRENT_GDN_KEY_HEAD_DIM=${RECURRENT_GDN_KEY_HEAD_DIM} RECURRENT_GDN_NUM_KEY_HEADS=${RECURRENT_GDN_NUM_KEY_HEADS}"
+echo "RECURRENT_GDN_VALUE_HEAD_DIM=${RECURRENT_GDN_VALUE_HEAD_DIM} RECURRENT_GDN_NUM_VALUE_HEADS=${RECURRENT_GDN_NUM_VALUE_HEADS}"
+echo "RECURRENT_GDN_READ_MODE=${RECURRENT_GDN_READ_MODE}"
 echo "RECURRENT_MEM_QK_NORM=${RECURRENT_MEM_QK_NORM}"
 echo "RECURRENT_MEMORY_INPUT_PRE_NORM=${RECURRENT_MEMORY_INPUT_PRE_NORM}"
+echo "ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD=${ARMT_LOG_LAYER_METRICS_TO_TENSORBOARD}"
+echo "ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD=${ARMT_LOG_READ_POSITION_METRICS_TO_TENSORBOARD}"
+echo "ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD=${ARMT_LOG_READ_CHUNK_METRICS_TO_TENSORBOARD}"
+echo "TENSORBOARD_LOG_INTERVAL=${TENSORBOARD_LOG_INTERVAL}"
 echo "ENABLE_TEST_TRAIN_RUN=${ENABLE_TEST_TRAIN_RUN}"
 echo "ENABLE_PARAM_STATS_ONLY=${ENABLE_PARAM_STATS_ONLY}"
 echo "ENABLE_RESUME=${ENABLE_RESUME}"

@@ -135,8 +135,8 @@ def add_recurrent_args(parser):
         action="store_true",
         default=RECURRENT_DEFAULTS["no_loss_from_first_chunk"],
         help=(
-            "Do not compute LM loss (loss_mask=0) on the first TBPTT chunk. "
-            "Forward still runs so memory can be written."
+            "Do not compute LM loss (loss_mask=0) on the first TBPTT chunk, so it does not "
+            "participate in gradient updates. Forward still runs so memory can be written."
         ),
     )
     group.add_argument(
