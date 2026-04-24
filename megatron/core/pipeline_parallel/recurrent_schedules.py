@@ -19,6 +19,7 @@ from megatron.core.utils import get_model_config, get_model_type, unwrap_model
 from .schedules import backward_step
 
 _PRIMARY_LOSS_KEY = "lm loss"
+_FULL_SEQ_LOSS_KEY = "train/avg_loss"
 _CHUNK_SCOPED_ARMT_READ_METRIC_NAMES = (
     "armt/read/retrieved_norm_mean",
     "armt/read/retrieved_to_hidden_ratio",
@@ -186,8 +187,10 @@ def _accumulate_chunk_loss_metrics(
     *,
     chunk_idx: int,
     chunk_report: Dict[str, torch.Tensor],
+    loss_report: Optional[torch.Tensor] = None,
 ) -> None:
-    loss_report = chunk_report.get(_PRIMARY_LOSS_KEY)
+    if loss_report is None:
+        loss_report = chunk_report.get(_PRIMARY_LOSS_KEY)
     if not isinstance(loss_report, torch.Tensor) or loss_report.numel() != 2:
         return
 
@@ -201,6 +204,15 @@ def _accumulate_chunk_loss_metrics(
 
     per_chunk_loss_sums[chunk_idx] = current_loss_sum + loss_report[0]
     per_chunk_token_sums[chunk_idx] = current_token_sum + loss_report[1]
+
+
+def _extract_primary_loss_report(loss_reduced: object) -> Optional[torch.Tensor]:
+    if not isinstance(loss_reduced, dict):
+        return None
+    loss_report = loss_reduced.get(_PRIMARY_LOSS_KEY)
+    if not isinstance(loss_report, torch.Tensor) or loss_report.numel() != 2:
+        return None
+    return loss_report.clone()
 
 
 def _set_recurrent_chunk_model_state(
@@ -330,6 +342,7 @@ def recurrent_forward_backward_no_pipelining(
 
         args = training_global_vars.get_args() if training_global_vars._GLOBAL_ARGS is not None else None
         recurrent_tbptt_mode = True
+        first_chunk_full_seq_loss_mask: Optional[torch.Tensor] = None
         if args is not None:
             recurrent_tbptt_mode = getattr(
                 args,
@@ -344,7 +357,9 @@ def recurrent_forward_backward_no_pipelining(
                 raise ValueError(
                     "--no-loss-from-first-chunk requires batch['loss_mask'] to exist and be a tensor."
                 )
-            chunks[0]["loss_mask"] = torch.zeros_like(chunks[0]["loss_mask"])
+            first_chunk_full_seq_loss_mask = chunks[0]["loss_mask"].clone()
+            chunks[0]["loss_mask"] = first_chunk_full_seq_loss_mask.clone()
+            chunks[0]["loss_mask"].zero_()
 
         if hasattr(unwrapped_model, "reset_all_memory"):
             unwrapped_model.reset_all_memory()
@@ -385,6 +400,30 @@ def recurrent_forward_backward_no_pipelining(
                 loss, loss_reduced = outputs
                 loss *= pg_collection.cp.size()
 
+            full_seq_primary_loss = _extract_primary_loss_report(loss_reduced)
+            if chunk_idx == 0 and first_chunk_full_seq_loss_mask is not None:
+                chunk_loss_mask = chunk.get("loss_mask")
+                if not isinstance(chunk_loss_mask, torch.Tensor):
+                    raise ValueError(
+                        "--no-loss-from-first-chunk requires batch['loss_mask'] to exist and be a tensor."
+                    )
+                chunk_loss_mask.copy_(first_chunk_full_seq_loss_mask)
+                try:
+                    with torch.no_grad():
+                        full_seq_outputs = loss_func(output_tensor)
+                finally:
+                    chunk_loss_mask.zero_()
+
+                full_seq_loss_reduced = (
+                    full_seq_outputs[2] if len(full_seq_outputs) == 3 else full_seq_outputs[1]
+                )
+                if not isinstance(full_seq_loss_reduced, dict):
+                    raise ValueError(
+                        "Recurrent TBPTT schedule expects loss_func to return a dict as "
+                        f"loss_reduced (got {type(full_seq_loss_reduced)})."
+                    )
+                full_seq_primary_loss = _extract_primary_loss_report(full_seq_loss_reduced)
+
             scaled_loss = loss * loss_weight
 
             if not forward_only and chunk_tokens > 0.0:
@@ -400,11 +439,14 @@ def recurrent_forward_backward_no_pipelining(
                     "Recurrent TBPTT schedule expects loss_func to return a dict as "
                     f"loss_reduced (got {type(loss_reduced)})."
                 )
+            if full_seq_primary_loss is not None:
+                loss_reduced[_FULL_SEQ_LOSS_KEY] = full_seq_primary_loss
             _accumulate_chunk_loss_metrics(
                 per_chunk_loss_sums,
                 per_chunk_token_sums,
                 chunk_idx=chunk_idx,
                 chunk_report=loss_reduced,
+                loss_report=full_seq_primary_loss,
             )
             microbatch_loss_reduced = _accumulate_chunk_reports(
                 microbatch_loss_reduced,

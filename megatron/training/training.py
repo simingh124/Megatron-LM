@@ -205,6 +205,8 @@ from . import ft_integration
 
 stimer = StragglerDetector()
 
+_LOSS_KEYS_WITHOUT_SAMPLE_AXIS = frozenset(("train/avg_loss",))
+
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 
@@ -2214,7 +2216,8 @@ def training_log(
                 wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
-            writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+            if key not in _LOSS_KEYS_WITHOUT_SAMPLE_AXIS:
+                writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
