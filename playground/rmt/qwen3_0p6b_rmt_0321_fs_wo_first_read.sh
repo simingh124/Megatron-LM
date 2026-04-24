@@ -17,7 +17,7 @@ set -ex
 #   Set EXIT_INTERVAL=1 to stop after 1 iter.
 
 # Optional:
-#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
+#   ENABLE_RESUME=1            load the latest checkpoint if present; otherwise train from scratch
 
 export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
@@ -90,8 +90,8 @@ fi
 
 if [[ "${ENABLE_RESUME}" == "1" ]]; then
   if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
-    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
-    exit 1
+    echo "WARNING: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt; training from scratch." >&2
+    ENABLE_RESUME=0
   fi
 fi
 
