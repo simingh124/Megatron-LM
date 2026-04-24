@@ -20,7 +20,7 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
-#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
+#   ENABLE_RESUME=1            load the latest checkpoint if present; otherwise train from scratch
 #   ENABLE_PYTORCH_PROFILER=1  enable PyTorch profiler; default exports a Perfetto trace under TENSORBOARD_LOGS_PATH
 #   PYTORCH_PROFILER_TRACE_FORMAT=perfetto  write a direct Perfetto/Chrome trace instead of TensorBoard-style naming
 #   PYTORCH_PROFILER_RECORD_SHAPES=0  keep tensor-shape metadata out of traces
@@ -120,8 +120,8 @@ fi
 
 if [[ "${ENABLE_RESUME}" == "1" ]]; then
   if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
-    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
-    exit 1
+    echo "WARNING: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt; training from scratch." >&2
+    ENABLE_RESUME=0
   fi
 fi
 

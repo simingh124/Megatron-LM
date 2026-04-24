@@ -19,7 +19,7 @@ set -ex
 # Optional:
 #   ENABLE_TEST_TRAIN_RUN=1    add --test-train-run and disable output_logs tee by default
 #   ENABLE_PARAM_STATS_ONLY=1  build model, print parameter stats, and exit before training
-#   ENABLE_RESUME=1            load the latest checkpoint from CHECKPOINT_PATH and continue training
+#   ENABLE_RESUME=1            load the latest checkpoint if present; otherwise train from scratch
 #   LOG_INTERVAL=10            override stdout logging cadence
 #   TENSORBOARD_LOG_INTERVAL=10 override TensorBoard logging cadence
 
@@ -105,8 +105,8 @@ fi
 
 if [[ "${ENABLE_RESUME}" == "1" ]]; then
   if [[ ! -f "${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" ]]; then
-    echo "ERROR: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt" >&2
-    exit 1
+    echo "WARNING: resume requested but checkpoint tracker not found: ${CHECKPOINT_PATH}/latest_checkpointed_iteration.txt; training from scratch." >&2
+    ENABLE_RESUME=0
   fi
 fi
 

@@ -58,6 +58,7 @@
 - Prefer `--use-recurrent-model-schedule`, `--recurrent-chunk-size`, and `--recurrent-tbptt-mode` in new docs and launchers.
 - `--use-armt-tbptt` and `--use-recurrent-tbptt` are intentionally rejected by `tests/unit_tests/models/armt/test_armt_constraints.py`; `--armt-chunk-size` survives only as a compatibility alias, not as the preferred spelling for new material.
 - `--recurrent-mem-qk-norm` is the single ARMT memory qk-norm switch. It must drive `gated_deltanet`, `associative`, and `cross_attn_slots`; avoid reintroducing older backend-specific names such as `recurrent_slot_qk_norm`.
+- `playground/rmt` launchers treat `ENABLE_RESUME=1` as best-effort: if `CHECKPOINT_PATH/latest_checkpointed_iteration.txt` is missing, they warn, set `ENABLE_RESUME=0`, and continue from scratch instead of failing before launch.
 - Launcher env wiring mirrors the CLI name as `RECURRENT_MEM_QK_NORM`. Keep base launchers aligned with the code default (`false`), and put opt-in norm defaults only in explicit `*_w_norm.sh` variants together with `RECURRENT_MEMORY_INPUT_PRE_NORM=1`.
 - The `--armt-d-mem`, `--armt-n-heads`, `--armt-head-dim`, `--armt-nu`, `--armt-use-denom`, `--armt-gating`, and `--armt-correction` knobs are associative-only. GDN and cross-attention-slot launchers should not wire them, and validation should not reject those backends because of associative divisibility rules.
 
