@@ -6,6 +6,7 @@
 
 ## Branch and Worktree Topology
 - `armt` is the integration branch in the root worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM`.
+- `concat` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-concat` and currently starts from `armt` commit `e1306a42f`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 - `lr` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-lr` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 - `metric` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-metric` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 - `omit` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-omit` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
