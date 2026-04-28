@@ -253,21 +253,15 @@ flowchart TD
 - `examples/armt/train.py:66`
 - `examples/armt/train.py:110`
 
-### 5.3 `get_armt_layer_spec()` 做了两件“换心脏”的事
+### 5.3 `get_armt_layer_spec()` 做了“换心脏”的事
 
-`get_armt_layer_spec()` 会基于 GPT layer spec 做两层替换：
+`get_armt_layer_spec()` 会基于 GPT layer spec 替换 transformer layer：
 
-#### 替换 1：SelfAttention -> ARMTSelfAttention
+#### 替换：TransformerLayer -> ARMTLayer
 
-- `megatron/core/models/armt/armt_layer_specs.py:95`
+- `megatron/core/models/armt/armt_layer_specs.py:87`
 
-这意味着 ARMT 可以在 full attention 路径里插入自己那套 windowed / legacy attention 逻辑。
-
-#### 替换 2：TransformerLayer -> ARMTLayer
-
-- `megatron/core/models/armt/armt_layer_specs.py:112`
-
-这意味着每层都会变成“标准 transformer layer + recurrent memory read/write”的增强版本。
+这意味着每层都会变成“标准 self-attention/MLP + recurrent memory read/write”的增强版本。
 
 ### 5.4 `ARMTModel` 仍然套在 GPTModel 外壳上
 
@@ -421,12 +415,10 @@ schedule 调用：
 
 - `ARMTModel.set_current_chunk_is_first()`
 - `ARMTModel.set_skip_read_memory_for_current_chunk()`
-- `ARMTModel.set_current_chunk_start_position()`
-- `megatron/core/models/armt/armt_model.py:129`
-- `megatron/core/models/armt/armt_model.py:134`
-- `megatron/core/models/armt/armt_model.py:139`
+- `megatron/core/models/armt/armt_model.py:157`
+- `megatron/core/models/armt/armt_model.py:162`
 
-再进一步传到每个 `ARMTLayer`，以及需要的话传给 `ARMTSelfAttention`。
+再进一步传到每个 `ARMTLayer`。
 
 ### 7.4 no-TBPTT 和 TBPTT 在 schedule 里的差别
 
@@ -814,26 +806,16 @@ GDN backend 最终会调用 `_run_gated_delta_rule()`：
 
 ## 15. Full attention 这条脚本实际上走的是哪条路径
 
-虽然 `ARMTSelfAttention` 已经接进去了，但对这份 launcher 来说：
-
-- `full_attn_window_size` 没有显式设置
-- 校验时会默认补成 `recurrent_chunk_size`
-- `armt_equal_window_full_attn_path` 默认是 `legacy`
+当前 ARMT 不再替换 self-attention；这份 launcher 的 full attention 直接走 GPT layer spec 里的标准 self-attention。
 
 代码：
 
-- `examples/recurrent/recurrent_args.py:284`
-- `examples/recurrent/recurrent_args.py:295`
-- `examples/recurrent/recurrent_args.py:303`
-
-所以 `ARMTSelfAttention.forward()` 会在这里直接退回父类：
-
-- `if not self._use_windowed_full_attention: return super().forward(...)`
-- `megatron/core/models/armt/armt_self_attention.py:343`
+- `examples/recurrent/recurrent_args.py:275`
+- `megatron/core/models/armt/armt_layer_specs.py:87`
 
 这意味着：
 
-> 当前 launcher 的关键变化点是 memory backend 变成 GDN；full attention 仍然是 legacy/equal-window 路径，不是 decoupled windowed full attention 热路径。
+> 当前 launcher 的关键变化点是 memory backend 变成 GDN；full attention 不再有 ARMT 专属跨 chunk 覆盖逻辑。
 
 ---
 
@@ -1013,7 +995,7 @@ GDN backend 的跨 chunk 状态保存在：
 
 1. launcher 把模型配置、ARMT 配置、GDN backend 配置和 recurrent schedule 配置全部拼成 CLI 参数
 2. `examples/armt/train.py` 通过 `pretrain(..., extra_args_provider=add_armt_args)` 接入 Megatron
-3. `model_provider()` 将 GPT layer spec 替换成 `ARMTLayer + ARMTSelfAttention`
+3. `model_provider()` 将 GPT layer spec 的 transformer layer 替换成 `ARMTLayer`
 4. 每个 `ARMTLayer` 都根据 `--recurrent-memory-backend gated_deltanet` 构建一个 `GatedDeltaNetMemory`
 5. 训练时 `get_forward_backward_func()` 由于 `--use-recurrent-model-schedule` 切到 `recurrent_forward_backward_no_pipelining`
 6. 该 schedule 将一个 microbatch 的序列切成多个 chunk

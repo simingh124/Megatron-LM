@@ -85,10 +85,6 @@ def model_provider(
         gating=args.armt_gating,
         correction=args.armt_correction,
         tbptt_mode=args.recurrent_tbptt_mode,
-        recurrent_chunk_size=args.recurrent_chunk_size,
-        full_attn_window_size=args.full_attn_window_size,
-        armt_windowed_full_attn_backend=args.armt_windowed_full_attn_backend,
-        armt_equal_window_full_attn_path=args.armt_equal_window_full_attn_path,
         recurrent_memory_backend=args.recurrent_memory_backend,
         recurrent_gdn_use_fla_kernel=args.recurrent_gdn_use_fla_kernel,
         recurrent_gdn_use_causal_conv1d=args.recurrent_gdn_use_causal_conv1d,
@@ -118,9 +114,6 @@ def model_provider(
         vocab_size=args.padded_vocab_size,
         max_sequence_length=max_seq_length,
         num_mem_tokens=args.num_mem_tokens,
-        recurrent_chunk_size=args.recurrent_chunk_size,
-        full_attn_window_size=args.full_attn_window_size,
-        armt_equal_window_full_attn_path=args.armt_equal_window_full_attn_path,
         log_layer_metrics_to_tensorboard=getattr(
             args, "armt_log_layer_metrics_to_tensorboard", False
         ),
