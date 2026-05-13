@@ -12,6 +12,7 @@ from megatron.core.models.armt.monitoring import (
     build_mean_metric,
     build_ratio_metric,
     build_ratio_of_means_metric,
+    build_std_metric,
 )
 
 
@@ -651,6 +652,132 @@ class TestARMTModel:
         assert "armt/read/retrieved_norm_mean/pos_0000/layer_02" not in metrics
         assert "armt/read/retrieved_to_hidden_ratio/pos_0000/layer_01" not in metrics
         assert "armt/read/retrieved_to_hidden_ratio/pos_0000/layer_02" not in metrics
+
+    def test_armt_model_injection_metrics_follow_layer_metric_switch(self):
+        config = _build_config(hidden_size=256)
+
+        def _build_model(*, log_layer_metrics_to_tensorboard: bool):
+            with patch(
+                "megatron.core.models.armt.armt_model.GPTModel.__init__",
+                new=_minimal_gpt_init,
+            ):
+                model = ARMTModel(
+                    config=config,
+                    transformer_layer_spec=MagicMock(),
+                    vocab_size=32000,
+                    max_sequence_length=2048,
+                    num_mem_tokens=16,
+                    log_layer_metrics_to_tensorboard=log_layer_metrics_to_tensorboard,
+                )
+
+            with patch(
+                "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+                new=_minimal_armt_layer_init,
+            ):
+                layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+                layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+            layer_one.consume_monitoring_primitives = MagicMock(
+                return_value={
+                    "armt/read/injection_delta_norm_mean": build_mean_metric(
+                        torch.tensor(6.0),
+                        torch.tensor(3.0),
+                    ),
+                    "armt/read/injection_delta_to_hidden_ratio": build_ratio_metric(
+                        torch.tensor(6.0),
+                        torch.tensor(12.0),
+                    ),
+                    "armt/read/post_injection_to_pre_hidden_ratio": build_ratio_metric(
+                        torch.tensor(18.0),
+                        torch.tensor(12.0),
+                    ),
+                    "armt/read/injection_gate_mean": build_mean_metric(
+                        torch.tensor(9.0),
+                        torch.tensor(3.0),
+                    ),
+                    "armt/read/injection_gate_std": build_std_metric(
+                        torch.tensor(9.0),
+                        torch.tensor(35.0),
+                        torch.tensor(3.0),
+                    ),
+                }
+            )
+            layer_two.consume_monitoring_primitives = MagicMock(
+                return_value={
+                    "armt/read/injection_delta_norm_mean": build_mean_metric(
+                        torch.tensor(4.0),
+                        torch.tensor(1.0),
+                    ),
+                    "armt/read/injection_delta_to_hidden_ratio": build_ratio_metric(
+                        torch.tensor(4.0),
+                        torch.tensor(8.0),
+                    ),
+                    "armt/read/post_injection_to_pre_hidden_ratio": build_ratio_metric(
+                        torch.tensor(12.0),
+                        torch.tensor(8.0),
+                    ),
+                    "armt/read/injection_gate_mean": build_mean_metric(
+                        torch.tensor(2.0),
+                        torch.tensor(1.0),
+                    ),
+                    "armt/read/injection_gate_std": build_std_metric(
+                        torch.tensor(2.0),
+                        torch.tensor(4.0),
+                        torch.tensor(1.0),
+                    ),
+                }
+            )
+            model.add_module("armt_layer_one", layer_one)
+            model.add_module("armt_layer_two", layer_two)
+            return model
+
+        metrics_without_layers = _build_model(
+            log_layer_metrics_to_tensorboard=False
+        ).consume_all_monitoring_metrics()
+        assert float(metrics_without_layers["armt/read/injection_delta_norm_mean"]) == (
+            pytest.approx(2.5)
+        )
+        assert "armt/read/injection_delta_norm_mean/layer_01" not in metrics_without_layers
+        assert "armt/read/injection_gate_std/layer_01" not in metrics_without_layers
+
+        metrics_with_layers = _build_model(
+            log_layer_metrics_to_tensorboard=True
+        ).consume_all_monitoring_metrics()
+        assert float(metrics_with_layers["armt/read/injection_delta_norm_mean"]) == pytest.approx(
+            2.5
+        )
+        assert float(
+            metrics_with_layers["armt/read/injection_delta_to_hidden_ratio"]
+        ) == pytest.approx(
+            0.5
+        )
+        assert float(
+            metrics_with_layers["armt/read/post_injection_to_pre_hidden_ratio"]
+        ) == pytest.approx(
+            1.5
+        )
+        assert float(metrics_with_layers["armt/read/injection_gate_mean"]) == pytest.approx(
+            2.75
+        )
+        assert float(metrics_with_layers["armt/read/injection_gate_std"]) == pytest.approx(
+            2.1875**0.5
+        )
+        assert float(
+            metrics_with_layers["armt/read/injection_delta_norm_mean/layer_01"]
+        ) == pytest.approx(
+            2.0
+        )
+        assert float(
+            metrics_with_layers["armt/read/injection_delta_norm_mean/layer_02"]
+        ) == pytest.approx(
+            4.0
+        )
+        assert float(metrics_with_layers["armt/read/injection_gate_std/layer_01"]) == (
+            pytest.approx((35.0 / 3.0 - 9.0) ** 0.5)
+        )
+        assert float(metrics_with_layers["armt/read/injection_gate_std/layer_02"]) == (
+            pytest.approx(0.0)
+        )
 
     def test_armt_model_rope_extension(self):
         """验证 _preprocess 在拼接 memory tokens 后会重新生成/扩展 RoPE 到 S+M。"""

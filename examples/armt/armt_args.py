@@ -4,6 +4,8 @@ import argparse
 
 from examples.recurrent.recurrent_args import add_recurrent_args, validate_recurrent_constraints
 
+_READ_INJECTION_MODES = ("residual", "silu_delta_gate", "sigmoid_gate")
+
 
 def add_armt_args(parser):
     parser = add_recurrent_args(parser)
@@ -100,6 +102,24 @@ def add_armt_args(parser):
             "memory-token concatenation and write context states instead."
         ),
     )
+    group.add_argument(
+        "--armt-read-injection-mode",
+        choices=_READ_INJECTION_MODES,
+        default="residual",
+        help=(
+            "Select how recurrent memory readouts are injected into hidden states. "
+            "residual keeps the legacy h + retrieved path."
+        ),
+    )
+    group.add_argument(
+        "--armt-read-sigmoid-gate-alpha",
+        type=float,
+        default=0.5,
+        help=(
+            "Scale for --armt-read-injection-mode sigmoid_gate: "
+            "h * (1 + alpha * (2 * sigmoid(retrieved) - 1))."
+        ),
+    )
 
     return parser
 
@@ -133,6 +153,19 @@ def validate_armt_constraints(args):
 
     if getattr(args, "armt_memory_write_source", "mem_tokens") != "mem_tokens":
         args.num_mem_tokens = 0
+
+    if not hasattr(args, "armt_read_injection_mode"):
+        args.armt_read_injection_mode = "residual"
+    if not hasattr(args, "armt_read_sigmoid_gate_alpha"):
+        args.armt_read_sigmoid_gate_alpha = 0.5
+    if args.armt_read_injection_mode not in _READ_INJECTION_MODES:
+        raise ValueError(
+            f"armt_read_injection_mode must be one of {_READ_INJECTION_MODES}, "
+            f"got {args.armt_read_injection_mode!r}"
+        )
+
+    if args.armt_read_sigmoid_gate_alpha < 0.0:
+        raise ValueError("armt_read_sigmoid_gate_alpha must be >= 0")
 
     return validate_recurrent_constraints(
         args,

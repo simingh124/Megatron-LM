@@ -372,6 +372,8 @@ def test_model_provider_threads_gdn_read_mode_to_layer_spec():
         recurrent_slot_read_attn_backend="sdpa",
         recurrent_mem_qk_norm=False,
         recurrent_memory_input_pre_norm=True,
+        armt_read_injection_mode="sigmoid_gate",
+        armt_read_sigmoid_gate_alpha=0.25,
         armt_log_read_position_metrics_to_tensorboard=False,
         max_position_embeddings=128,
         seq_length=64,
@@ -404,6 +406,8 @@ def test_model_provider_threads_gdn_read_mode_to_layer_spec():
 
     assert model is fake_model
     assert layer_spec_mock.call_args.kwargs["recurrent_gdn_read_mode"] == "buggy"
+    assert layer_spec_mock.call_args.kwargs["armt_read_injection_mode"] == "sigmoid_gate"
+    assert layer_spec_mock.call_args.kwargs["armt_read_sigmoid_gate_alpha"] == 0.25
 
 
 class TestARMTTraining:

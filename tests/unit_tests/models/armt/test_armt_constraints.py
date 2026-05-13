@@ -258,6 +258,53 @@ def test_armt_memory_write_source_arg_is_registered():
     assert args.armt_memory_write_source == "post_attn_context"
 
 
+def test_armt_read_injection_mode_defaults_to_residual():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_read_injection_mode == "residual"
+    assert args.armt_read_sigmoid_gate_alpha == 0.5
+
+
+def test_armt_read_injection_mode_and_sigmoid_alpha_are_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(
+        [
+            "--armt-read-injection-mode",
+            "sigmoid_gate",
+            "--armt-read-sigmoid-gate-alpha",
+            "0.25",
+        ]
+    )
+
+    assert args.armt_read_injection_mode == "sigmoid_gate"
+    assert args.armt_read_sigmoid_gate_alpha == 0.25
+
+
+def test_armt_silu_gate_is_not_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--armt-read-injection-mode", "silu_gate"])
+
+
+def test_armt_read_sigmoid_gate_alpha_must_be_non_negative():
+    args = _make_args(armt_read_sigmoid_gate_alpha=-0.1)
+
+    with pytest.raises(ValueError, match="armt_read_sigmoid_gate_alpha"):
+        validate_armt_constraints(args)
+
+
+def test_armt_silu_gate_is_rejected_by_validation():
+    args = _make_args(armt_read_injection_mode="silu_gate")
+
+    with pytest.raises(ValueError, match="silu_gate"):
+        validate_armt_constraints(args)
+
+
 def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
     args = _make_args()
     validate_armt_constraints(args)

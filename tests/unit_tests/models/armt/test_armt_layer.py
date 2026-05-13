@@ -1,6 +1,8 @@
-import torch
-import pytest
 from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+import torch.nn.functional as F
 
 from megatron.core.models.armt.associative_layer import AssociativeLayer
 from megatron.core.models.armt.armt_layer import ARMTLayer
@@ -29,6 +31,38 @@ class _DummyMemoryLayer(torch.nn.Module):
         self.consume_monitoring_primitives = MagicMock(return_value={})
         self.input_pre_norm = input_pre_norm
         self.set_collect_monitoring_for_current_iteration = MagicMock()
+
+
+def _build_read_injection_test_layer(
+    mock_config,
+    hidden_states,
+    retrieved,
+    *,
+    mode: str = "residual",
+    sigmoid_gate_alpha: float = 0.5,
+):
+    def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.submodules_config = submodules
+
+    with patch(
+        "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+        new=_minimal_init,
+    ):
+        layer = ARMTLayer(
+            config=mock_config,
+            submodules=MagicMock(),
+            layer_number=1,
+            num_mem_tokens=0,
+            armt_read_injection_mode=mode,
+            armt_read_sigmoid_gate_alpha=sigmoid_gate_alpha,
+        )
+        layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
+        layer._forward_attention = MagicMock(side_effect=lambda x, *args, **kwargs: (x, None))
+        layer._forward_mlp = MagicMock(side_effect=lambda x, *args, **kwargs: x)
+
+    return layer
 
 
 class TestARMTLayer:
@@ -147,6 +181,109 @@ class TestARMTLayer:
             layer.forward(hidden_states=hidden_states, attention_mask=None)
 
         assert torch.equal(layer._forward_attention.call_args.args[0], hidden_states)
+
+    @pytest.mark.parametrize(
+        ("mode", "sigmoid_gate_alpha"),
+        (
+            ("residual", 0.5),
+            ("silu_delta_gate", 0.5),
+            ("sigmoid_gate", 0.25),
+        ),
+    )
+    def test_armt_layer_applies_requested_read_injection_mode(
+        self, mock_config, mode, sigmoid_gate_alpha
+    ):
+        hidden_states = torch.full((2, 1, 256), 2.0)
+        retrieved = torch.full_like(hidden_states, 0.5)
+        layer = _build_read_injection_test_layer(
+            mock_config,
+            hidden_states,
+            retrieved,
+            mode=mode,
+            sigmoid_gate_alpha=sigmoid_gate_alpha,
+        )
+
+        out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        if mode == "residual":
+            expected = hidden_states + retrieved
+        elif mode == "silu_delta_gate":
+            expected = hidden_states * (1.0 + F.silu(retrieved.float()))
+        else:
+            gate = 1.0 + sigmoid_gate_alpha * (2.0 * torch.sigmoid(retrieved.float()) - 1.0)
+            expected = hidden_states * gate
+
+        torch.testing.assert_close(layer._forward_attention.call_args.args[0], expected)
+        torch.testing.assert_close(out, expected)
+
+    @pytest.mark.parametrize(
+        ("mode", "sigmoid_gate_alpha"),
+        (
+            ("silu_delta_gate", 0.5),
+            ("sigmoid_gate", 0.25),
+        ),
+    )
+    def test_armt_layer_gate_modes_emit_injection_monitoring_metrics(
+        self, mock_config, mode, sigmoid_gate_alpha
+    ):
+        hidden_states = torch.full((2, 1, 256), 2.0)
+        retrieved = torch.linspace(-1.0, 1.0, hidden_states.numel()).view_as(hidden_states)
+        layer = _build_read_injection_test_layer(
+            mock_config,
+            hidden_states,
+            retrieved,
+            mode=mode,
+            sigmoid_gate_alpha=sigmoid_gate_alpha,
+        )
+
+        out, _ = layer.forward(hidden_states, attention_mask=None)
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        if mode == "silu_delta_gate":
+            gate = 1.0 + F.silu(retrieved.float())
+        else:
+            gate = 1.0 + sigmoid_gate_alpha * (2.0 * torch.sigmoid(retrieved.float()) - 1.0)
+        expected_hidden = hidden_states * gate
+        delta_norms = torch.linalg.vector_norm(expected_hidden - hidden_states, dim=-1)
+        pre_norms = torch.linalg.vector_norm(hidden_states, dim=-1)
+        post_norms = torch.linalg.vector_norm(expected_hidden, dim=-1)
+
+        torch.testing.assert_close(out, expected_hidden)
+        assert float(metrics["armt/read/injection_delta_norm_mean"]) == pytest.approx(
+            float(delta_norms.mean())
+        )
+        assert float(metrics["armt/read/injection_delta_to_hidden_ratio"]) == pytest.approx(
+            float(delta_norms.sum() / pre_norms.sum())
+        )
+        assert float(metrics["armt/read/post_injection_to_pre_hidden_ratio"]) == pytest.approx(
+            float(post_norms.sum() / pre_norms.sum())
+        )
+        assert float(metrics["armt/read/injection_gate_mean"]) == pytest.approx(
+            float(gate.mean())
+        )
+        assert float(metrics["armt/read/injection_gate_std"]) == pytest.approx(
+            float(gate.std(unbiased=False)),
+            rel=1e-5,
+        )
+
+    def test_armt_layer_residual_mode_skips_injection_monitoring_metrics(self, mock_config):
+        hidden_states = torch.full((2, 1, 256), 2.0)
+        retrieved = torch.linspace(-1.0, 1.0, hidden_states.numel()).view_as(hidden_states)
+        layer = _build_read_injection_test_layer(
+            mock_config,
+            hidden_states,
+            retrieved,
+            mode="residual",
+        )
+
+        layer.forward(hidden_states, attention_mask=None)
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert "armt/read/injection_delta_norm_mean" not in metrics
+        assert "armt/read/injection_delta_to_hidden_ratio" not in metrics
+        assert "armt/read/post_injection_to_pre_hidden_ratio" not in metrics
+        assert "armt/read/injection_gate_mean" not in metrics
+        assert "armt/read/injection_gate_std" not in metrics
 
     def test_armt_layer_memory_update(self, mock_config):
         """验证 ARMTLayer 的调用顺序：associate 被调用，且 update_mem 使用尾部 M 个 memory tokens。"""

@@ -9,6 +9,7 @@ from megatron.core.models.armt.monitoring import (
     build_ratio_metric,
     build_ratio_of_means_metric,
     build_rms_metric,
+    build_std_metric,
     consume_armt_tensorboard_metrics,
     publish_armt_tensorboard_metrics,
 )
@@ -351,6 +352,11 @@ def test_consume_armt_metrics_batches_all_reduce_calls():
                 torch.tensor(16.0),
                 torch.tensor(4.0),
             ),
+            "armt/read/injection_gate_std": build_std_metric(
+                torch.tensor(10.0),
+                torch.tensor(30.0),
+                torch.tensor(4.0),
+            ),
         }
     )
 
@@ -367,12 +373,13 @@ def test_consume_armt_metrics_batches_all_reduce_calls():
     reduced_tensor = all_reduce_mock.call_args.kwargs.get("tensor")
     if reduced_tensor is None:
         reduced_tensor = all_reduce_mock.call_args.args[0]
-    assert reduced_tensor.numel() == 10
+    assert reduced_tensor.numel() == 13
     assert all_reduce_mock.call_args.kwargs["group"] is fake_reduce_group
     assert float(metrics["armt/read/retrieved_norm_mean"]) == pytest.approx(4.0)
     assert float(metrics["armt/read/retrieved_to_hidden_ratio"]) == pytest.approx(0.5)
     assert float(metrics["armt/token/mem_ctx_norm_ratio"]) == pytest.approx(0.2)
     assert float(metrics["armt/write/delta_mem_norm"]) == pytest.approx(2.0)
+    assert float(metrics["armt/read/injection_gate_std"]) == pytest.approx(1.25**0.5)
 
 
 def test_consume_armt_metrics_can_skip_finalize_on_non_writer_rank():

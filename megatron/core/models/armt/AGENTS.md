@@ -19,7 +19,7 @@
   4. `self.decoder(...)` 执行 ARMT layers
   5. 输出隐藏态剥离 memory token 部分（S+M -> S），再走 `_postprocess`（LM head/loss）
 - `ARMTLayer.forward(...)`
-  1. `recurrent_memory_layer.associate()` 检索记忆并残差相加
+  1. `recurrent_memory_layer.associate()` 检索记忆，并按 `armt_read_injection_mode` 注入 hidden states（默认残差相加）
   2. `TransformerLayer.forward()`（注意力 + FFN）
   3. 取尾部 `M` 个 memory token hidden 做 `recurrent_memory_layer.update_mem()` 写入
 - `AssociativeLayer`

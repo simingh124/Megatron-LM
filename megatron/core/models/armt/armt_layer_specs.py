@@ -51,6 +51,8 @@ def get_armt_layer_spec(
     recurrent_mem_qk_norm: bool = False,
     recurrent_memory_input_pre_norm: bool = False,
     armt_memory_write_source: str = "mem_tokens",
+    armt_read_injection_mode: str = "residual",
+    armt_read_sigmoid_gate_alpha: float = 0.5,
     log_read_position_metrics_to_tensorboard: bool = False,
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
@@ -113,6 +115,8 @@ def get_armt_layer_spec(
             "recurrent_mem_qk_norm": recurrent_mem_qk_norm,
             "recurrent_memory_input_pre_norm": recurrent_memory_input_pre_norm,
             "armt_memory_write_source": armt_memory_write_source,
+            "armt_read_injection_mode": armt_read_injection_mode,
+            "armt_read_sigmoid_gate_alpha": armt_read_sigmoid_gate_alpha,
             "log_read_position_metrics_to_tensorboard": (
                 log_read_position_metrics_to_tensorboard
             ),

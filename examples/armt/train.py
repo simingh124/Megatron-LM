@@ -101,6 +101,8 @@ def model_provider(
         recurrent_mem_qk_norm=args.recurrent_mem_qk_norm,
         recurrent_memory_input_pre_norm=args.recurrent_memory_input_pre_norm,
         armt_memory_write_source=getattr(args, "armt_memory_write_source", "mem_tokens"),
+        armt_read_injection_mode=getattr(args, "armt_read_injection_mode", "residual"),
+        armt_read_sigmoid_gate_alpha=getattr(args, "armt_read_sigmoid_gate_alpha", 0.5),
         log_read_position_metrics_to_tensorboard=(
             getattr(args, "armt_log_read_position_metrics_to_tensorboard", False)
         ),

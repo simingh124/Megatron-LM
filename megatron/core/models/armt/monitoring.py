@@ -67,6 +67,18 @@ def build_rms_metric(square_sum: torch.Tensor, count: torch.Tensor) -> MetricPri
     return MetricPrimitive("rms", _to_scalar_tensor(square_sum), _to_scalar_tensor(count))
 
 
+def build_std_metric(
+    sum_value: torch.Tensor,
+    square_sum: torch.Tensor,
+    count: torch.Tensor,
+) -> MetricPrimitive:
+    return MetricPrimitive(
+        "std",
+        torch.stack((_to_scalar_tensor(sum_value), _to_scalar_tensor(square_sum))),
+        _to_scalar_tensor(count),
+    )
+
+
 def merge_metric_primitives(
     destination: MutableMapping[str, MetricPrimitive],
     source: Mapping[str, MetricPrimitive],
@@ -109,6 +121,14 @@ def finalize_metric_primitive(primitive: MetricPrimitive) -> torch.Tensor:
         return numerator_mean / (denominator_mean + _RATIO_EPSILON)
     if primitive.kind == "rms":
         return torch.sqrt(numerator / torch.clamp(denominator, min=1.0))
+    if primitive.kind == "std":
+        if numerator.numel() != 2:
+            raise ValueError("std expects [sum, square_sum] tensors for numerator")
+        count = torch.clamp(denominator, min=1.0)
+        sum_value, square_sum = numerator.reshape(-1)
+        mean = sum_value / count
+        variance = square_sum / count - mean * mean
+        return torch.sqrt(torch.clamp(variance, min=0.0))
 
     raise ValueError(f"Unsupported metric kind: {primitive.kind}")
 

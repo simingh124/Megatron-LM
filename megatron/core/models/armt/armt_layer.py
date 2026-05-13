@@ -9,7 +9,13 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-from .monitoring import build_mean_metric, build_ratio_of_means_metric, merge_metric_primitives
+from .monitoring import (
+    build_mean_metric,
+    build_ratio_metric,
+    build_ratio_of_means_metric,
+    build_std_metric,
+    merge_metric_primitives,
+)
 from .recurrent_memory import build_recurrent_memory_backend
 
 _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
@@ -18,6 +24,11 @@ _SUPPORTED_MEMORY_WRITE_SOURCES = (
     "post_mlp_context",
     "post_attn_context",
     "pre_attn_context",
+)
+_SUPPORTED_READ_INJECTION_MODES = (
+    "residual",
+    "silu_delta_gate",
+    "sigmoid_gate",
 )
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +66,8 @@ class ARMTLayer(TransformerLayer):
         recurrent_mem_qk_norm: bool = False,
         recurrent_memory_input_pre_norm: bool = False,
         armt_memory_write_source: str = "mem_tokens",
+        armt_read_injection_mode: str = "residual",
+        armt_read_sigmoid_gate_alpha: float = 0.5,
         log_read_position_metrics_to_tensorboard: bool = False,
         **kwargs,
     ):
@@ -69,6 +82,15 @@ class ARMTLayer(TransformerLayer):
                 f"{_SUPPORTED_MEMORY_WRITE_SOURCES}, got {armt_memory_write_source!r}"
             )
         self.armt_memory_write_source = armt_memory_write_source
+        if armt_read_injection_mode not in _SUPPORTED_READ_INJECTION_MODES:
+            raise ValueError(
+                "armt_read_injection_mode must be one of "
+                f"{_SUPPORTED_READ_INJECTION_MODES}, got {armt_read_injection_mode!r}"
+            )
+        self.armt_read_injection_mode = armt_read_injection_mode
+        self.armt_read_sigmoid_gate_alpha = float(armt_read_sigmoid_gate_alpha)
+        if self.armt_read_sigmoid_gate_alpha < 0.0:
+            raise ValueError("armt_read_sigmoid_gate_alpha must be >= 0")
         self.recurrent_memory_layer = None
         params_dtype = getattr(config, "params_dtype", torch.bfloat16)
 
@@ -167,6 +189,28 @@ class ARMTLayer(TransformerLayer):
 
     def _uses_mem_tokens(self) -> bool:
         return self.armt_memory_write_source == "mem_tokens" and self.num_mem_tokens > 0
+
+    def _inject_retrieved_memory(
+        self,
+        hidden_states: torch.Tensor,
+        retrieved: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.armt_read_injection_mode == "residual":
+            return hidden_states + retrieved, None
+
+        if self.armt_read_injection_mode == "silu_delta_gate":
+            gate = 1.0 + F.silu(retrieved.float()).to(dtype=hidden_states.dtype)
+            return hidden_states * gate, gate
+
+        if self.armt_read_injection_mode == "sigmoid_gate":
+            sigmoid_gate = torch.sigmoid(retrieved.float())
+            gate = 1.0 + self.armt_read_sigmoid_gate_alpha * (2.0 * sigmoid_gate - 1.0)
+            gate = gate.to(dtype=hidden_states.dtype)
+            return hidden_states * gate, gate
+
+        raise RuntimeError(
+            f"Unsupported armt_read_injection_mode: {self.armt_read_injection_mode!r}"
+        )
 
     def _accumulate_monitoring_stat(self, name: str, value: torch.Tensor):
         value = value.detach()
@@ -273,6 +317,44 @@ class ARMTLayer(TransformerLayer):
             self._count_tensor(mem_tokens.shape[0], cosine.device),
         )
 
+    def _update_read_injection_monitoring_stats(
+        self,
+        pre_injection_hidden_states: torch.Tensor,
+        post_injection_hidden_states: torch.Tensor,
+        injection_gate: torch.Tensor,
+    ):
+        pre_hidden = self._prepare_hidden_states_for_memory_ops(
+            pre_injection_hidden_states.detach()
+        ).float()
+        post_hidden = self._prepare_hidden_states_for_memory_ops(
+            post_injection_hidden_states.detach()
+        ).float()
+
+        delta_norms = torch.linalg.vector_norm(post_hidden - pre_hidden, dim=-1)
+        pre_norms = torch.linalg.vector_norm(pre_hidden, dim=-1)
+        post_norms = torch.linalg.vector_norm(post_hidden, dim=-1)
+        self._accumulate_monitoring_stat("injection_delta_norm_sum", delta_norms.sum())
+        self._accumulate_monitoring_stat(
+            "injection_pre_hidden_norm_sum",
+            pre_norms.sum(),
+        )
+        self._accumulate_monitoring_stat(
+            "injection_post_hidden_norm_sum",
+            post_norms.sum(),
+        )
+        self._accumulate_monitoring_stat(
+            "injection_delta_norm_count",
+            self._count_tensor(delta_norms.numel(), delta_norms.device),
+        )
+
+        gate = self._prepare_hidden_states_for_memory_ops(injection_gate.detach()).float()
+        self._accumulate_monitoring_stat("injection_gate_sum", gate.sum())
+        self._accumulate_monitoring_stat("injection_gate_sq_sum", torch.square(gate).sum())
+        self._accumulate_monitoring_stat(
+            "injection_gate_elem_count",
+            self._count_tensor(gate.numel(), gate.device),
+        )
+
     def consume_monitoring_primitives(self):
         if not self._collect_monitoring_for_current_iteration:
             self.reset_monitoring_stats()
@@ -317,6 +399,31 @@ class ARMTLayer(TransformerLayer):
             primitives["armt/token/mem_token_cosine_gt_0p8_ratio_mean"] = build_mean_metric(
                 stats["mem_token_cosine_gt_0p8_ratio_sum"],
                 stats["mem_token_cosine_count"],
+            )
+
+        if "injection_delta_norm_count" in stats:
+            primitives["armt/read/injection_delta_norm_mean"] = build_mean_metric(
+                stats["injection_delta_norm_sum"],
+                stats["injection_delta_norm_count"],
+            )
+            primitives["armt/read/injection_delta_to_hidden_ratio"] = build_ratio_metric(
+                stats["injection_delta_norm_sum"],
+                stats["injection_pre_hidden_norm_sum"],
+            )
+            primitives["armt/read/post_injection_to_pre_hidden_ratio"] = build_ratio_metric(
+                stats["injection_post_hidden_norm_sum"],
+                stats["injection_pre_hidden_norm_sum"],
+            )
+
+        if "injection_gate_elem_count" in stats:
+            primitives["armt/read/injection_gate_mean"] = build_mean_metric(
+                stats["injection_gate_sum"],
+                stats["injection_gate_elem_count"],
+            )
+            primitives["armt/read/injection_gate_std"] = build_std_metric(
+                stats["injection_gate_sum"],
+                stats["injection_gate_sq_sum"],
+                stats["injection_gate_elem_count"],
             )
 
         self._monitoring_stats = {}
@@ -398,8 +505,18 @@ class ARMTLayer(TransformerLayer):
 
         # Step 1: Associate (Memory Retrieval)
         if not self._skip_read_memory_for_current_chunk:
+            pre_injection_hidden_states = hidden_states
             retrieved = memory_layer.associate(hidden_states, input_is_sbh=input_is_sbh)
-            hidden_states = hidden_states + retrieved
+            hidden_states, injection_gate = self._inject_retrieved_memory(
+                hidden_states,
+                retrieved,
+            )
+            if injection_gate is not None and self._collect_monitoring_for_current_iteration:
+                self._update_read_injection_monitoring_stats(
+                    pre_injection_hidden_states,
+                    hidden_states,
+                    injection_gate,
+                )
 
         pre_attn_hidden_states = hidden_states
 
