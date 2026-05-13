@@ -26,11 +26,14 @@ def _make_args(**overrides):
         full_attn_window_size=None,
         recurrent_tbptt_mode=True,
         num_mem_tokens=16,
+        num_read_mem_tokens=0,
         sequence_parallel=False,
         armt_windowed_full_attn_backend="native",
         armt_equal_window_full_attn_path="legacy",
         recurrent_memory_lr=None,
         min_lr=None,
+        armt_read_memory_mode="none",
+        armt_read_memory_residual=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -297,6 +300,22 @@ def test_armt_read_chunk_metrics_tensorboard_switch_can_be_enabled():
     assert args.armt_log_read_chunk_metrics_to_tensorboard is True
 
 
+def test_armt_read_prefix_attn_mass_tensorboard_switch_defaults_to_disabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args([])
+
+    assert args.armt_log_read_prefix_attn_mass_to_tensorboard is False
+
+
+def test_armt_read_prefix_attn_mass_tensorboard_switch_can_be_enabled():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-log-read-prefix-attn-mass-to-tensorboard"])
+
+    assert args.armt_log_read_prefix_attn_mass_to_tensorboard is True
+
+
 def test_armt_head_dim_arg_is_registered():
     parser = argparse.ArgumentParser()
     add_armt_args(parser)
@@ -313,6 +332,30 @@ def test_armt_memory_write_source_arg_is_registered():
     assert args.armt_memory_write_source == "post_attn_context"
 
 
+def test_armt_num_read_mem_tokens_arg_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--num-read-mem-tokens", "8"])
+
+    assert args.num_read_mem_tokens == 8
+
+
+def test_armt_read_memory_mode_arg_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-read-memory-mode", "shared"])
+
+    assert args.armt_read_memory_mode == "shared"
+
+
+def test_armt_read_memory_residual_arg_is_registered():
+    parser = argparse.ArgumentParser()
+    add_armt_args(parser)
+    args = parser.parse_args(["--armt-read-memory-residual"])
+
+    assert args.armt_read_memory_residual is True
+
+
 def test_armt_validation_sets_skip_read_default_for_legacy_namespaces():
     args = _make_args()
     validate_armt_constraints(args)
@@ -324,11 +367,65 @@ def test_armt_non_mem_write_source_forces_zero_mem_tokens():
     args = _make_args(
         armt_memory_write_source="post_mlp_context",
         num_mem_tokens=16,
+        num_read_mem_tokens=8,
+        armt_read_memory_mode="shared",
     )
 
     validate_armt_constraints(args)
 
     assert args.num_mem_tokens == 0
+    assert args.num_read_mem_tokens == 8
+
+
+@pytest.mark.parametrize("read_memory_mode", ("initial", "shared", "per_layer"))
+def test_armt_read_memory_residual_allows_read_prefix_modes(read_memory_mode):
+    args = _make_args(
+        armt_read_memory_mode=read_memory_mode,
+        num_read_mem_tokens=8,
+        armt_read_memory_residual=True,
+    )
+
+    validate_armt_constraints(args)
+
+    assert args.armt_read_memory_residual is True
+    assert args.armt_read_memory_mode == read_memory_mode
+
+
+def test_armt_read_memory_residual_rejects_none_mode():
+    args = _make_args(
+        armt_read_memory_mode="none",
+        num_read_mem_tokens=8,
+        armt_read_memory_residual=True,
+    )
+
+    with pytest.raises(ValueError, match="requires armt_read_memory_mode"):
+        validate_armt_constraints(args)
+
+
+def test_armt_none_read_memory_mode_forces_zero_read_tokens():
+    args = _make_args(
+        armt_read_memory_mode="none",
+        num_read_mem_tokens=8,
+    )
+
+    validate_armt_constraints(args)
+
+    assert args.num_read_mem_tokens == 0
+
+
+def test_armt_sequence_parallel_first_chunk_without_read_prefix_must_still_be_divisible():
+    args = _make_args(
+        tensor_model_parallel_size=3,
+        sequence_parallel=True,
+        recurrent_chunk_size=512,
+        num_mem_tokens=0,
+        num_read_mem_tokens=1,
+        armt_read_memory_mode="shared",
+        no_read_memory_from_first_chunk=True,
+    )
+
+    with pytest.raises(ValueError, match="first chunk"):
+        validate_armt_constraints(args)
 
 
 def test_gdn_requires_explicit_hyperparameters():

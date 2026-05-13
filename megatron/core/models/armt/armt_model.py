@@ -7,11 +7,11 @@ import torch
 import torch.nn as nn
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 
-from .init_utils import init_parameter
 from .armt_layer import ARMTLayer
+from .init_utils import init_parameter
 from .monitoring import finalize_metric_primitives, merge_metric_primitives
 from .windowed_attention_utils import should_use_windowed_full_attention
 
@@ -33,9 +33,12 @@ class ARMTModel(GPTModel):
         vocab_size: int,
         max_sequence_length: int,
         num_mem_tokens: int = 16,
+        num_read_mem_tokens: int = 0,
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
         armt_equal_window_full_attn_path: str = "legacy",
+        armt_read_memory_mode: str = "none",
+        armt_read_memory_residual: bool = False,
         log_layer_metrics_to_tensorboard: bool = False,
         **kwargs,
     ):
@@ -48,6 +51,9 @@ class ARMTModel(GPTModel):
         )
 
         self.num_mem_tokens = num_mem_tokens
+        self.num_read_mem_tokens = num_read_mem_tokens
+        self.armt_read_memory_mode = armt_read_memory_mode
+        self.armt_read_memory_residual = bool(armt_read_memory_residual)
         self.recurrent_chunk_size = recurrent_chunk_size or max_sequence_length
         self.full_attn_window_size = (
             full_attn_window_size
@@ -65,34 +71,54 @@ class ARMTModel(GPTModel):
         self._skip_read_memory_for_current_chunk = False
         self._current_chunk_is_first = False
         self._current_chunk_start_position = 0
+        actual_num_armt_layers = len(self._ordered_armt_layers())
+        configured_num_armt_layers = int(getattr(config, "num_layers", actual_num_armt_layers))
+        self._num_armt_layers = actual_num_armt_layers or configured_num_armt_layers
 
         if num_mem_tokens > 0:
-            memory_device = None
-            if not getattr(config, "use_cpu_initialization", False) and torch.cuda.is_available():
-                memory_device = torch.cuda.current_device()
-
-            self.memory_embeddings = nn.Parameter(
-                torch.empty(
-                    num_mem_tokens,
-                    config.hidden_size,
-                    dtype=config.params_dtype,
-                    device=memory_device,
-                )
-            )
+            self.memory_embeddings = nn.Parameter(self._new_memory_parameter((num_mem_tokens,)))
             init_parameter(
                 self.memory_embeddings,
                 config.embedding_init_method,
                 perform_initialization=config.perform_initialization,
             )
         else:
-            # Avoid keeping a zero-sized trainable parameter around. It is semantically unused
-            # and can create padding-only distributed-optimizer buckets during checkpoint save.
             self.register_parameter("memory_embeddings", None)
+
+        if self._uses_read_prefix_mode():
+            read_shape = (num_read_mem_tokens,)
+            if self.armt_read_memory_mode == "per_layer":
+                read_shape = (self._num_armt_layers, num_read_mem_tokens)
+            self.read_memory_embeddings = nn.Parameter(self._new_memory_parameter(read_shape))
+            init_parameter(
+                self.read_memory_embeddings,
+                config.embedding_init_method,
+                perform_initialization=config.perform_initialization,
+            )
+        else:
+            self.register_parameter("read_memory_embeddings", None)
+
+    def _new_memory_parameter(self, prefix_shape: tuple[int, ...]) -> torch.Tensor:
+        memory_device = None
+        if not getattr(self.config, "use_cpu_initialization", False) and torch.cuda.is_available():
+            memory_device = torch.cuda.current_device()
+        return torch.empty(
+            *prefix_shape,
+            self.config.hidden_size,
+            dtype=self.config.params_dtype,
+            device=memory_device,
+        )
 
     def _armt_layers(self):
         for module in self.modules():
             if isinstance(module, ARMTLayer):
                 yield module
+
+    def _ordered_armt_layers(self) -> list[ARMTLayer]:
+        return sorted(
+            list(self._armt_layers()),
+            key=lambda module: int(getattr(module, "layer_number", 0)),
+        )
 
     @staticmethod
     def _layer_monitoring_metric_name(metric_name: str, layer_number: int) -> str:
@@ -108,10 +134,105 @@ class ARMTModel(GPTModel):
             and metric_name not in ARMTModel._LAYER_METRICS_TO_KEEP_AGGREGATED_ONLY
         )
 
+    def _uses_read_prefix_mode(self) -> bool:
+        return self.armt_read_memory_mode != "none" and self.num_read_mem_tokens > 0
+
+    def _current_read_mem_tokens(self) -> int:
+        if not self._uses_read_prefix_mode() or self._skip_read_memory_for_current_chunk:
+            return 0
+        return self.num_read_mem_tokens
+
+    def _current_write_mem_tokens(self) -> int:
+        if self.memory_embeddings is None:
+            return 0
+        return self.num_mem_tokens
+
+    def _current_total_extra_tokens(self) -> int:
+        return self._current_read_mem_tokens() + self._current_write_mem_tokens()
+
+    def _current_context_bounds(self, seq_len: int) -> tuple[int, int]:
+        context_start = self._current_read_mem_tokens()
+        return context_start, context_start + seq_len
+
+    def _get_first_layer_read_embedding_slice(self) -> Optional[torch.Tensor]:
+        current_read_tokens = self._current_read_mem_tokens()
+        if current_read_tokens == 0 or self.read_memory_embeddings is None:
+            return None
+        if self.armt_read_memory_mode == "per_layer":
+            return self.read_memory_embeddings[0, :current_read_tokens]
+        return self.read_memory_embeddings[:current_read_tokens]
+
+    def _expand_token_embeddings(
+        self,
+        embeddings: Optional[torch.Tensor],
+        decoder_input: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if embeddings is None:
+            return None
+        batch_size = decoder_input.shape[1]
+        expanded = embeddings.unsqueeze(1).expand(-1, batch_size, -1)
+        return expanded.to(dtype=decoder_input.dtype, device=decoder_input.device)
+
+    def _concat_memory_embeddings(self, decoder_input: torch.Tensor) -> torch.Tensor:
+        if self._current_total_extra_tokens() == 0:
+            return decoder_input
+
+        read_prefix = self._expand_token_embeddings(
+            self._get_first_layer_read_embedding_slice(),
+            decoder_input,
+        )
+        write_suffix = self._expand_token_embeddings(self.memory_embeddings, decoder_input)
+
+        parts = []
+        if read_prefix is not None:
+            parts.append(read_prefix)
+        parts.append(decoder_input)
+        if write_suffix is not None:
+            parts.append(write_suffix)
+        return torch.cat(parts, dim=0)
+
+    def _concat_padding_mask(self, padding_mask: torch.Tensor) -> torch.Tensor:
+        read_tokens = self._current_read_mem_tokens()
+        write_tokens = self._current_write_mem_tokens()
+        if read_tokens == 0 and write_tokens == 0:
+            return padding_mask
+
+        batch_size = padding_mask.shape[0]
+        mem_mask = torch.zeros(
+            batch_size,
+            read_tokens + write_tokens,
+            dtype=padding_mask.dtype,
+            device=padding_mask.device,
+        )
+
+        parts = []
+        if read_tokens > 0:
+            parts.append(mem_mask[:, :read_tokens])
+        parts.append(padding_mask)
+        if write_tokens > 0:
+            parts.append(mem_mask[:, read_tokens:])
+        return torch.cat(parts, dim=1)
+
+    def _configure_layers_for_current_forward(self) -> None:
+        current_read_tokens = self._current_read_mem_tokens()
+        for layer_idx, layer in enumerate(self._ordered_armt_layers()):
+            if self.armt_read_memory_mode == "shared" and current_read_tokens > 0:
+                layer.set_current_layer_read_memory_embeddings(
+                    self.read_memory_embeddings[:current_read_tokens]
+                )
+            elif self.armt_read_memory_mode == "per_layer" and current_read_tokens > 0:
+                layer.set_current_layer_read_memory_embeddings(
+                    self.read_memory_embeddings[layer_idx, :current_read_tokens]
+                )
+            else:
+                layer.set_current_layer_read_memory_embeddings(None)
+
     def get_memory_parameter_breakdown(self) -> list[tuple[str, int]]:
         breakdown = []
         if self.memory_embeddings is not None and self.memory_embeddings.numel() > 0:
             breakdown.append(("memory_embeddings", self.memory_embeddings.numel()))
+        if self.read_memory_embeddings is not None and self.read_memory_embeddings.numel() > 0:
+            breakdown.append(("read_memory_embeddings", self.read_memory_embeddings.numel()))
         for module_name, module in self.named_modules():
             if not isinstance(module, ARMTLayer):
                 continue
@@ -209,26 +330,6 @@ class ARMTModel(GPTModel):
     def consume_all_monitoring_metrics(self):
         return finalize_metric_primitives(self.consume_all_monitoring_primitives())
 
-    def _concat_memory_embeddings(self, decoder_input: torch.Tensor) -> torch.Tensor:
-        if self.num_mem_tokens == 0:
-            return decoder_input
-        batch_size = decoder_input.shape[1]
-        mem = self.memory_embeddings.unsqueeze(1).expand(-1, batch_size, -1)
-        mem = mem.to(dtype=decoder_input.dtype, device=decoder_input.device)
-        return torch.cat([decoder_input, mem], dim=0)
-
-    def _concat_padding_mask(self, padding_mask: torch.Tensor) -> torch.Tensor:
-        if self.num_mem_tokens == 0:
-            return padding_mask
-        batch_size = padding_mask.shape[0]
-        mem_mask = torch.zeros(
-            batch_size,
-            self.num_mem_tokens,
-            dtype=padding_mask.dtype,
-            device=padding_mask.device,
-        )
-        return torch.cat([padding_mask, mem_mask], dim=1)
-
     def _preprocess(
         self,
         input_ids: torch.Tensor,
@@ -285,7 +386,6 @@ class ARMTModel(GPTModel):
             if padding_mask is not None:
                 padding_mask = self._concat_padding_mask(padding_mask)
 
-        # Recompute rotary embeddings for the new sequence length.
         rotary_offset = self._current_chunk_start_position if self._use_windowed_full_attention else 0
         if self.position_embedding_type == "rope" and not self.config.multi_latent_attention:
             rotary_seq_len = decoder_input.shape[0]
@@ -322,10 +422,10 @@ class ARMTModel(GPTModel):
     def _adjust_attention_mask(self, attention_mask: torch.Tensor, seq_len: int) -> torch.Tensor:
         if attention_mask is None:
             return None
-        if self.num_mem_tokens == 0:
+        if self._current_total_extra_tokens() == 0:
             return attention_mask
 
-        new_seq_len = seq_len + self.num_mem_tokens
+        new_seq_len = seq_len + self._current_total_extra_tokens()
         causal_mask = torch.triu(
             torch.ones(
                 new_seq_len,
@@ -340,23 +440,25 @@ class ARMTModel(GPTModel):
             new_mask = new_mask.unsqueeze(0)
 
         new_mask = new_mask.expand(attention_mask.shape[:-2] + (new_seq_len, new_seq_len)).clone()
-        new_mask[..., :seq_len, :seq_len] = attention_mask
+        context_start, context_end = self._current_context_bounds(seq_len)
+        new_mask[..., context_start:context_end, context_start:context_end] = attention_mask
         return new_mask
 
     def _strip_memory_tokens(self, hidden_states: torch.Tensor, seq_len: int) -> torch.Tensor:
-        if self.num_mem_tokens == 0:
+        if self._current_total_extra_tokens() == 0:
             return hidden_states
+        context_start, context_end = self._current_context_bounds(seq_len)
         if getattr(self.config, "sequence_parallel", False):
             tp_group = parallel_state.get_tensor_model_parallel_group()
             gathered = tensor_parallel.gather_from_sequence_parallel_region(
                 hidden_states, group=tp_group
             )
-            gathered = gathered[:seq_len]
+            gathered = gathered[context_start:context_end]
             hidden_states = tensor_parallel.scatter_to_sequence_parallel_region(
                 gathered, group=tp_group
             )
         else:
-            hidden_states = hidden_states[:seq_len]
+            hidden_states = hidden_states[context_start:context_end]
         return hidden_states
 
     def forward(
@@ -399,6 +501,7 @@ class ARMTModel(GPTModel):
         ) = preproc_output[:6]
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        self._configure_layers_for_current_forward()
         attention_mask = self._adjust_attention_mask(attention_mask, seq_len)
 
         hidden_states = self.decoder(

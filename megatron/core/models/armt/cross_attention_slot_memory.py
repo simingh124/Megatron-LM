@@ -92,6 +92,7 @@ class CrossAttentionSlotMemory(nn.Module):
             log_read_position_metrics_to_tensorboard
         )
         self._collect_monitoring_for_current_iteration = True
+        self._read_prefix_mode = False
 
         projection_size = self.num_heads * self.head_dim
         self.W_read_q = nn.Linear(d_model, projection_size, bias=False, dtype=dtype)
@@ -191,6 +192,9 @@ class CrossAttentionSlotMemory(nn.Module):
 
     def set_collect_monitoring_for_current_iteration(self, enabled: bool):
         self._collect_monitoring_for_current_iteration = bool(enabled)
+
+    def set_read_prefix_mode(self, enabled: bool):
+        self._read_prefix_mode = bool(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats: Dict[str, torch.Tensor] = {}
@@ -547,7 +551,7 @@ class CrossAttentionSlotMemory(nn.Module):
         memory_input_states = self._prepare_memory_input(hidden_states)
 
         self._maybe_initialize_memory(batch_size=hidden_states.shape[0], device=hidden_states.device)
-        should_track_read_metrics = not self._first_chunk
+        should_track_read_metrics = not self._first_chunk and not self._read_prefix_mode
 
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)

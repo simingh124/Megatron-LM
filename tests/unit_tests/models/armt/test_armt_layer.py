@@ -6,7 +6,7 @@ from megatron.core.models.armt.associative_layer import AssociativeLayer
 from megatron.core.models.armt.armt_layer import ARMTLayer
 from megatron.core.models.armt.cross_attention_slot_memory import CrossAttentionSlotMemory
 from megatron.core.models.armt.gated_deltanet_memory import GatedDeltaNetMemory
-from megatron.core.models.armt.monitoring import finalize_metric_primitives
+from megatron.core.models.armt.monitoring import build_mean_metric, finalize_metric_primitives
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -221,6 +221,251 @@ class TestARMTLayer:
         layer.recurrent_memory_layer.update_mem.assert_called_once()
         assert torch.equal(attn_inputs[0], hidden_states)
         assert torch.equal(out, hidden_states)
+
+    def test_armt_layer_shared_read_prefix_uses_top_level_embeddings_and_tracks_prefix_metrics(
+        self, mock_config
+    ):
+        hidden_states = torch.tensor(
+            [
+                [[10.0, 0.0]],
+                [[20.0, 0.0]],
+                [[1.0, 1.0]],
+                [[2.0, 2.0]],
+                [[3.0, 3.0]],
+            ]
+        )
+        read_embeddings = torch.tensor([[5.0, 0.0], [0.0, 6.0]])
+        retrieved = torch.tensor(
+            [
+                [[1.0, 2.0]],
+                [[3.0, 4.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=1,
+                num_read_mem_tokens=2,
+                armt_read_memory_mode="shared",
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
+            layer.set_current_layer_read_memory_embeddings(read_embeddings)
+            layer._forward_attention = MagicMock(side_effect=lambda x, *args, **kwargs: (x, None))
+            layer._forward_mlp = MagicMock(side_effect=lambda x, *args, **kwargs: x)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        expected_query = read_embeddings.unsqueeze(1)
+        expected_hidden = torch.cat([retrieved, hidden_states[2:]], dim=0)
+        assert torch.equal(layer.recurrent_memory_layer.associate.call_args.args[0], expected_query)
+        assert torch.equal(out, expected_hidden)
+        assert torch.equal(layer.recurrent_memory_layer.update_mem.call_args.args[0], hidden_states[-1:])
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        assert "armt/read_prefix/norm_mean" in metrics
+        assert "armt/read_prefix/cosine_mean" in metrics
+        assert "armt/read_prefix/query_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_to_query_norm_ratio" in metrics
+        assert "armt/read_prefix/read_to_context_norm_ratio" in metrics
+        assert "armt/token/context_token_norm_mean" in metrics
+        assert "armt/token/mem_token_norm_mean" in metrics
+        assert float(metrics["armt/read_prefix/query_norm_mean"]) == pytest.approx(5.5)
+        assert float(metrics["armt/read_prefix/retrieved_norm_mean"]) == pytest.approx(
+            (5.0**0.5 + 5.0) / 2.0
+        )
+        assert float(metrics["armt/read_prefix/retrieved_to_query_norm_ratio"]) == pytest.approx(
+            ((5.0**0.5 + 5.0) / 2.0) / 5.5
+        )
+        assert float(metrics["armt/read_prefix/read_to_context_norm_ratio"]) == pytest.approx(
+            ((5.0**0.5 + 5.0) / 2.0) / (((2.0**0.5) + (8.0**0.5)) / 2.0)
+        )
+
+    def test_armt_layer_read_prefix_attention_mass_metric_is_merged_from_self_attention(
+        self, mock_config
+    ):
+        hidden_states = torch.tensor(
+            [
+                [[10.0, 0.0]],
+                [[20.0, 0.0]],
+                [[1.0, 1.0]],
+                [[2.0, 2.0]],
+            ]
+        )
+        read_embeddings = torch.tensor([[5.0, 0.0], [0.0, 6.0]])
+        retrieved = torch.tensor(
+            [
+                [[1.0, 2.0]],
+                [[3.0, 4.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+            self.input_layernorm = torch.nn.Identity()
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=0,
+                num_read_mem_tokens=2,
+                armt_read_memory_mode="shared",
+                log_read_prefix_attn_mass_to_tensorboard=True,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
+            layer.set_current_layer_read_memory_embeddings(read_embeddings)
+            layer.self_attention = MagicMock()
+            layer.self_attention.track_read_prefix_attention_mass = MagicMock()
+            layer.self_attention.consume_monitoring_primitives = MagicMock(
+                return_value={
+                    "armt/read_prefix/attn_mass_from_context_mean": build_mean_metric(
+                        torch.tensor(1.5),
+                        torch.tensor(2.0),
+                    )
+                }
+            )
+            layer.self_attention.reset_monitoring_stats = MagicMock()
+            layer.self_attention.set_collect_monitoring_for_current_iteration = MagicMock()
+            layer._forward_attention = MagicMock(side_effect=lambda x, *args, **kwargs: (x, None))
+            layer._forward_mlp = MagicMock(side_effect=lambda x, *args, **kwargs: x)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            _out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        layer.self_attention.track_read_prefix_attention_mass.assert_called_once()
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        assert float(metrics["armt/read_prefix/attn_mass_from_context_mean"]) == pytest.approx(0.75)
+
+    @pytest.mark.parametrize("read_memory_mode", ("shared", "per_layer"))
+    def test_armt_layer_read_prefix_residual_adds_embedding_query_for_learned_modes(
+        self, mock_config, read_memory_mode
+    ):
+        hidden_states = torch.tensor(
+            [
+                [[10.0, 0.0]],
+                [[20.0, 0.0]],
+                [[1.0, 1.0]],
+                [[2.0, 2.0]],
+            ]
+        )
+        read_embeddings = torch.tensor([[5.0, 0.0], [0.0, 6.0]])
+        retrieved = torch.tensor(
+            [
+                [[1.0, 2.0]],
+                [[3.0, 4.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=0,
+                num_read_mem_tokens=2,
+                armt_read_memory_mode=read_memory_mode,
+                armt_read_memory_residual=True,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
+            layer.set_current_layer_read_memory_embeddings(read_embeddings)
+            layer._forward_attention = MagicMock(side_effect=lambda x, *args, **kwargs: (x, None))
+            layer._forward_mlp = MagicMock(side_effect=lambda x, *args, **kwargs: x)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        expected_query = read_embeddings.unsqueeze(1)
+        expected_hidden = torch.cat([expected_query + retrieved, hidden_states[2:]], dim=0)
+        assert torch.equal(layer.recurrent_memory_layer.associate.call_args.args[0], expected_query)
+        assert torch.equal(out, expected_hidden)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        assert "armt/read_prefix/query_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_to_query_norm_ratio" in metrics
+        assert "armt/read_prefix/read_to_context_norm_ratio" in metrics
+        assert "armt/token/context_token_norm_mean" in metrics
+        assert "armt/token/mem_token_norm_mean" not in metrics
+
+    def test_armt_layer_initial_read_prefix_residual_uses_input_prefix_as_query(self, mock_config):
+        hidden_states = torch.tensor(
+            [
+                [[1.0, 0.0]],
+                [[0.0, 2.0]],
+                [[3.0, 3.0]],
+                [[4.0, 4.0]],
+            ]
+        )
+        retrieved = torch.tensor(
+            [
+                [[0.5, 1.5]],
+                [[2.0, 0.5]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=0,
+                num_read_mem_tokens=2,
+                armt_read_memory_mode="initial",
+                armt_read_memory_residual=True,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(retrieved)
+            layer._forward_attention = MagicMock(side_effect=lambda x, *args, **kwargs: (x, None))
+            layer._forward_mlp = MagicMock(side_effect=lambda x, *args, **kwargs: x)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            out, _ = layer.forward(hidden_states, attention_mask=None)
+
+        expected_query = hidden_states[:2]
+        expected_hidden = torch.cat([expected_query + retrieved, hidden_states[2:]], dim=0)
+        assert torch.equal(layer.recurrent_memory_layer.associate.call_args.args[0], expected_query)
+        assert torch.equal(out, expected_hidden)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+        assert "armt/read_prefix/query_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_norm_mean" in metrics
+        assert "armt/read_prefix/retrieved_to_query_norm_ratio" in metrics
+        assert "armt/read_prefix/read_to_context_norm_ratio" in metrics
+        assert "armt/token/context_token_norm_mean" in metrics
 
     def test_armt_layer_token_monitoring_metrics(self, mock_config):
         """验证 token 监控指标按最终层输出计算。"""

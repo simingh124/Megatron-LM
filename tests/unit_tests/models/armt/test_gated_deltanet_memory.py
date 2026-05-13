@@ -296,7 +296,10 @@ def test_gdn_memory_normal_read_mode_uses_direct_state_readout_without_decay():
     layer = _build_layer(read_mode="normal")
     batch_size = 2
     layer.reset_memory(batch_size=batch_size)
-    layer.update_mem(torch.randn(batch_size, layer.num_mem_tokens, layer.d_model), input_is_sbh=False)
+    layer.update_mem(
+        torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+        input_is_sbh=False,
+    )
 
     hidden_states = torch.randn(batch_size, 6, layer.d_model)
     memory_input_states = layer._prepare_memory_input(hidden_states)
@@ -327,6 +330,76 @@ def test_gdn_memory_normal_read_mode_uses_direct_state_readout_without_decay():
 
     assert torch.equal(layer.recurrent_state, state_before_read)
     assert torch.allclose(retrieved, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_gdn_memory_normal_read_fast_projection_matches_full_projection():
+    layer = _build_layer(read_mode="normal")
+    hidden_states = torch.randn(2, 6, layer.d_model)
+    memory_input_states = layer._prepare_memory_input(hidden_states)
+
+    query, _, _, gate, _, _ = layer._project_hidden_states(
+        hidden_states,
+        allow_causal_kernel=True,
+        memory_input_states=memory_input_states,
+    )
+    fast_query, fast_gate = layer._project_read_query_and_gate(
+        hidden_states,
+        allow_causal_kernel=True,
+        memory_input_states=memory_input_states,
+    )
+
+    assert torch.allclose(fast_query, query, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fast_gate, gate, atol=1e-6, rtol=1e-6)
+
+
+def test_gdn_memory_normal_read_fast_projection_matches_causal_conv_path():
+    def _fake_causal_conv1d_fn(x, weight, bias, activation):
+        del weight, bias, activation
+        return x + 3.0
+
+    with patch(
+        "megatron.core.models.armt.gated_deltanet_memory.causal_conv1d_fn",
+        side_effect=_fake_causal_conv1d_fn,
+    ):
+        layer = _build_layer(read_mode="normal", use_causal_conv1d=True)
+        hidden_states = torch.randn(2, 6, layer.d_model)
+        memory_input_states = layer._prepare_memory_input(hidden_states)
+
+        query, _, _, gate, _, _ = layer._project_hidden_states(
+            hidden_states,
+            allow_causal_kernel=True,
+            memory_input_states=memory_input_states,
+        )
+        fast_query, fast_gate = layer._project_read_query_and_gate(
+            hidden_states,
+            allow_causal_kernel=True,
+            memory_input_states=memory_input_states,
+        )
+
+    assert torch.allclose(fast_query, query, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(fast_gate, gate, atol=1e-6, rtol=1e-6)
+
+
+def test_gdn_memory_normal_read_associate_uses_fast_projection_path():
+    layer = _build_layer(read_mode="normal")
+    batch_size = 2
+    layer.reset_memory(batch_size=batch_size)
+    layer.update_mem(
+        torch.randn(batch_size, layer.num_mem_tokens, layer.d_model),
+        input_is_sbh=False,
+    )
+
+    with patch.object(
+        layer,
+        "_project_hidden_states",
+        side_effect=AssertionError("normal read should use read-only projection"),
+    ):
+        retrieved = layer.associate(
+            torch.randn(batch_size, 6, layer.d_model),
+            input_is_sbh=False,
+        )
+
+    assert torch.isfinite(retrieved).all()
 
 
 def test_gdn_memory_buggy_read_mode_still_uses_legacy_delta_rule_path():

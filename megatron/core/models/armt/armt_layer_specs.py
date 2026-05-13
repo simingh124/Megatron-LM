@@ -30,6 +30,7 @@ def get_armt_layer_spec(
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
     num_mem_tokens: int = 16,
+    num_read_mem_tokens: int = 0,
     d_mem: Optional[int] = None,
     armt_n_heads: int = 1,
     armt_head_dim: Optional[int] = None,
@@ -58,7 +59,10 @@ def get_armt_layer_spec(
     recurrent_mem_qk_norm: bool = False,
     recurrent_memory_input_pre_norm: bool = False,
     armt_memory_write_source: str = "mem_tokens",
+    armt_read_memory_mode: str = "none",
+    armt_read_memory_residual: bool = False,
     log_read_position_metrics_to_tensorboard: bool = False,
+    log_read_prefix_attn_mass_to_tensorboard: bool = False,
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
         base_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -101,10 +105,12 @@ def get_armt_layer_spec(
             params={
                 **base_spec.submodules.self_attention.params,
                 "num_mem_tokens": num_mem_tokens,
+                "num_read_mem_tokens": num_read_mem_tokens,
                 "recurrent_chunk_size": recurrent_chunk_size,
                 "full_attn_window_size": full_attn_window_size,
                 "armt_windowed_full_attn_backend": armt_windowed_full_attn_backend,
                 "armt_equal_window_full_attn_path": armt_equal_window_full_attn_path,
+                "armt_read_memory_mode": armt_read_memory_mode,
             },
         )
         base_spec = replace(
@@ -117,6 +123,7 @@ def get_armt_layer_spec(
         submodules=base_spec.submodules,
         params={
             "num_mem_tokens": num_mem_tokens,
+            "num_read_mem_tokens": num_read_mem_tokens,
             "d_mem": d_mem,
             "armt_n_heads": armt_n_heads,
             "armt_head_dim": armt_head_dim,
@@ -145,8 +152,13 @@ def get_armt_layer_spec(
             "recurrent_mem_qk_norm": recurrent_mem_qk_norm,
             "recurrent_memory_input_pre_norm": recurrent_memory_input_pre_norm,
             "armt_memory_write_source": armt_memory_write_source,
+            "armt_read_memory_mode": armt_read_memory_mode,
+            "armt_read_memory_residual": armt_read_memory_residual,
             "log_read_position_metrics_to_tensorboard": (
                 log_read_position_metrics_to_tensorboard
+            ),
+            "log_read_prefix_attn_mass_to_tensorboard": (
+                log_read_prefix_attn_mass_to_tensorboard
             ),
         },
     )

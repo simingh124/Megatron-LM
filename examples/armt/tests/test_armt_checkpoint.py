@@ -42,6 +42,70 @@ def test_memory_embeddings_saved():
         assert armt_state["memory_embeddings"].shape == (8, hidden_size)
 
 
+def test_memory_embeddings_omitted_when_num_mem_tokens_is_zero():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hidden_size = 64
+        baseline = _write_baseline(tmpdir, hidden_size)
+        armt_path = os.path.join(tmpdir, "armt.pt")
+
+        config = ARMTCheckpointConfig(
+            num_mem_tokens=0,
+            hidden_size=hidden_size,
+            num_layers=2,
+            d_mem=hidden_size,
+            armt_n_heads=2,
+            gating=False,
+        )
+        convert_baseline_to_armt(baseline, armt_path, config)
+
+        armt_state = torch.load(armt_path, map_location="cpu")
+        assert "memory_embeddings" not in armt_state
+
+
+def test_shared_read_memory_embeddings_saved():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hidden_size = 64
+        baseline = _write_baseline(tmpdir, hidden_size)
+        armt_path = os.path.join(tmpdir, "armt.pt")
+
+        config = ARMTCheckpointConfig(
+            num_mem_tokens=0,
+            hidden_size=hidden_size,
+            num_layers=2,
+            d_mem=hidden_size,
+            armt_n_heads=2,
+            gating=False,
+            num_read_mem_tokens=6,
+            read_memory_mode="shared",
+        )
+        convert_baseline_to_armt(baseline, armt_path, config)
+
+        armt_state = torch.load(armt_path, map_location="cpu")
+        assert armt_state["read_memory_embeddings"].shape == (6, hidden_size)
+
+
+def test_per_layer_read_memory_embeddings_saved():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hidden_size = 64
+        baseline = _write_baseline(tmpdir, hidden_size)
+        armt_path = os.path.join(tmpdir, "armt.pt")
+
+        config = ARMTCheckpointConfig(
+            num_mem_tokens=0,
+            hidden_size=hidden_size,
+            num_layers=3,
+            d_mem=hidden_size,
+            armt_n_heads=2,
+            gating=False,
+            num_read_mem_tokens=5,
+            read_memory_mode="per_layer",
+        )
+        convert_baseline_to_armt(baseline, armt_path, config)
+
+        armt_state = torch.load(armt_path, map_location="cpu")
+        assert armt_state["read_memory_embeddings"].shape == (3, 5, hidden_size)
+
+
 def test_W_mem_z_not_saved():
     """验证 runtime buffer（W_mem/z）不会被写入 checkpoint（应当不存在于 state_dict keys）。"""
     with tempfile.TemporaryDirectory() as tmpdir:

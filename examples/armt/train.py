@@ -77,6 +77,7 @@ def model_provider(
         use_kitchen_attention=getattr(args, "use_kitchen_attention", False),
         kitchen_attention_backend=getattr(args, "kitchen_attention_backend", "sdpa"),
         num_mem_tokens=args.num_mem_tokens,
+        num_read_mem_tokens=getattr(args, "num_read_mem_tokens", 0),
         d_mem=args.armt_d_mem,
         armt_n_heads=args.armt_n_heads,
         armt_head_dim=getattr(args, "armt_head_dim", None),
@@ -105,8 +106,13 @@ def model_provider(
         recurrent_mem_qk_norm=args.recurrent_mem_qk_norm,
         recurrent_memory_input_pre_norm=args.recurrent_memory_input_pre_norm,
         armt_memory_write_source=getattr(args, "armt_memory_write_source", "mem_tokens"),
+        armt_read_memory_mode=getattr(args, "armt_read_memory_mode", "none"),
+        armt_read_memory_residual=getattr(args, "armt_read_memory_residual", False),
         log_read_position_metrics_to_tensorboard=(
             getattr(args, "armt_log_read_position_metrics_to_tensorboard", False)
+        ),
+        log_read_prefix_attn_mass_to_tensorboard=(
+            getattr(args, "armt_log_read_prefix_attn_mass_to_tensorboard", False)
         ),
     )
 
@@ -118,9 +124,12 @@ def model_provider(
         vocab_size=args.padded_vocab_size,
         max_sequence_length=max_seq_length,
         num_mem_tokens=args.num_mem_tokens,
+        num_read_mem_tokens=getattr(args, "num_read_mem_tokens", 0),
         recurrent_chunk_size=args.recurrent_chunk_size,
         full_attn_window_size=args.full_attn_window_size,
         armt_equal_window_full_attn_path=args.armt_equal_window_full_attn_path,
+        armt_read_memory_mode=getattr(args, "armt_read_memory_mode", "none"),
+        armt_read_memory_residual=getattr(args, "armt_read_memory_residual", False),
         log_layer_metrics_to_tensorboard=getattr(
             args, "armt_log_layer_metrics_to_tensorboard", False
         ),

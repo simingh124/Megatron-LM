@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.models.armt.armt_self_attention import ARMTSelfAttention
+from megatron.core.models.armt.monitoring import finalize_metric_primitives
 
 
 requires_gpu = pytest.mark.skipif(
@@ -27,13 +28,17 @@ def _build_minimal_windowed_attention(
     attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
     torch.nn.Module.__init__(attention)
     attention.num_mem_tokens = num_mem_tokens
+    attention.num_read_mem_tokens = 0
     attention.recurrent_chunk_size = recurrent_chunk_size
     attention.full_attn_window_size = full_attn_window_size
     attention.armt_windowed_full_attn_backend = backend
+    attention.armt_read_memory_mode = "none"
     attention._use_windowed_full_attention = True
     attention._current_chunk_start_position = 0
     attention._history_key_cache = None
     attention._history_value_cache = None
+    attention._collect_monitoring_for_current_iteration = True
+    attention._monitoring_stats = {}
     attention.num_attention_heads_per_partition = query.shape[2]
     attention.num_query_groups_per_partition = query.shape[2]
     attention.hidden_size_per_attention_head = query.shape[3]
@@ -113,6 +118,23 @@ def test_windowed_attention_uses_scaled_dot_product_attention():
     sdpa_mock.assert_called_once()
     assert output.shape == (seq_with_mem, batch_size, num_heads * head_dim)
     assert bias is None
+
+
+def test_windowed_attention_split_excludes_read_prefix_and_write_suffix_from_real_tokens():
+    attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_mem_tokens = 1
+    attention.num_read_mem_tokens = 2
+    attention.armt_read_memory_mode = "shared"
+    attention._skip_read_memory_for_current_chunk = False
+
+    tensor = torch.arange(12, dtype=torch.float32).view(6, 1, 1, 2)
+
+    read_part, real_part, write_part = attention._split_read_real_and_memory_tokens(tensor)
+
+    assert torch.equal(read_part, tensor[:2])
+    assert torch.equal(real_part, tensor[2:5])
+    assert torch.equal(write_part, tensor[5:])
 
 
 def test_windowed_attention_history_update_defers_concatenation():
@@ -204,6 +226,99 @@ def test_windowed_attention_matches_reference_softmax_path():
     ).reshape(seq_with_mem, batch_size, num_heads * head_dim)
 
     assert torch.allclose(output, reference_output, atol=1e-6, rtol=1e-5)
+
+
+def test_read_prefix_attention_mass_metric_uses_context_queries_only():
+    attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_mem_tokens = 1
+    attention.num_read_mem_tokens = 2
+    attention.armt_read_memory_mode = "shared"
+    attention._skip_read_memory_for_current_chunk = False
+    attention._use_windowed_full_attention = False
+    attention._collect_monitoring_for_current_iteration = True
+    attention._monitoring_stats = {}
+    attention.num_attention_heads_per_partition = 1
+    attention.num_query_groups_per_partition = 1
+    attention.hidden_size_per_attention_head = 1
+    attention.layer_number = 1
+    attention.core_attention = SimpleNamespace(softmax_offset=None)
+    attention.pg_collection = SimpleNamespace(cp=None)
+    attention.config = SimpleNamespace(
+        attention_dropout=0.0,
+        sequence_parallel=False,
+        softmax_scale=1.0,
+        apply_query_key_layer_scaling=False,
+        attention_output_gate=False,
+    )
+
+    query = torch.tensor([[[[0.0]]], [[[0.0]]], [[[1.0]]], [[[1.0]]], [[[0.0]]]])
+    key = torch.tensor([[[[2.0]]], [[[0.0]]], [[[-2.0]]], [[[-2.0]]], [[[-2.0]]]])
+    value = torch.zeros_like(key)
+    attention.get_query_key_value_tensors = lambda *args, **kwargs: (query, key, value)
+
+    attention.track_read_prefix_attention_mass(
+        hidden_states=torch.zeros(5, 1, 1),
+        attention_mask=None,
+        rotary_pos_emb=None,
+    )
+
+    metrics = finalize_metric_primitives(attention.consume_monitoring_primitives())
+    expected = (
+        torch.softmax(torch.tensor([2.0, 0.0, -2.0]), dim=0)[:2].sum()
+        + torch.softmax(torch.tensor([2.0, 0.0, -2.0, -2.0]), dim=0)[:2].sum()
+    ) / 2.0
+    assert float(metrics["armt/read_prefix/attn_mass_from_context_mean"]) == pytest.approx(
+        float(expected)
+    )
+
+
+def test_read_prefix_attention_mass_metric_offsets_read_slice_after_history():
+    attention = ARMTSelfAttention.__new__(ARMTSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_mem_tokens = 1
+    attention.num_read_mem_tokens = 2
+    attention.armt_read_memory_mode = "shared"
+    attention._skip_read_memory_for_current_chunk = False
+    attention._use_windowed_full_attention = True
+    attention._collect_monitoring_for_current_iteration = True
+    attention._monitoring_stats = {}
+    attention.num_attention_heads_per_partition = 1
+    attention.num_query_groups_per_partition = 1
+    attention.hidden_size_per_attention_head = 1
+    attention.layer_number = 1
+    attention.core_attention = SimpleNamespace(softmax_offset=None)
+    attention.pg_collection = SimpleNamespace(cp=None)
+    attention.config = SimpleNamespace(
+        attention_dropout=0.0,
+        sequence_parallel=False,
+        softmax_scale=1.0,
+        apply_query_key_layer_scaling=False,
+        attention_output_gate=False,
+    )
+
+    query = torch.tensor([[[[0.0]]], [[[0.0]]], [[[1.0]]], [[[1.0]]], [[[0.0]]]])
+    key = torch.tensor([[[[2.0]]], [[[0.0]]], [[[-2.0]]], [[[-2.0]]], [[[-2.0]]]])
+    value = torch.zeros_like(key)
+    history_key = torch.tensor([[[[5.0]]]])
+    history_value = torch.zeros_like(history_key)
+    attention.get_query_key_value_tensors = lambda *args, **kwargs: (query, key, value)
+    attention._select_history_kv = lambda current_real_seq_len: (history_key, history_value)
+
+    attention.track_read_prefix_attention_mass(
+        hidden_states=torch.zeros(5, 1, 1),
+        attention_mask=None,
+        rotary_pos_emb=None,
+    )
+
+    metrics = finalize_metric_primitives(attention.consume_monitoring_primitives())
+    expected = (
+        torch.softmax(torch.tensor([5.0, 2.0, 0.0, -2.0]), dim=0)[1:3].sum()
+        + torch.softmax(torch.tensor([5.0, 2.0, 0.0, -2.0, -2.0]), dim=0)[1:3].sum()
+    ) / 2.0
+    assert float(metrics["armt/read_prefix/attn_mass_from_context_mean"]) == pytest.approx(
+        float(expected)
+    )
 
 
 @requires_gpu

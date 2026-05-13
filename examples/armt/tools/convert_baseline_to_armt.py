@@ -16,6 +16,8 @@ class ARMTCheckpointConfig:
     d_mem: int
     armt_n_heads: int
     gating: bool
+    num_read_mem_tokens: int = 0
+    read_memory_mode: str = "none"
     armt_head_dim: Optional[int] = None
     init_method_std: float = 0.02
     embedding_init_method_std: Optional[float] = None
@@ -59,12 +61,31 @@ def convert_baseline_to_armt(
     armt_state = dict(baseline_state)
 
     value_dim = _get_armt_value_dim(config)
-    armt_state["memory_embeddings"] = torch.empty(config.num_mem_tokens, config.hidden_size)
-    torch.nn.init.normal_(
-        armt_state["memory_embeddings"],
-        mean=0.0,
-        std=_get_embedding_init_std(config),
-    )
+    if config.num_mem_tokens > 0:
+        armt_state["memory_embeddings"] = torch.empty(config.num_mem_tokens, config.hidden_size)
+        torch.nn.init.normal_(
+            armt_state["memory_embeddings"],
+            mean=0.0,
+            std=_get_embedding_init_std(config),
+        )
+
+    if config.num_read_mem_tokens > 0 and config.read_memory_mode != "none":
+        if config.read_memory_mode == "per_layer":
+            armt_state["read_memory_embeddings"] = torch.empty(
+                config.num_layers,
+                config.num_read_mem_tokens,
+                config.hidden_size,
+            )
+        else:
+            armt_state["read_memory_embeddings"] = torch.empty(
+                config.num_read_mem_tokens,
+                config.hidden_size,
+            )
+        torch.nn.init.normal_(
+            armt_state["read_memory_embeddings"],
+            mean=0.0,
+            std=_get_embedding_init_std(config),
+        )
 
     for layer_idx in range(config.num_layers):
         prefix = f"decoder.layers.{layer_idx}.recurrent_memory_layer."
@@ -108,6 +129,12 @@ def _parse_args():
     parser.add_argument("--baseline-ckpt", type=str, required=True)
     parser.add_argument("--armt-ckpt", type=str, required=True)
     parser.add_argument("--num-mem-tokens", type=int, default=16)
+    parser.add_argument("--num-read-mem-tokens", type=int, default=0)
+    parser.add_argument(
+        "--armt-read-memory-mode",
+        choices=("none", "per_layer", "shared", "initial"),
+        default="none",
+    )
     parser.add_argument("--hidden-size", type=int, required=True)
     parser.add_argument("--num-layers", type=int, required=True)
     parser.add_argument("--armt-d-mem", dest="armt_d_mem", type=int, default=None)
@@ -123,6 +150,8 @@ if __name__ == "__main__":
     args = _parse_args()
     config = ARMTCheckpointConfig(
         num_mem_tokens=args.num_mem_tokens,
+        num_read_mem_tokens=args.num_read_mem_tokens,
+        read_memory_mode=args.armt_read_memory_mode,
         hidden_size=args.hidden_size,
         num_layers=args.num_layers,
         d_mem=args.armt_d_mem or args.hidden_size,

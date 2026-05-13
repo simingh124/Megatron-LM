@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import parallel_state
 from megatron.core.fusions.fused_softmax import SoftmaxOne
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -18,6 +19,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 
+from .monitoring import build_mean_metric
 from .windowed_attention_utils import should_use_windowed_full_attention
 
 
@@ -44,10 +46,12 @@ class ARMTSelfAttention(SelfAttention):
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         num_mem_tokens: int = 16,
+        num_read_mem_tokens: int = 0,
         recurrent_chunk_size: Optional[int] = None,
         full_attn_window_size: Optional[int] = None,
         armt_windowed_full_attn_backend: str = "native",
         armt_equal_window_full_attn_path: str = "legacy",
+        armt_read_memory_mode: str = "none",
     ):
         super().__init__(
             config=config,
@@ -58,18 +62,32 @@ class ARMTSelfAttention(SelfAttention):
             pg_collection=pg_collection,
         )
         self.num_mem_tokens = num_mem_tokens
+        self.num_read_mem_tokens = num_read_mem_tokens
         self.recurrent_chunk_size = recurrent_chunk_size
         self.full_attn_window_size = (
             full_attn_window_size if full_attn_window_size is not None else recurrent_chunk_size
         )
         self.armt_windowed_full_attn_backend = armt_windowed_full_attn_backend
         self.armt_equal_window_full_attn_path = armt_equal_window_full_attn_path
+        self.armt_read_memory_mode = armt_read_memory_mode
+        self._skip_read_memory_for_current_chunk = False
+        self._collect_monitoring_for_current_iteration = True
+        self._monitoring_stats = {}
         self._configure_windowed_full_attention_mode()
         self._current_chunk_start_position = 0
         self.reset_window_kv_cache()
 
     def set_current_chunk_start_position(self, position: int):
         self._current_chunk_start_position = int(position)
+
+    def set_skip_read_memory_for_current_chunk(self, enabled: bool):
+        self._skip_read_memory_for_current_chunk = bool(enabled)
+
+    def set_collect_monitoring_for_current_iteration(self, enabled: bool):
+        self._collect_monitoring_for_current_iteration = bool(enabled)
+
+    def reset_monitoring_stats(self):
+        self._monitoring_stats = {}
 
     def _configure_windowed_full_attention_mode(self):
         self._use_windowed_full_attention = should_use_windowed_full_attention(
@@ -84,14 +102,48 @@ class ARMTSelfAttention(SelfAttention):
         self._history_cache_num_tokens = 0
         self._current_chunk_start_position = 0
 
-    def _split_real_and_memory_tokens(self, tensor: Tensor) -> Tuple[Tensor, Tensor]:
-        if self.num_mem_tokens == 0:
-            return tensor, tensor[:0]
-        if tensor.size(0) < self.num_mem_tokens:
+    def _current_read_mem_tokens(self) -> int:
+        read_memory_mode = getattr(self, "armt_read_memory_mode", "none")
+        num_read_mem_tokens = int(getattr(self, "num_read_mem_tokens", 0))
+        skip_read_memory = bool(getattr(self, "_skip_read_memory_for_current_chunk", False))
+        if read_memory_mode == "none" or num_read_mem_tokens == 0:
+            return 0
+        if skip_read_memory:
+            return 0
+        return num_read_mem_tokens
+
+    def _accumulate_monitoring_stat(self, name: str, value: Tensor) -> None:
+        value = value.detach()
+        if value.numel() != 1:
+            raise ValueError(
+                f"ARMTSelfAttention monitoring expects scalars, got {name}={tuple(value.shape)}"
+            )
+        value = value.reshape(()).to(dtype=torch.float32)
+        current = self._monitoring_stats.get(name)
+        if current is None:
+            self._monitoring_stats[name] = value
+        else:
+            self._monitoring_stats[name] = current + value
+
+    @staticmethod
+    def _count_tensor(count: int, device: torch.device) -> Tensor:
+        return torch.tensor(float(count), device=device, dtype=torch.float32)
+
+    def _split_read_real_and_memory_tokens(self, tensor: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        read_tokens = self._current_read_mem_tokens()
+        write_tokens = self.num_mem_tokens
+        minimum_expected_tokens = read_tokens + write_tokens
+        if tensor.size(0) < minimum_expected_tokens:
             raise ValueError(
                 "ARMT windowed self-attention expects hidden states to contain memory tokens."
             )
-        return tensor[:-self.num_mem_tokens], tensor[-self.num_mem_tokens :]
+        if write_tokens == 0:
+            return tensor[:read_tokens], tensor[read_tokens:], tensor[:0]
+        return (
+            tensor[:read_tokens],
+            tensor[read_tokens:-write_tokens],
+            tensor[-write_tokens:],
+        )
 
     def _select_history_kv(self, current_real_seq_len: int) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         self._ensure_history_cache_lists()
@@ -206,6 +258,216 @@ class ARMTSelfAttention(SelfAttention):
             softmax_scale /= self.layer_number
 
         return softmax_scale
+
+    @staticmethod
+    def _slice_attention_mask_for_query_range(
+        attention_mask: Optional[Tensor],
+        *,
+        query_start: int,
+        query_len: int,
+    ) -> Optional[Tensor]:
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() != 4:
+            raise ValueError(
+                "ARMT read-prefix attention monitoring expects a 4D attention mask, "
+                f"got shape {tuple(attention_mask.shape)}"
+            )
+        return attention_mask[:, :, query_start : query_start + query_len, :]
+
+    @staticmethod
+    def _build_context_query_causal_mask(
+        *,
+        query_start_position: int,
+        query_len: int,
+        key_len: int,
+        history_len: int,
+        device: torch.device,
+    ) -> Tensor:
+        query_positions = torch.arange(query_len, device=device) + query_start_position
+        key_positions = torch.arange(key_len, device=device)
+        max_visible_key = history_len + query_positions.unsqueeze(1)
+        return key_positions.unsqueeze(0) > max_visible_key
+
+    def _apply_rotary_pos_emb_to_query_key(
+        self,
+        query: Tensor,
+        key: Tensor,
+        *,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        if rotary_pos_emb is None:
+            return query, key
+
+        if not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        q_pos_emb, k_pos_emb = rotary_pos_emb
+        if q_pos_emb is not None:
+            query = apply_rotary_pos_emb(
+                query,
+                q_pos_emb,
+                config=self.config,
+                cu_seqlens=None,
+                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                cp_group=self.pg_collection.cp,
+            )
+        if k_pos_emb is not None:
+            key = apply_rotary_pos_emb(
+                key,
+                k_pos_emb,
+                config=self.config,
+                cu_seqlens=None,
+                mscale=_yarn_get_concentration_factor_from_config(self.config),
+                cp_group=self.pg_collection.cp,
+            )
+        return query, key
+
+    def _build_attention_probs(
+        self,
+        query: Tensor,
+        key: Tensor,
+        *,
+        attention_mask: Optional[Tensor],
+    ) -> Tensor:
+        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+            repeats = self.num_attention_heads_per_partition // self.num_query_groups_per_partition
+            key = key.repeat_interleave(repeats, dim=2)
+
+        attention_scores = torch.einsum("tbhd,sbhd->bhts", query.float(), key.float())
+        attention_scores = attention_scores * self._get_softmax_scale()
+
+        if attention_mask is not None:
+            attention_scores = attention_scores.masked_fill(
+                attention_mask.to(device=attention_scores.device, dtype=torch.bool),
+                -10000.0,
+            )
+
+        softmax_offset = getattr(self.core_attention, "softmax_offset", None)
+        if softmax_offset is None:
+            return torch.softmax(attention_scores, dim=-1, dtype=torch.float32)
+
+        return SoftmaxOne(
+            dim=-1,
+            denominator_offset=softmax_offset.to(attention_scores.device),
+        )(attention_scores)
+
+    def track_read_prefix_attention_mass(
+        self,
+        hidden_states: Tensor,
+        *,
+        attention_mask: Optional[Tensor],
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+    ) -> None:
+        if not self._collect_monitoring_for_current_iteration:
+            return
+
+        read_tokens = self._current_read_mem_tokens()
+        if read_tokens == 0:
+            return
+
+        qkv_output = self.get_query_key_value_tensors(
+            hidden_states,
+            None,
+            output_gate=self.config.attention_output_gate,
+            split_qkv=True,
+        )
+        if self.config.attention_output_gate:
+            query, key, _value, _gate = qkv_output
+        else:
+            query, key, _value = qkv_output
+
+        query, key = self._apply_rotary_pos_emb_to_query_key(
+            query,
+            key,
+            rotary_pos_emb=rotary_pos_emb,
+        )
+
+        _, current_real_key, _ = self._split_read_real_and_memory_tokens(key)
+        context_len = current_real_key.size(0)
+        if context_len == 0:
+            return
+
+        history_len = 0
+        key_for_monitoring = key
+        if self._use_windowed_full_attention:
+            history_key, _history_value = self._select_history_kv(current_real_key.size(0))
+            if history_key is not None:
+                history_len = history_key.size(0)
+                key_for_monitoring = torch.cat([history_key, key], dim=0)
+            monitor_mask = self._build_context_query_causal_mask(
+                query_start_position=read_tokens,
+                query_len=context_len,
+                key_len=key_for_monitoring.size(0),
+                history_len=history_len,
+                device=query.device,
+            ).unsqueeze(0).unsqueeze(0)
+        else:
+            monitor_mask = self._slice_attention_mask_for_query_range(
+                attention_mask,
+                query_start=read_tokens,
+                query_len=context_len,
+            )
+            if monitor_mask is None:
+                monitor_mask = self._build_context_query_causal_mask(
+                    query_start_position=read_tokens,
+                    query_len=context_len,
+                    key_len=key_for_monitoring.size(0),
+                    history_len=0,
+                    device=query.device,
+                ).unsqueeze(0).unsqueeze(0)
+
+        context_queries = query[read_tokens : read_tokens + context_len]
+        attention_probs = self._build_attention_probs(
+            context_queries,
+            key_for_monitoring,
+            attention_mask=monitor_mask,
+        )
+        read_prefix_mass = attention_probs[..., history_len : history_len + read_tokens].sum(dim=-1)
+        self._accumulate_monitoring_stat("read_prefix_attn_mass_sum", read_prefix_mass.sum())
+        self._accumulate_monitoring_stat(
+            "read_prefix_attn_mass_count",
+            self._count_tensor(read_prefix_mass.numel(), read_prefix_mass.device),
+        )
+
+    @staticmethod
+    def _reduce_monitoring_scalar_across_tp(value: Tensor) -> Tensor:
+        if not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and parallel_state.model_parallel_is_initialized()
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ):
+            return value
+
+        reduced = value.clone()
+        torch.distributed.all_reduce(
+            reduced,
+            group=parallel_state.get_tensor_model_parallel_group(),
+        )
+        return reduced
+
+    def consume_monitoring_primitives(self):
+        if not self._collect_monitoring_for_current_iteration:
+            self.reset_monitoring_stats()
+            return {}
+
+        stats = self._monitoring_stats
+        primitives = {}
+        if "read_prefix_attn_mass_count" in stats:
+            attn_mass_sum = self._reduce_monitoring_scalar_across_tp(
+                stats["read_prefix_attn_mass_sum"]
+            )
+            attn_mass_count = self._reduce_monitoring_scalar_across_tp(
+                stats["read_prefix_attn_mass_count"]
+            )
+            primitives["armt/read_prefix/attn_mass_from_context_mean"] = build_mean_metric(
+                attn_mass_sum,
+                attn_mass_count,
+            )
+
+        self.reset_monitoring_stats()
+        return primitives
 
     def _compute_windowed_attention(self, query: Tensor, key: Tensor, value: Tensor) -> Tensor:
         batch_size = query.size(1)
@@ -408,8 +670,8 @@ class ARMTSelfAttention(SelfAttention):
                     cp_group=self.pg_collection.cp,
                 )
 
-        current_real_key, _ = self._split_real_and_memory_tokens(key)
-        current_real_value, _ = self._split_real_and_memory_tokens(value)
+        _, current_real_key, _ = self._split_read_real_and_memory_tokens(key)
+        _, current_real_value, _ = self._split_read_real_and_memory_tokens(value)
         history_key, history_value = self._select_history_kv(current_real_key.size(0))
 
         if history_key is not None and history_value is not None:

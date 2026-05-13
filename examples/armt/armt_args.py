@@ -11,6 +11,31 @@ def add_armt_args(parser):
     group = parser.add_argument_group("ARMT", "ARMT specific arguments")
 
     group.add_argument(
+        "--num-read-mem-tokens",
+        type=int,
+        default=0,
+        help="Number of read-memory prefix tokens used by ARMT concat read mode.",
+    )
+    group.add_argument(
+        "--armt-read-memory-mode",
+        choices=("none", "per_layer", "shared", "initial"),
+        default="none",
+        help=(
+            "How ARMT sources read-memory queries before concatenating retrieved read-prefix "
+            "hidden states. 'none' keeps the legacy addition read path."
+        ),
+    )
+    group.add_argument(
+        "--armt-read-memory-residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In read-prefix modes, add the read query back to the retrieved read prefix "
+            "(query + associate(query))."
+        ),
+    )
+
+    group.add_argument(
         "--armt-d-mem",
         dest="armt_d_mem",
         type=int,
@@ -92,6 +117,15 @@ def add_armt_args(parser):
         ),
     )
     group.add_argument(
+        "--armt-log-read-prefix-attn-mass-to-tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Emit armt/read_prefix/attn_mass_from_context_mean by recomputing attention "
+            "probabilities from Q/K on sampled TensorBoard steps."
+        ),
+    )
+    group.add_argument(
         "--armt-memory-write-source",
         choices=("mem_tokens", "post_mlp_context", "post_attn_context", "pre_attn_context"),
         default="mem_tokens",
@@ -126,17 +160,54 @@ def _validate_associative_args(args):
 def validate_armt_constraints(args):
     if not hasattr(args, "no_read_memory_from_first_chunk"):
         args.no_read_memory_from_first_chunk = True
+    if not hasattr(args, "num_read_mem_tokens"):
+        args.num_read_mem_tokens = 0
+    if not hasattr(args, "armt_read_memory_mode"):
+        args.armt_read_memory_mode = "none"
+    if not hasattr(args, "armt_read_memory_residual"):
+        args.armt_read_memory_residual = False
+
+    if args.num_read_mem_tokens < 0:
+        raise ValueError("num_read_mem_tokens must be >= 0")
+
+    if args.armt_read_memory_mode == "none":
+        args.num_read_mem_tokens = 0
+
+    if getattr(args, "armt_read_memory_residual", False) and args.armt_read_memory_mode == "none":
+        raise ValueError(
+            "armt_read_memory_residual requires armt_read_memory_mode to be one of "
+            "initial, shared, or per_layer"
+        )
 
     recurrent_memory_backend = getattr(args, "recurrent_memory_backend", "associative")
     if recurrent_memory_backend == "associative":
         _validate_associative_args(args)
 
+    num_write_mem_tokens = args.num_mem_tokens
     if getattr(args, "armt_memory_write_source", "mem_tokens") != "mem_tokens":
         args.num_mem_tokens = 0
+        num_write_mem_tokens = 0
 
-    return validate_recurrent_constraints(
+    validate_recurrent_constraints(
         args,
         model_name="ARMT",
-        sequence_parallel_extra_tokens=args.num_mem_tokens,
-        divisibility_expr="(recurrent_chunk_size + num_mem_tokens) % TP == 0",
+        sequence_parallel_extra_tokens=args.num_read_mem_tokens + num_write_mem_tokens,
+        divisibility_expr=(
+            "(recurrent_chunk_size + num_read_mem_tokens + num_mem_tokens) % TP == 0"
+        ),
     )
+
+    if (
+        getattr(args, "sequence_parallel", False)
+        and getattr(args, "no_read_memory_from_first_chunk", False)
+        and args.num_read_mem_tokens > 0
+    ):
+        tp = args.tensor_model_parallel_size
+        if (args.recurrent_chunk_size + num_write_mem_tokens) % tp != 0:
+            raise ValueError(
+                "V1 SP safety-mode requires "
+                "(recurrent_chunk_size + num_mem_tokens) % TP == 0 on the first chunk "
+                "when no_read_memory_from_first_chunk=True"
+            )
+
+    return args

@@ -124,6 +124,7 @@ class GatedDeltaNetMemory(nn.Module):
             log_read_position_metrics_to_tensorboard
         )
         self._collect_monitoring_for_current_iteration = True
+        self._read_prefix_mode = False
         self.A_init_range = A_init_range
         self.read_mode = read_mode
 
@@ -193,6 +194,9 @@ class GatedDeltaNetMemory(nn.Module):
 
     def set_collect_monitoring_for_current_iteration(self, enabled: bool):
         self._collect_monitoring_for_current_iteration = bool(enabled)
+
+    def set_read_prefix_mode(self, enabled: bool):
+        self._read_prefix_mode = bool(enabled)
 
     def reset_monitoring_stats(self):
         self._monitoring_stats: Dict[str, torch.Tensor] = {}
@@ -520,6 +524,86 @@ class GatedDeltaNetMemory(nn.Module):
 
         return qkv.transpose(1, 2).contiguous()
 
+    def _apply_query_conv(
+        self,
+        query_projection: torch.Tensor,
+        *,
+        allow_causal_kernel: bool,
+    ) -> torch.Tensor:
+        seq_len = query_projection.shape[1]
+        query_projection = query_projection.transpose(1, 2).contiguous()
+
+        if self.use_causal_conv1d and allow_causal_kernel:
+            query_projection = causal_conv1d_fn(
+                x=query_projection,
+                weight=self.conv1d.weight[: self.qk_dim].squeeze(1),
+                bias=None,
+                activation="silu",
+            )
+        else:
+            query_projection = F.silu(
+                F.conv1d(
+                    query_projection,
+                    self.conv1d.weight[: self.qk_dim],
+                    bias=None,
+                    padding=self.conv_kernel_size - 1,
+                    groups=self.qk_dim,
+                )[..., :seq_len]
+            )
+
+        return query_projection.transpose(1, 2).contiguous()
+
+    def _project_read_query_and_gate(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        allow_causal_kernel: bool,
+        memory_input_states: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project only the tensors required by normal direct-state reads."""
+        if memory_input_states is None:
+            memory_input_states = self._prepare_memory_input(hidden_states)
+
+        query_projection = F.linear(
+            memory_input_states,
+            self.in_proj.weight[: self.qk_dim],
+        )
+        gate_start = self.conv_dim
+        gate_projection = F.linear(
+            memory_input_states,
+            self.in_proj.weight[gate_start : gate_start + self.v_dim],
+        )
+        query_projection = self._apply_query_conv(
+            query_projection,
+            allow_causal_kernel=allow_causal_kernel,
+        )
+
+        batch_size, seq_len = memory_input_states.shape[:2]
+        query = query_projection.reshape(
+            batch_size,
+            seq_len,
+            self.num_key_heads,
+            self.key_head_dim,
+        )
+        gate = gate_projection.reshape(
+            batch_size,
+            seq_len,
+            self.num_value_heads,
+            self.value_head_dim,
+        )
+
+        if self.use_qk_l2norm:
+            if self.use_fla_kernel:
+                query = fla_l2norm(query.contiguous())
+            else:
+                query = F.normalize(query.float(), dim=-1, p=2.0).to(gate.dtype)
+
+        if self.num_value_heads // self.num_key_heads > 1:
+            repeat = self.num_value_heads // self.num_key_heads
+            query = query.repeat_interleave(repeat, dim=2)
+
+        return query.contiguous(), gate.contiguous()
+
     def _project_hidden_states(
         self,
         hidden_states: torch.Tensor,
@@ -678,19 +762,24 @@ class GatedDeltaNetMemory(nn.Module):
         self._maybe_initialize_memory(
             batch_size=hidden_states.shape[0], device=hidden_states.device
         )
-        should_track_read_metrics = not self._first_chunk
+        should_track_read_metrics = not self._first_chunk and not self._read_prefix_mode
 
         if self._first_chunk:
             result = torch.zeros_like(hidden_states)
         else:
-            query, _, _, gate, _, alpha = self._project_hidden_states(
-                hidden_states,
-                allow_causal_kernel=True,
-                memory_input_states=memory_input_states,
-            )
             if self.read_mode == "buggy":
+                query, _, _, gate, _, alpha = self._project_hidden_states(
+                    hidden_states,
+                    allow_causal_kernel=True,
+                    memory_input_states=memory_input_states,
+                )
                 result = self._associate_via_buggy_delta_rule(query, gate, alpha)
             else:
+                query, gate = self._project_read_query_and_gate(
+                    hidden_states,
+                    allow_causal_kernel=True,
+                    memory_input_states=memory_input_states,
+                )
                 result = self._associate_via_direct_state(query, gate)
 
         if should_track_read_metrics and self._collect_monitoring_for_current_iteration:

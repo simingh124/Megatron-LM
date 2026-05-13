@@ -464,6 +464,7 @@ def test_model_provider_threads_gdn_read_mode_to_layer_spec():
         use_kitchen_attention=False,
         kitchen_attention_backend="sdpa",
         num_mem_tokens=4,
+        num_read_mem_tokens=6,
         armt_d_mem=64,
         armt_n_heads=1,
         armt_head_dim=None,
@@ -490,7 +491,10 @@ def test_model_provider_threads_gdn_read_mode_to_layer_spec():
         recurrent_slot_read_attn_backend="sdpa",
         recurrent_mem_qk_norm=False,
         recurrent_memory_input_pre_norm=True,
+        armt_read_memory_mode="shared",
+        armt_read_memory_residual=False,
         armt_log_read_position_metrics_to_tensorboard=False,
+        armt_log_read_prefix_attn_mass_to_tensorboard=True,
         max_position_embeddings=128,
         seq_length=64,
         padded_vocab_size=32000,
@@ -517,11 +521,18 @@ def test_model_provider_threads_gdn_read_mode_to_layer_spec():
         armt_train_entry, "get_armt_layer_spec", return_value="layer_spec"
     ) as layer_spec_mock, patch.object(
         armt_train_entry, "ARMTModel", return_value=fake_model
-    ):
+    ) as model_ctor_mock:
         model = armt_train_entry.model_provider()
 
     assert model is fake_model
     assert layer_spec_mock.call_args.kwargs["recurrent_gdn_read_mode"] == "buggy"
+    assert layer_spec_mock.call_args.kwargs["num_read_mem_tokens"] == 6
+    assert layer_spec_mock.call_args.kwargs["armt_read_memory_mode"] == "shared"
+    assert layer_spec_mock.call_args.kwargs["armt_read_memory_residual"] is False
+    assert layer_spec_mock.call_args.kwargs["log_read_prefix_attn_mass_to_tensorboard"] is True
+    assert model_ctor_mock.call_args.kwargs["num_read_mem_tokens"] == 6
+    assert model_ctor_mock.call_args.kwargs["armt_read_memory_mode"] == "shared"
+    assert model_ctor_mock.call_args.kwargs["armt_read_memory_residual"] is False
 
 
 class TestARMTTraining:

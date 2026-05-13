@@ -83,6 +83,38 @@ class TestARMTModel:
             ),
         ]
 
+    @pytest.mark.parametrize(
+        ("read_memory_mode", "expected_shape"),
+        [
+            ("shared", (3, 8)),
+            ("initial", (3, 8)),
+            ("per_layer", (2, 3, 8)),
+        ],
+    )
+    def test_armt_model_top_level_read_memory_embeddings_shape(
+        self,
+        read_memory_mode,
+        expected_shape,
+    ):
+        config = _build_config(hidden_size=8, num_layers=2)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=0,
+                num_read_mem_tokens=3,
+                armt_read_memory_mode=read_memory_mode,
+            )
+
+        assert model.read_memory_embeddings is not None
+        assert tuple(model.read_memory_embeddings.shape) == expected_shape
+
     def test_armt_model_omits_memory_embeddings_parameter_when_num_mem_tokens_is_zero(self):
         config = _build_config(hidden_size=8)
 
@@ -253,6 +285,84 @@ class TestARMTModel:
 
         stripped = model._strip_memory_tokens(concat_hidden, S)
         assert stripped.shape == (S, B, H)
+
+    def test_armt_model_read_prefix_concat_strip_and_first_chunk_skip(self):
+        config = _build_config(hidden_size=8)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=1,
+                num_read_mem_tokens=2,
+                armt_read_memory_mode="shared",
+            )
+
+        decoder_input = torch.randn(4, 2, 8)
+
+        concat_hidden = model._concat_memory_embeddings(decoder_input)
+        assert concat_hidden.shape == (7, 2, 8)
+        assert model._strip_memory_tokens(concat_hidden, 4).shape == (4, 2, 8)
+
+        model.set_skip_read_memory_for_current_chunk(True)
+        concat_hidden = model._concat_memory_embeddings(decoder_input)
+        assert concat_hidden.shape == (5, 2, 8)
+        assert model._strip_memory_tokens(concat_hidden, 4).shape == (4, 2, 8)
+
+    def test_armt_model_configures_per_layer_read_memory_slices(self):
+        config = _build_config(hidden_size=8, num_layers=2)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=0,
+                num_read_mem_tokens=3,
+                armt_read_memory_mode="per_layer",
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+        layer_one.set_current_layer_read_memory_embeddings = MagicMock()
+        layer_two.set_current_layer_read_memory_embeddings = MagicMock()
+        model.add_module("armt_layer_one", layer_one)
+        model.add_module("armt_layer_two", layer_two)
+
+        model._configure_layers_for_current_forward()
+
+        assert layer_one.set_current_layer_read_memory_embeddings.call_count == 1
+        assert layer_two.set_current_layer_read_memory_embeddings.call_count == 1
+        assert torch.equal(
+            layer_one.set_current_layer_read_memory_embeddings.call_args.args[0],
+            model.read_memory_embeddings[0],
+        )
+        assert torch.equal(
+            layer_two.set_current_layer_read_memory_embeddings.call_args.args[0],
+            model.read_memory_embeddings[1],
+        )
+
+        layer_one.set_current_layer_read_memory_embeddings.reset_mock()
+        layer_two.set_current_layer_read_memory_embeddings.reset_mock()
+        model.set_skip_read_memory_for_current_chunk(True)
+        model._configure_layers_for_current_forward()
+
+        layer_one.set_current_layer_read_memory_embeddings.assert_called_once_with(None)
+        layer_two.set_current_layer_read_memory_embeddings.assert_called_once_with(None)
 
     def test_armt_model_reset_all_memory(self):
         """验证 reset_all_memory 会遍历并调用每个 ARMTLayer.reset_memory。"""
