@@ -10,7 +10,7 @@
 - `lr` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-lr` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 - `metric` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-metric` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 - `omit` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-omit` and currently starts from `armt` commit `e5549212d`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
-- `wofst` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-wofst` and currently starts from `armt` commit `b2b06ade7`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
+- `hadamard` lives in sibling worktree `/mnt/step3-abla/siming/code_repo/Megatron-LM-hadamard` and currently starts from `armt` commit `35fd7ae00`. If it needs to be recreated from a newer `armt`, remove the sibling worktree first and then create the branch/worktree explicitly from the refreshed `armt` HEAD.
 
 ## Safe Branch Integration
 - Before merging another branch into `armt`, run `git log --oneline --left-right --cherry-pick --graph armt...<branch>` and `git diff --name-status --find-renames armt...<branch>` to estimate divergence and overlap.
