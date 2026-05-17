@@ -31,6 +31,16 @@ class _DummyMemoryLayer(torch.nn.Module):
         self.set_collect_monitoring_for_current_iteration = MagicMock()
 
 
+class _ScaleSeqMixer(torch.nn.Module):
+    def __init__(self, scale: float):
+        super().__init__()
+        self.scale = scale
+
+    def forward(self, x, *, input_is_sbh: bool):
+        assert input_is_sbh
+        return x * self.scale
+
+
 class TestARMTLayer:
     @pytest.fixture
     def mock_config(self):
@@ -352,6 +362,127 @@ class TestARMTLayer:
         layer.recurrent_memory_layer.set_collect_monitoring_for_current_iteration.assert_called_once_with(
             False
         )
+
+    def test_armt_layer_seq_mixer_metrics_absent_when_mixer_disabled(self, mock_config):
+        monitored_hidden = torch.tensor(
+            [
+                [[3.0, 4.0]],
+                [[0.0, 5.0]],
+                [[1.0, 0.0]],
+                [[0.0, 2.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=2,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(monitored_hidden))
+            layer.seq_mixer = None
+            layer._forward_attention = MagicMock(return_value=(monitored_hidden, None))
+            layer._forward_mlp = MagicMock(return_value=monitored_hidden)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            layer.forward(monitored_hidden, attention_mask=None)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert not any(name.startswith("armt/seq_mixer/") for name in metrics)
+
+    def test_armt_layer_seq_mixer_metrics_absent_when_monitoring_disabled(self, mock_config):
+        monitored_hidden = torch.tensor(
+            [
+                [[3.0, 4.0]],
+                [[0.0, 5.0]],
+                [[1.0, 0.0]],
+                [[0.0, 2.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=2,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(monitored_hidden))
+            layer.seq_mixer = _ScaleSeqMixer(scale=2.0)
+            layer._forward_attention = MagicMock(return_value=(monitored_hidden, None))
+            layer._forward_mlp = MagicMock(return_value=monitored_hidden)
+
+        layer.set_collect_monitoring_for_current_iteration(False)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            layer.forward(monitored_hidden, attention_mask=None)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert metrics == {}
+        updated = layer.recurrent_memory_layer.update_mem.call_args.args[0]
+        assert torch.equal(updated, monitored_hidden[-2:] * 2.0)
+
+    def test_armt_layer_seq_mixer_metrics_use_exact_mixer_input_and_output(self, mock_config):
+        monitored_hidden = torch.tensor(
+            [
+                [[3.0, 4.0]],
+                [[0.0, 5.0]],
+                [[1.0, 0.0]],
+                [[0.0, 2.0]],
+            ]
+        )
+
+        def _minimal_init(self, config, submodules, layer_number=1, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.config = config
+            self.submodules_config = submodules
+
+        with patch(
+            "megatron.core.models.armt.armt_layer.TransformerLayer.__init__",
+            new=_minimal_init,
+        ):
+            layer = ARMTLayer(
+                config=mock_config,
+                submodules=MagicMock(),
+                layer_number=1,
+                num_mem_tokens=2,
+            )
+            layer.recurrent_memory_layer = _DummyMemoryLayer(torch.zeros_like(monitored_hidden))
+            layer.seq_mixer = _ScaleSeqMixer(scale=2.0)
+            layer._forward_attention = MagicMock(return_value=(monitored_hidden, None))
+            layer._forward_mlp = MagicMock(return_value=monitored_hidden)
+
+        with patch.object(layer, "_prepare_hidden_states_for_memory_ops", side_effect=lambda x: x):
+            layer.forward(monitored_hidden, attention_mask=None)
+
+        metrics = finalize_metric_primitives(layer.consume_monitoring_primitives())
+
+        assert float(metrics["armt/seq_mixer/input_norm_mean"]) == pytest.approx(1.5)
+        assert float(metrics["armt/seq_mixer/output_norm_mean"]) == pytest.approx(3.0)
+        assert float(metrics["armt/seq_mixer/output_to_input_norm_ratio"]) == pytest.approx(2.0)
+        assert float(metrics["armt/seq_mixer/delta_to_input_norm_ratio"]) == pytest.approx(1.0)
+        assert float(metrics["armt/seq_mixer/input_output_cosine_mean"]) == pytest.approx(1.0)
+        updated = layer.recurrent_memory_layer.update_mem.call_args.args[0]
+        assert torch.equal(updated, monitored_hidden[-2:] * 2.0)
 
     def test_armt_layer_sequence_parallel_monitoring_gathers_full_hidden_states(
         self, mock_config

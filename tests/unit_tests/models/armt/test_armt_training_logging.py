@@ -9,10 +9,13 @@ from megatron.core.models.armt.monitoring import (
     build_ratio_metric,
     build_ratio_of_means_metric,
     build_rms_metric,
+    clear_armt_tensorboard_metrics,
     consume_armt_tensorboard_metrics,
     publish_armt_tensorboard_metrics,
 )
+from megatron.core.models.armt.armt_layer import ARMTLayer
 from megatron.training.training import (
+    _publish_armt_seq_mixer_grad_norm_metrics,
     _should_collect_armt_monitoring_for_iteration,
     _write_scalar_metrics_to_tensorboard,
     training_log,
@@ -31,6 +34,136 @@ def test_armt_monitoring_collection_follows_tensorboard_interval():
 
     args.disable_tensorboard_writer = True
     assert _should_collect_armt_monitoring_for_iteration(args, 9) is False
+
+
+def _make_armt_layer_with_seq_mixer(layer_number: int, grad_values):
+    def _minimal_init(self, config=None, submodules=None, layer_number=1, **kwargs):
+        del config, submodules, kwargs
+        torch.nn.Module.__init__(self)
+        self.layer_number = layer_number
+
+    with patch.object(ARMTLayer, "__init__", new=_minimal_init):
+        layer = ARMTLayer(layer_number=layer_number)
+
+    layer.seq_mixer = torch.nn.Linear(len(grad_values), 1, bias=False)
+    layer.seq_mixer.weight.grad = torch.tensor([grad_values], dtype=torch.float32)
+    return layer
+
+
+def _fake_grad_norm(grads_for_norm, grad_stats_parallel_group=None):
+    del grad_stats_parallel_group
+    square_sum = torch.tensor(0.0)
+    for grad in grads_for_norm:
+        square_sum = square_sum + grad.float().pow(2).sum()
+    return float(torch.sqrt(square_sum))
+
+
+def test_seq_mixer_grad_norm_helper_skips_unsampled_iterations():
+    clear_armt_tensorboard_metrics()
+    model = torch.nn.ModuleList([_make_armt_layer_with_seq_mixer(1, [3.0, 4.0])])
+    args = SimpleNamespace(
+        tensorboard_dir="/tmp/tensorboard",
+        disable_tensorboard_writer=False,
+        tensorboard_log_interval=2,
+        armt_log_layer_metrics_to_tensorboard=True,
+    )
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False),
+        get_grad_stats_parallel_group=MagicMock(return_value=object()),
+        tp_group=object(),
+    )
+
+    with (
+        patch("megatron.training.training.get_grad_norm_fp32") as grad_norm_mock,
+        patch(
+            "megatron.training.training.tensor_parallel.param_is_not_tensor_parallel_duplicate",
+            return_value=True,
+        ),
+    ):
+        _publish_armt_seq_mixer_grad_norm_metrics(model, optimizer, args, iteration=0)
+
+    grad_norm_mock.assert_not_called()
+    assert consume_armt_tensorboard_metrics() == {}
+
+
+def test_seq_mixer_grad_norm_helper_publishes_aggregate_metric():
+    clear_armt_tensorboard_metrics()
+    model = torch.nn.ModuleList(
+        [
+            _make_armt_layer_with_seq_mixer(1, [3.0, 4.0]),
+            _make_armt_layer_with_seq_mixer(2, [0.0, 12.0]),
+        ]
+    )
+    args = SimpleNamespace(
+        tensorboard_dir="/tmp/tensorboard",
+        disable_tensorboard_writer=False,
+        tensorboard_log_interval=2,
+        armt_log_layer_metrics_to_tensorboard=False,
+    )
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False),
+        get_grad_stats_parallel_group=MagicMock(return_value=object()),
+        tp_group=object(),
+    )
+
+    with (
+        patch("megatron.training.training.get_grad_norm_fp32", side_effect=_fake_grad_norm),
+        patch(
+            "megatron.training.training.reduce_max_stat_across_model_parallel_group",
+            side_effect=lambda value: value,
+        ),
+        patch(
+            "megatron.training.training.tensor_parallel.param_is_not_tensor_parallel_duplicate",
+            return_value=True,
+        ),
+    ):
+        _publish_armt_seq_mixer_grad_norm_metrics(model, optimizer, args, iteration=1)
+
+    metrics = consume_armt_tensorboard_metrics()
+
+    assert float(metrics["armt/seq_mixer/grad_norm"]) == pytest.approx(13.0)
+    assert "armt/seq_mixer/grad_norm/layer_01" not in metrics
+    assert "armt/seq_mixer/grad_norm/layer_02" not in metrics
+
+
+def test_seq_mixer_grad_norm_helper_layer_metrics_follow_flag():
+    clear_armt_tensorboard_metrics()
+    model = torch.nn.ModuleList(
+        [
+            _make_armt_layer_with_seq_mixer(1, [3.0, 4.0]),
+            _make_armt_layer_with_seq_mixer(2, [0.0, 12.0]),
+        ]
+    )
+    args = SimpleNamespace(
+        tensorboard_dir="/tmp/tensorboard",
+        disable_tensorboard_writer=False,
+        tensorboard_log_interval=2,
+        armt_log_layer_metrics_to_tensorboard=True,
+    )
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=False),
+        get_grad_stats_parallel_group=MagicMock(return_value=object()),
+        tp_group=object(),
+    )
+
+    with (
+        patch("megatron.training.training.get_grad_norm_fp32", side_effect=_fake_grad_norm),
+        patch(
+            "megatron.training.training.reduce_max_stat_across_model_parallel_group",
+            side_effect=lambda value: value,
+        ),
+        patch(
+            "megatron.training.training.tensor_parallel.param_is_not_tensor_parallel_duplicate",
+            return_value=True,
+        ),
+    ):
+        _publish_armt_seq_mixer_grad_norm_metrics(model, optimizer, args, iteration=1)
+
+    metrics = consume_armt_tensorboard_metrics()
+
+    assert float(metrics["armt/seq_mixer/grad_norm"]) == pytest.approx(13.0)
+    assert float(metrics["armt/seq_mixer/grad_norm/layer_01"]) == pytest.approx(5.0)
+    assert float(metrics["armt/seq_mixer/grad_norm/layer_02"]) == pytest.approx(12.0)
 
 
 def test_training_log_writes_armt_metrics_only_to_tensorboard():

@@ -337,6 +337,7 @@ DATA_ARGS=(
   --num-workers ${NUM_WORKERS}
   --tokenizer-type HuggingFaceTokenizer
   --tokenizer-model "${TOKENIZER_DIR}"
+  --tokenizer-hf-use-fast
 )
 
 CKPT_AND_LOG_ARGS=(

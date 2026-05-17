@@ -104,6 +104,15 @@ def model_provider(
         log_read_position_metrics_to_tensorboard=(
             getattr(args, "armt_log_read_position_metrics_to_tensorboard", False)
         ),
+        armt_seq_mixer_type=getattr(args, "armt_seq_mixer_type", "none"),
+        armt_seq_mixer_init=getattr(args, "armt_seq_mixer_init", "identity"),
+        armt_seq_mixer_mlp_expansion=getattr(args, "armt_seq_mixer_mlp_expansion", 2),
+        armt_seq_mixer_attn_num_heads=getattr(args, "armt_seq_mixer_attn_num_heads", 1),
+        armt_seq_mixer_attn_head_dim=getattr(args, "armt_seq_mixer_attn_head_dim", None),
+        armt_seq_mixer_attn_residual=getattr(args, "armt_seq_mixer_attn_residual", True),
+        armt_seq_mixer_attn_prenorm=getattr(args, "armt_seq_mixer_attn_prenorm", True),
+        armt_seq_mixer_attn_backend=getattr(args, "armt_seq_mixer_attn_backend", "flash"),
+        recurrent_chunk_size=getattr(args, "recurrent_chunk_size", None),
     )
 
     max_seq_length = getattr(args, "max_position_embeddings", args.seq_length)

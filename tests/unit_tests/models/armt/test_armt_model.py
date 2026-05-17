@@ -82,6 +82,77 @@ class TestARMTModel:
             ),
         ]
 
+    def test_armt_model_memory_parameter_breakdown_includes_seq_mixer(self):
+        """seq_mixer sits on the memory write path and should count as memory params."""
+        config = _build_config(hidden_size=8)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        memory_module = torch.nn.Linear(8, 4, bias=False)
+        seq_mixer = torch.nn.Linear(16, 16, bias=False)  # e.g. mlp1 with seq_len=16
+        layer.recurrent_memory_layer = memory_module
+        layer.seq_mixer = seq_mixer
+        model.add_module("armt_layer", layer)
+
+        breakdown = model.get_memory_parameter_breakdown()
+
+        assert breakdown == [
+            ("memory_embeddings", 32),
+            (
+                "armt_layer.recurrent_memory_layer",
+                sum(p.numel() for p in memory_module.parameters()),
+            ),
+            (
+                "armt_layer.seq_mixer",
+                sum(p.numel() for p in seq_mixer.parameters()),
+            ),
+        ]
+
+    def test_armt_model_memory_parameter_breakdown_skips_absent_seq_mixer(self):
+        """When seq_mixer is None (mixer disabled) it must not appear in the breakdown."""
+        config = _build_config(hidden_size=8)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=4,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+
+        layer.recurrent_memory_layer = torch.nn.Linear(8, 4, bias=False)
+        layer.seq_mixer = None
+        model.add_module("armt_layer", layer)
+
+        names = [name for name, _ in model.get_memory_parameter_breakdown()]
+        assert "armt_layer.seq_mixer" not in names
+
     def test_armt_model_omits_memory_embeddings_parameter_when_num_mem_tokens_is_zero(self):
         config = _build_config(hidden_size=8)
 
@@ -651,6 +722,155 @@ class TestARMTModel:
         assert "armt/read/retrieved_norm_mean/pos_0000/layer_02" not in metrics
         assert "armt/read/retrieved_to_hidden_ratio/pos_0000/layer_01" not in metrics
         assert "armt/read/retrieved_to_hidden_ratio/pos_0000/layer_02" not in metrics
+
+    def test_armt_model_seq_mixer_forward_metrics_aggregate_across_layers(self):
+        config = _build_config(hidden_size=256)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+        layer_one.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/seq_mixer/input_norm_mean": build_mean_metric(
+                    torch.tensor(3.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_norm_mean": build_mean_metric(
+                    torch.tensor(6.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(6.0),
+                    torch.tensor(3.0),
+                ),
+                "armt/seq_mixer/delta_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(3.0),
+                    torch.tensor(3.0),
+                ),
+                "armt/seq_mixer/input_output_cosine_mean": build_mean_metric(
+                    torch.tensor(2.0),
+                    torch.tensor(2.0),
+                ),
+            }
+        )
+        layer_two.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/seq_mixer/input_norm_mean": build_mean_metric(
+                    torch.tensor(5.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_norm_mean": build_mean_metric(
+                    torch.tensor(15.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(15.0),
+                    torch.tensor(5.0),
+                ),
+                "armt/seq_mixer/delta_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(10.0),
+                    torch.tensor(5.0),
+                ),
+                "armt/seq_mixer/input_output_cosine_mean": build_mean_metric(
+                    torch.tensor(1.0),
+                    torch.tensor(2.0),
+                ),
+            }
+        )
+        model.add_module("armt_layer_one", layer_one)
+        model.add_module("armt_layer_two", layer_two)
+
+        metrics = model.consume_all_monitoring_metrics()
+
+        assert float(metrics["armt/seq_mixer/input_norm_mean"]) == pytest.approx(2.0)
+        assert float(metrics["armt/seq_mixer/output_norm_mean"]) == pytest.approx(21.0 / 4.0)
+        assert float(metrics["armt/seq_mixer/output_to_input_norm_ratio"]) == pytest.approx(
+            21.0 / 8.0
+        )
+        assert float(metrics["armt/seq_mixer/delta_to_input_norm_ratio"]) == pytest.approx(
+            13.0 / 8.0
+        )
+        assert float(metrics["armt/seq_mixer/input_output_cosine_mean"]) == pytest.approx(0.75)
+        assert "armt/seq_mixer/input_norm_mean/layer_01" not in metrics
+        assert "armt/seq_mixer/input_norm_mean/layer_02" not in metrics
+
+    def test_armt_model_seq_mixer_forward_layer_metrics_are_gated(self):
+        config = _build_config(hidden_size=256)
+
+        with patch(
+            "megatron.core.models.armt.armt_model.GPTModel.__init__",
+            new=_minimal_gpt_init,
+        ):
+            model = ARMTModel(
+                config=config,
+                transformer_layer_spec=MagicMock(),
+                vocab_size=32000,
+                max_sequence_length=2048,
+                num_mem_tokens=16,
+                log_layer_metrics_to_tensorboard=True,
+            )
+
+        with patch(
+            "megatron.core.models.armt.armt_model.ARMTLayer.__init__",
+            new=_minimal_armt_layer_init,
+        ):
+            layer_one = ARMTLayer(config=config, submodules=MagicMock(), layer_number=1)
+            layer_two = ARMTLayer(config=config, submodules=MagicMock(), layer_number=2)
+
+        layer_one.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/seq_mixer/input_norm_mean": build_mean_metric(
+                    torch.tensor(3.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(6.0),
+                    torch.tensor(3.0),
+                ),
+            }
+        )
+        layer_two.consume_monitoring_primitives = MagicMock(
+            return_value={
+                "armt/seq_mixer/input_norm_mean": build_mean_metric(
+                    torch.tensor(5.0),
+                    torch.tensor(2.0),
+                ),
+                "armt/seq_mixer/output_to_input_norm_ratio": build_ratio_metric(
+                    torch.tensor(15.0),
+                    torch.tensor(5.0),
+                ),
+            }
+        )
+        model.add_module("armt_layer_one", layer_one)
+        model.add_module("armt_layer_two", layer_two)
+
+        metrics = model.consume_all_monitoring_metrics()
+
+        assert float(metrics["armt/seq_mixer/input_norm_mean"]) == pytest.approx(2.0)
+        assert float(metrics["armt/seq_mixer/input_norm_mean/layer_01"]) == pytest.approx(1.5)
+        assert float(metrics["armt/seq_mixer/input_norm_mean/layer_02"]) == pytest.approx(2.5)
+        assert float(
+            metrics["armt/seq_mixer/output_to_input_norm_ratio/layer_01"]
+        ) == pytest.approx(2.0)
+        assert float(
+            metrics["armt/seq_mixer/output_to_input_norm_ratio/layer_02"]
+        ) == pytest.approx(3.0)
 
     def test_armt_model_rope_extension(self):
         """验证 _preprocess 在拼接 memory tokens 后会重新生成/扩展 RoPE 到 S+M。"""

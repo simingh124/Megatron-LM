@@ -52,6 +52,15 @@ def get_armt_layer_spec(
     recurrent_memory_input_pre_norm: bool = False,
     armt_memory_write_source: str = "mem_tokens",
     log_read_position_metrics_to_tensorboard: bool = False,
+    armt_seq_mixer_type: str = "none",
+    armt_seq_mixer_init: str = "identity",
+    armt_seq_mixer_mlp_expansion: int = 2,
+    armt_seq_mixer_attn_num_heads: int = 1,
+    armt_seq_mixer_attn_head_dim: Optional[int] = None,
+    armt_seq_mixer_attn_residual: bool = True,
+    armt_seq_mixer_attn_prenorm: bool = True,
+    armt_seq_mixer_attn_backend: str = "flash",
+    recurrent_chunk_size: Optional[int] = None,
 ) -> ModuleSpec:
     if transformer_impl == "transformer_engine":
         base_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -116,5 +125,14 @@ def get_armt_layer_spec(
             "log_read_position_metrics_to_tensorboard": (
                 log_read_position_metrics_to_tensorboard
             ),
+            "armt_seq_mixer_type": armt_seq_mixer_type,
+            "armt_seq_mixer_init": armt_seq_mixer_init,
+            "armt_seq_mixer_mlp_expansion": armt_seq_mixer_mlp_expansion,
+            "armt_seq_mixer_attn_num_heads": armt_seq_mixer_attn_num_heads,
+            "armt_seq_mixer_attn_head_dim": armt_seq_mixer_attn_head_dim,
+            "armt_seq_mixer_attn_residual": armt_seq_mixer_attn_residual,
+            "armt_seq_mixer_attn_prenorm": armt_seq_mixer_attn_prenorm,
+            "armt_seq_mixer_attn_backend": armt_seq_mixer_attn_backend,
+            "recurrent_chunk_size": recurrent_chunk_size,
         },
     )

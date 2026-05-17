@@ -100,15 +100,25 @@ class ARMTModel(GPTModel):
                 continue
 
             backend_module = getattr(module, "recurrent_memory_layer", None)
-            if backend_module is None:
-                continue
-
-            breakdown.append(
-                (
-                    f"{module_name}.recurrent_memory_layer",
-                    sum(param.numel() for param in backend_module.parameters()),
+            if backend_module is not None:
+                breakdown.append(
+                    (
+                        f"{module_name}.recurrent_memory_layer",
+                        sum(param.numel() for param in backend_module.parameters()),
+                    )
                 )
-            )
+
+            # The seq mixer is a per-layer module on the memory write path
+            # (between _resolve_write_source and update_mem); count it under
+            # the same memory budget as the recurrent backend.
+            seq_mixer = getattr(module, "seq_mixer", None)
+            if seq_mixer is not None:
+                breakdown.append(
+                    (
+                        f"{module_name}.seq_mixer",
+                        sum(param.numel() for param in seq_mixer.parameters()),
+                    )
+                )
 
         return breakdown
 

@@ -114,7 +114,7 @@ from megatron.training.pytorch_profiler_utils import build_pytorch_profiler_trac
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, param_is_not_shared
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
@@ -132,6 +132,7 @@ except ImportError:
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
+from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -150,7 +151,10 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.models.armt.armt_layer import ARMTLayer
 from megatron.core.models.armt.monitoring import (
+    accumulate_armt_tensorboard_metrics,
+    build_mean_metric,
     clear_armt_tensorboard_metrics,
     consume_armt_tensorboard_metrics,
 )
@@ -1848,6 +1852,127 @@ def _set_collect_armt_monitoring_for_current_iteration(model, enabled: bool) -> 
             setter(bool(enabled))
 
 
+def _iter_armt_layers_in_model_chunks(model):
+    model_chunks = model if isinstance(model, list) else [model]
+    fallback_layer_idx = 0
+    for model_chunk in model_chunks:
+        unwrapped_model_chunk = unwrap_model(model_chunk)
+        modules = getattr(unwrapped_model_chunk, "modules", None)
+        if not callable(modules):
+            continue
+        for module in modules():
+            if isinstance(module, ARMTLayer):
+                fallback_layer_idx += 1
+                layer_number = getattr(module, "layer_number", fallback_layer_idx)
+                yield module, int(layer_number)
+
+
+def _get_optimizer_grad_stats_parallel_group(optimizer):
+    getter = getattr(optimizer, "get_grad_stats_parallel_group", None)
+    if not callable(getter):
+        return None
+    return getter()
+
+
+def _optimizer_uses_decoupled_grad_for_norm(optimizer) -> bool:
+    config = getattr(optimizer, "config", None)
+    return bool(getattr(config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False))
+
+
+def _get_armt_seq_mixer_param_grad_for_norm(param, *, use_decoupled_grad: bool):
+    if getattr(param, "__fsdp_param__", False):
+        return param.grad._local_tensor if param.grad is not None else None
+    if use_decoupled_grad:
+        return param.decoupled_grad if hasattr(param, "decoupled_grad") else None
+    return param.grad
+
+
+def _collect_armt_seq_mixer_grad_tensors(layer, optimizer) -> list[torch.Tensor]:
+    seq_mixer = getattr(layer, "seq_mixer", None)
+    if seq_mixer is None:
+        return []
+
+    grads_for_norm = []
+    use_decoupled_grad = _optimizer_uses_decoupled_grad_for_norm(optimizer)
+    tp_group = getattr(optimizer, "tp_group", None)
+    for param in seq_mixer.parameters():
+        grad = _get_armt_seq_mixer_param_grad_for_norm(
+            param,
+            use_decoupled_grad=use_decoupled_grad,
+        )
+        if (
+            grad is not None
+            and param_is_not_shared(param)
+            and tensor_parallel.param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+        ):
+            grads_for_norm.append(grad)
+
+    return grads_for_norm
+
+
+def _compute_armt_seq_mixer_grad_norm(grads_for_norm, grad_stats_parallel_group):
+    if not grads_for_norm:
+        return None
+    grad_norm = get_grad_norm_fp32(
+        grads_for_norm,
+        grad_stats_parallel_group=grad_stats_parallel_group,
+    )
+    return reduce_max_stat_across_model_parallel_group(grad_norm)
+
+
+def _build_armt_scalar_metric(value, device: torch.device):
+    return build_mean_metric(
+        torch.tensor(float(value), device=device, dtype=torch.float32),
+        torch.tensor(1.0, device=device, dtype=torch.float32),
+    )
+
+
+def _publish_armt_seq_mixer_grad_norm_metrics(
+    model,
+    optimizer,
+    args,
+    iteration: int | None,
+) -> None:
+    if not _should_collect_armt_monitoring_for_iteration(args, iteration):
+        return
+
+    grad_stats_parallel_group = _get_optimizer_grad_stats_parallel_group(optimizer)
+    if grad_stats_parallel_group is None:
+        return
+
+    all_grads_for_norm = []
+    layer_grad_entries = []
+    for layer, layer_number in _iter_armt_layers_in_model_chunks(model):
+        layer_grads_for_norm = _collect_armt_seq_mixer_grad_tensors(layer, optimizer)
+        if not layer_grads_for_norm:
+            continue
+        all_grads_for_norm.extend(layer_grads_for_norm)
+        layer_grad_entries.append((layer_number, layer_grads_for_norm))
+
+    if not all_grads_for_norm:
+        return
+
+    metric_device = all_grads_for_norm[0].device
+    primitives = {
+        "armt/seq_mixer/grad_norm": _build_armt_scalar_metric(
+            _compute_armt_seq_mixer_grad_norm(all_grads_for_norm, grad_stats_parallel_group),
+            metric_device,
+        )
+    }
+
+    if getattr(args, "armt_log_layer_metrics_to_tensorboard", False):
+        for layer_number, layer_grads_for_norm in layer_grad_entries:
+            layer_grad_norm = _compute_armt_seq_mixer_grad_norm(
+                layer_grads_for_norm,
+                grad_stats_parallel_group,
+            )
+            primitives[f"armt/seq_mixer/grad_norm/layer_{layer_number:02d}"] = (
+                _build_armt_scalar_metric(layer_grad_norm, metric_device)
+            )
+
+    accumulate_armt_tensorboard_metrics(primitives)
+
+
 def _write_scalar_metrics_to_tensorboard(
     writer,
     metrics: Dict[str, Any],
@@ -1984,6 +2109,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+
+    _publish_armt_seq_mixer_grad_norm_metrics(model, optimizer, args, iteration)
 
     # Update parameters.
 

@@ -9,8 +9,14 @@ import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-from .monitoring import build_mean_metric, build_ratio_of_means_metric, merge_metric_primitives
+from .monitoring import (
+    build_mean_metric,
+    build_ratio_metric,
+    build_ratio_of_means_metric,
+    merge_metric_primitives,
+)
 from .recurrent_memory import build_recurrent_memory_backend
+from .seq_mixers import build_seq_mixer
 
 _MEM_TOKEN_COSINE_HIGH_THRESHOLD = 0.8
 _SUPPORTED_MEMORY_WRITE_SOURCES = (
@@ -56,6 +62,15 @@ class ARMTLayer(TransformerLayer):
         recurrent_memory_input_pre_norm: bool = False,
         armt_memory_write_source: str = "mem_tokens",
         log_read_position_metrics_to_tensorboard: bool = False,
+        armt_seq_mixer_type: str = "none",
+        armt_seq_mixer_init: str = "identity",
+        armt_seq_mixer_mlp_expansion: int = 2,
+        armt_seq_mixer_attn_num_heads: int = 1,
+        armt_seq_mixer_attn_head_dim: Optional[int] = None,
+        armt_seq_mixer_attn_residual: bool = True,
+        armt_seq_mixer_attn_prenorm: bool = True,
+        armt_seq_mixer_attn_backend: str = "flash",
+        recurrent_chunk_size: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(config=config, submodules=submodules, layer_number=layer_number, **kwargs)
@@ -138,6 +153,30 @@ class ARMTLayer(TransformerLayer):
             )
         self._collect_monitoring_for_current_iteration = True
         self.reset_monitoring_stats()
+
+        # Optional chunk-internal token mixer sitting between
+        # ``_resolve_write_source`` and ``memory_layer.update_mem``. The MLP
+        # variants tie their weight shape to S_eff (== num_mem_tokens when
+        # writing memory tokens, else recurrent_chunk_size). The attn variant
+        # is shape-agnostic and accepts seq_len=None.
+        if armt_memory_write_source == "mem_tokens":
+            s_eff = num_mem_tokens
+        else:
+            s_eff = recurrent_chunk_size
+        self.seq_mixer = build_seq_mixer(
+            armt_seq_mixer_type,
+            config=config,
+            hidden_size=config.hidden_size,
+            seq_len=s_eff,
+            init_strategy=armt_seq_mixer_init,
+            mlp_expansion=armt_seq_mixer_mlp_expansion,
+            attn_num_heads=armt_seq_mixer_attn_num_heads,
+            attn_head_dim=armt_seq_mixer_attn_head_dim,
+            attn_residual=armt_seq_mixer_attn_residual,
+            attn_prenorm=armt_seq_mixer_attn_prenorm,
+            attn_backend=armt_seq_mixer_attn_backend,
+            dtype=params_dtype,
+        )
 
     def _get_memory_layer(self):
         if self.recurrent_memory_layer is not None:
@@ -273,6 +312,33 @@ class ARMTLayer(TransformerLayer):
             self._count_tensor(mem_tokens.shape[0], cosine.device),
         )
 
+    def _update_seq_mixer_monitoring_stats(
+        self,
+        input_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+    ):
+        if input_tensor.shape != output_tensor.shape:
+            raise ValueError(
+                "ARMT seq mixer monitoring expects input/output shapes to match, "
+                f"got {tuple(input_tensor.shape)} vs {tuple(output_tensor.shape)}"
+            )
+
+        x = input_tensor.detach().float()
+        y = output_tensor.detach().float()
+        input_norms = torch.linalg.vector_norm(x, dim=-1)
+        output_norms = torch.linalg.vector_norm(y, dim=-1)
+        delta_norms = torch.linalg.vector_norm(y - x, dim=-1)
+        cosine = (x * y).sum(dim=-1) / (input_norms * output_norms + 1e-8)
+
+        self._accumulate_monitoring_stat("seq_mixer_input_norm_sum", input_norms.sum())
+        self._accumulate_monitoring_stat("seq_mixer_output_norm_sum", output_norms.sum())
+        self._accumulate_monitoring_stat("seq_mixer_delta_norm_sum", delta_norms.sum())
+        self._accumulate_monitoring_stat("seq_mixer_cosine_sum", cosine.sum())
+        self._accumulate_monitoring_stat(
+            "seq_mixer_token_count",
+            self._count_tensor(input_norms.numel(), input_tensor.device),
+        )
+
     def consume_monitoring_primitives(self):
         if not self._collect_monitoring_for_current_iteration:
             self.reset_monitoring_stats()
@@ -317,6 +383,28 @@ class ARMTLayer(TransformerLayer):
             primitives["armt/token/mem_token_cosine_gt_0p8_ratio_mean"] = build_mean_metric(
                 stats["mem_token_cosine_gt_0p8_ratio_sum"],
                 stats["mem_token_cosine_count"],
+            )
+
+        if "seq_mixer_token_count" in stats:
+            primitives["armt/seq_mixer/input_norm_mean"] = build_mean_metric(
+                stats["seq_mixer_input_norm_sum"],
+                stats["seq_mixer_token_count"],
+            )
+            primitives["armt/seq_mixer/output_norm_mean"] = build_mean_metric(
+                stats["seq_mixer_output_norm_sum"],
+                stats["seq_mixer_token_count"],
+            )
+            primitives["armt/seq_mixer/output_to_input_norm_ratio"] = build_ratio_metric(
+                stats["seq_mixer_output_norm_sum"],
+                stats["seq_mixer_input_norm_sum"],
+            )
+            primitives["armt/seq_mixer/delta_to_input_norm_ratio"] = build_ratio_metric(
+                stats["seq_mixer_delta_norm_sum"],
+                stats["seq_mixer_input_norm_sum"],
+            )
+            primitives["armt/seq_mixer/input_output_cosine_mean"] = build_mean_metric(
+                stats["seq_mixer_cosine_sum"],
+                stats["seq_mixer_token_count"],
             )
 
         self._monitoring_stats = {}
@@ -435,6 +523,15 @@ class ARMTLayer(TransformerLayer):
             post_mlp_hidden_states=hidden_states,
             input_is_sbh=input_is_sbh,
         )
+        # Optional seq mixer: token-level information exchange within the
+        # current chunk. ``write_part`` is already gathered along TP/SP by
+        # ``_resolve_write_source``, so the mixer sees full hidden_size and
+        # full sequence length and does not need its own parallel ops.
+        if self.seq_mixer is not None and write_part.numel() != 0:
+            seq_mixer_input = write_part
+            write_part = self.seq_mixer(write_part, input_is_sbh=input_is_sbh)
+            if self._collect_monitoring_for_current_iteration:
+                self._update_seq_mixer_monitoring_stats(seq_mixer_input, write_part)
         if write_part.numel() != 0:
             memory_layer.update_mem(
                 write_part,
